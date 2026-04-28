@@ -2,9 +2,15 @@
 /**
  * @module elabftw MCP Server — CLI entry
  *
- * Standalone MCP server that wraps the elabftw v2 REST API. Run it as a
- * stdio child process of any MCP-aware client (Claude Desktop, Claude
- * Code, Cursor, etc.). See README for full env-var documentation.
+ * Standalone MCP server that wraps the elabftw v2 REST API.
+ *
+ * Two run modes:
+ *   - stdio (default): run as a stdio child process of an MCP-aware
+ *     client (Claude Desktop, Claude Code, Cursor, …).
+ *   - hosted (`MCP_MODE=hosted`): run as an HTTP server with
+ *     self-service registration; clients connect over Streamable HTTP.
+ *
+ * See README for full env-var documentation.
  */
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -15,7 +21,7 @@ import { registerFanoutTools } from './mcp/tools/fanout';
 import { registerReadTools } from './mcp/tools/read';
 import { registerWriteTools } from './mcp/tools/write';
 
-async function main(): Promise<void> {
+async function runStdio(): Promise<void> {
   const config = loadConfig();
   const registry = new ClientRegistry(config);
 
@@ -23,7 +29,7 @@ async function main(): Promise<void> {
 
   const server = new McpServer({
     name: 'sura-elabftw',
-    version: '0.1.0',
+    version: '0.2.0',
   });
 
   registerReadTools(server, registry, config);
@@ -34,6 +40,21 @@ async function main(): Promise<void> {
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
+}
+
+async function main(): Promise<void> {
+  const mode = process.env.MCP_MODE?.trim().toLowerCase() || 'stdio';
+  if (mode === 'hosted') {
+    const { main: runHosted } = await import('./hosted/server');
+    await runHosted();
+    return;
+  }
+  if (mode !== 'stdio') {
+    throw new Error(
+      `Unknown MCP_MODE: ${mode}. Expected 'stdio' (default) or 'hosted'.`
+    );
+  }
+  await runStdio();
 }
 
 main().catch((error) => {

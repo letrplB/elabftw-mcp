@@ -43,9 +43,16 @@ export interface ElabMcpConfig {
    * Controlled by `ELABFTW_REVEAL_USER_IDENTITIES` env var.
    */
   revealUserIdentities: boolean;
-  /** One entry per API key. Always non-empty. */
+  /**
+   * One entry per API key. Non-empty in stdio mode. May be empty in hosted
+   * mode, where per-request tokens supply credentials at call time and the
+   * boot-time config is only used as a flag carrier (`baseUrl`,
+   * `allowWrites`, etc.). Hosted-mode code constructs a fresh
+   * single-entry config per registered token and never reads the empty
+   * shell's `keys`.
+   */
   keys: ElabKeyConfig[];
-  /** Team id used when a tool call doesn't specify `team`. Always present in `keys`. */
+  /** Team id used when a tool call doesn't specify `team`. Always present in `keys` (stdio mode). */
   defaultTeam: number;
   /**
    * When true, the team field on each key was supplied by the user in
@@ -108,7 +115,19 @@ function collectIndexedKeys(): ElabKeyConfig[] {
   return out.sort((a, b) => a.team - b.team);
 }
 
-export function loadConfig(): ElabMcpConfig {
+export interface LoadConfigOptions {
+  /**
+   * In hosted mode, per-request tokens supply API keys at call time, so
+   * boot-time `ELABFTW_API_KEY` / `ELABFTW_KEY_<n>` are not required. We
+   * still load the rest of the config (base URL, flags) and synthesize a
+   * placeholder `keys` entry so downstream types stay happy; hosted-mode
+   * code never reads from it.
+   */
+  requireKeys?: boolean;
+}
+
+export function loadConfig(options: LoadConfigOptions = {}): ElabMcpConfig {
+  const requireKeys = options.requireKeys ?? true;
   const baseUrl = requireEnv('ELABFTW_BASE_URL').replace(/\/+$/, '');
 
   const timeoutRaw = process.env.ELABFTW_TIMEOUT_MS;
@@ -121,6 +140,20 @@ export function loadConfig(): ElabMcpConfig {
 
   const indexedKeys = collectIndexedKeys();
   const legacyKey = process.env.ELABFTW_API_KEY?.trim();
+
+  if (!requireKeys && indexedKeys.length === 0 && !legacyKey) {
+    return {
+      baseUrl,
+      userAgent,
+      timeoutMs,
+      allowWrites,
+      allowDestructive,
+      revealUserIdentities,
+      keys: [],
+      defaultTeam: 0,
+      teamDeclaredByUser: false,
+    };
+  }
 
   if (indexedKeys.length > 0 && legacyKey) {
     throw new ElabMcpConfigError(

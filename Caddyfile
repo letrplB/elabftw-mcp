@@ -1,0 +1,28 @@
+# Hosted-mode reverse proxy.
+#
+# Caddy auto-provisions a Let's Encrypt cert for {$MCP_DOMAIN}.
+# Long-lived SSE streams need ample read timeouts. We forward the
+# typical proxy headers; the Node app reads them via `trust proxy`.
+
+{$MCP_DOMAIN} {
+	encode zstd gzip
+
+	header {
+		# Conservative default headers. The MCP body itself is JSON,
+		# never rendered, so most browser security headers are
+		# largely cosmetic — but cheap to send.
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		# Defense-in-depth against accidental embedding of /register.
+		X-Frame-Options "DENY"
+		-Server
+	}
+
+	reverse_proxy mcp-elabftw:8000 {
+		flush_interval -1
+		transport http {
+			read_timeout 300s
+		}
+	}
+}

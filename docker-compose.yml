@@ -1,0 +1,53 @@
+# Hosted-mode deployment.
+#
+# Caddy terminates TLS (Let's Encrypt) and reverse-proxies to the MCP
+# container. Registrations persist to a named volume so they survive
+# container rebuilds.
+#
+# Required environment (set via .env or your orchestrator):
+#   ELABFTW_BASE_URL     — default base URL prefilled in the registration form
+#   MCP_PUBLIC_URL       — public origin used in personal URLs (https://mcp.example.tum.de)
+#   MCP_DOMAIN           — bare hostname for Caddy's automatic TLS (mcp.example.tum.de)
+#   MCP_ALLOWED_HOSTS    — DNS-rebind protection allow-list
+#   MCP_ALLOWED_ORIGINS  — origin allow-list
+
+services:
+  mcp-elabftw:
+    build:
+      context: .
+    image: elabftw-mcp:latest
+    restart: unless-stopped
+    expose:
+      - "8000"
+    environment:
+      ELABFTW_BASE_URL: ${ELABFTW_BASE_URL:?must be set}
+      MCP_MODE: hosted
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: "8000"
+      MCP_PUBLIC_URL: ${MCP_PUBLIC_URL:-}
+      MCP_ALLOWED_HOSTS: ${MCP_ALLOWED_HOSTS:-}
+      MCP_ALLOWED_ORIGINS: ${MCP_ALLOWED_ORIGINS:-}
+      MCP_REGISTRATIONS_PATH: /var/lib/elabftw-mcp/registrations.json
+    volumes:
+      - mcp_registrations:/var/lib/elabftw-mcp
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      MCP_DOMAIN: ${MCP_DOMAIN:?must be set}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - mcp-elabftw
+
+volumes:
+  mcp_registrations:
+  caddy_data:
+  caddy_config:

@@ -27,10 +27,12 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.25.1",
+    "express": "^5.1.0",
     "turndown": "^7.2.4",
     "zod": "^4.2.1"
   },
   "devDependencies": {
+    "@types/express": "^5.0.0",
     "@types/node": "^22.10.5",
     "@types/turndown": "^5.0.6",
     "tsup": "^8.3.5",
