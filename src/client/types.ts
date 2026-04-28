@@ -246,6 +246,37 @@ export interface ElabCreateEntityInput {
   tags?: string[];
   /** Metadata as a JSON string (safest across versions). */
   metadata?: string;
+  /**
+   * YYYYMMDD string (e.g. "20260417"). elabftw drops this on POST and
+   * defaults to "today"; the MCP `elab_create_entity` tool re-PATCHes
+   * when supplied so the value lands.
+   */
+  date?: string;
+  /**
+   * Integer 0-5. elabftw drops this on POST; the MCP layer re-PATCHes.
+   */
+  rating?: number;
+  /** Status id (team-scoped). elabftw honors this on POST in v5.x. */
+  status?: number;
+  /**
+   * Stable per-team identifier. elabftw drops this on POST; the MCP
+   * layer re-PATCHes.
+   */
+  custom_id?: number;
+  /**
+   * JSON string describing read permissions. elabftw normalizes
+   * whitespace/key-order on round-trip; the MCP layer compares with
+   * deep-equal before deciding to re-PATCH.
+   */
+  canread?: string;
+  /** Same shape and semantics as `canread`. */
+  canwrite?: string;
+  /**
+   * 1 = Normal, 2 = Archived. State `3` (Deleted) is reachable via
+   * `elab_delete_entity` only — keep create/update flows unambiguous.
+   * elabftw drops this on POST; the MCP layer re-PATCHes.
+   */
+  state?: ElabState | number;
 }
 
 export interface ElabUpload {

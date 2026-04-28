@@ -1,5 +1,5 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import type { ElabEntityType } from '../../client';
+import type { ElabEntityType, ElabEntityUpdate } from '../../client';
 import { z } from 'zod';
 import type { ClientRegistry } from '../clients';
 import type { ElabMcpConfig } from '../config';
@@ -10,6 +10,52 @@ import {
   effectiveTeam,
   teamParamSchema,
 } from './team-guard';
+
+const stateMap = { normal: 1, archived: 2 } as const;
+type StateName = keyof typeof stateMap;
+
+/**
+ * Deep-equal for parsed JSON. Used for `canread` / `canwrite`: elabftw
+ * normalizes whitespace and may reorder keys, so byte-for-byte string
+ * comparison would falsely flag a mismatch on every round-trip.
+ */
+function deepEqualJson(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (a === null || b === null) return false;
+  if (typeof a !== typeof b) return false;
+  if (typeof a !== 'object') return false;
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  if (Array.isArray(a)) {
+    if (a.length !== (b as unknown[]).length) return false;
+    return a.every((v, i) => deepEqualJson(v, (b as unknown[])[i]));
+  }
+  const ao = a as Record<string, unknown>;
+  const bo = b as Record<string, unknown>;
+  const ak = Object.keys(ao).sort();
+  const bk = Object.keys(bo).sort();
+  if (ak.length !== bk.length) return false;
+  if (!ak.every((k, i) => k === bk[i])) return false;
+  return ak.every((k) => deepEqualJson(ao[k], bo[k]));
+}
+
+function fieldMismatch(
+  key: string,
+  requested: unknown,
+  current: unknown
+): boolean {
+  if (key === 'canread' || key === 'canwrite') {
+    try {
+      return !deepEqualJson(
+        JSON.parse(String(requested)),
+        JSON.parse(String(current ?? '{}'))
+      );
+    } catch {
+      return String(requested) !== String(current);
+    }
+  }
+  if (current == null) return requested != null;
+  return current !== requested;
+}
 
 export function registerWriteTools(
   server: McpServer,
@@ -23,8 +69,8 @@ export function registerWriteTools(
     'Create a new entity. Supports all four kinds:\n' +
       '  - `experiments`: pass `category_id=<templateId>` to instantiate from a template (optional).\n' +
       '  - `items`: pass `category_id=<itemsTypeId>` (required — every item belongs to a type).\n' +
-      '  - `experiments_templates`: create a blank template. POST accepts title; use `elab_update_entity` afterward to set body/metadata.\n' +
-      '  - `items_types`: create a blank items-type schema. Upstream elabftw currently accepts only `title` on POST; body/metadata edits typically need the web UI (see https://github.com/elabftw/elabftw/issues/4726).\n' +
+      '  - `experiments_templates` / `items_types`: blank-schema kinds. The elabftw POST endpoint accepts only `title`; this tool follows up with a PATCH for body / metadata / content_type / etc. when supplied.\n' +
+      'Optional fields (`date`, `rating`, `status`, `custom_id`, `canread`, `canwrite`, `state`, `content_type`) are forwarded on POST and, if elabftw drops or normalizes any of them, transparently re-PATCHed after a fresh fetch so the values actually land. Failures of the follow-up PATCH are reported in the response (call `elab_update_entity` to retry).\n' +
       'Pass `team` to target a specific configured team; otherwise the default team is used.',
     {
       entityType: entityTypeSchema,
@@ -51,6 +97,47 @@ export function registerWriteTools(
         .describe(
           'JSON string for the metadata field (extra_fields etc.). Keep it stringified.'
         ),
+      date: z
+        .string()
+        .optional()
+        .describe(
+          'YYYYMMDD format (e.g. "20260417"). elabftw defaults to today on POST and the tool re-PATCHes the requested value after creation.'
+        ),
+      rating: z
+        .number()
+        .int()
+        .min(0)
+        .max(5)
+        .optional()
+        .describe('Integer 0-5. Re-PATCHed after creation if elabftw drops it.'),
+      status: z
+        .number()
+        .int()
+        .optional()
+        .describe(
+          'Status id (team-scoped). Use `elab_list_*`-discovered status ids; v5.x typically honors this on POST.'
+        ),
+      custom_id: z
+        .number()
+        .int()
+        .optional()
+        .describe('Stable per-team identifier. Re-PATCHed if elabftw drops it.'),
+      canread: z
+        .string()
+        .optional()
+        .describe(
+          'JSON string describing read permissions, e.g. `{"base":40,"teams":[],"users":[],"teamgroups":[]}`. Compared with deep-equal because elabftw normalizes whitespace.'
+        ),
+      canwrite: z
+        .string()
+        .optional()
+        .describe('Same shape as `canread`.'),
+      state: z
+        .enum(['normal', 'archived'])
+        .optional()
+        .describe(
+          'Initial state. `normal` (default) or `archived`. To soft-delete an entity use `elab_delete_entity`.'
+        ),
     },
     async (args) => {
       const input = args as {
@@ -62,6 +149,13 @@ export function registerWriteTools(
         content_type?: 'html' | 'markdown';
         tags?: string[];
         metadata?: string;
+        date?: string;
+        rating?: number;
+        status?: number;
+        custom_id?: number;
+        canread?: string;
+        canwrite?: string;
+        state?: StateName;
       };
       const ct =
         input.content_type === 'markdown'
@@ -69,11 +163,27 @@ export function registerWriteTools(
           : input.content_type === 'html'
             ? 1
             : undefined;
+      const stateNum = input.state ? stateMap[input.state] : undefined;
       const t = effectiveTeam(registry, input.team);
       const client = clientFor(registry, input.team);
       const isSchemaKind =
         input.entityType === 'experiments_templates' ||
         input.entityType === 'items_types';
+
+      // Fields that POST may drop on older elabftw versions. We forward them
+      // anyway, then reconcile from a fresh fetch.
+      const requestedFields: Partial<ElabEntityUpdate> = {
+        ...(ct ? { content_type: ct as 1 | 2 } : {}),
+        ...(input.date !== undefined ? { date: input.date } : {}),
+        ...(input.rating !== undefined ? { rating: input.rating } : {}),
+        ...(input.status !== undefined ? { status: input.status } : {}),
+        ...(input.custom_id !== undefined
+          ? { custom_id: input.custom_id }
+          : {}),
+        ...(input.canread !== undefined ? { canread: input.canread } : {}),
+        ...(input.canwrite !== undefined ? { canwrite: input.canwrite } : {}),
+        ...(stateNum !== undefined ? { state: stateNum } : {}),
+      };
       return guard(
         async () => {
           const id = await client.create(input.entityType, {
@@ -82,53 +192,50 @@ export function registerWriteTools(
             body: input.body,
             tags: input.tags,
             metadata: input.metadata,
-            ...(ct ? { content_type: ct as 1 | 2 } : {}),
+            ...requestedFields,
           });
           if (id == null)
             return {
               id,
               landedTeam: undefined as number | undefined,
-              schemaPatched: false,
-              contentTypePatched: false,
+              reconcileFailed: null as string[] | null,
             };
-          // For templates/items_types, POST accepts only `title` reliably;
-          // follow up with PATCH so body/metadata/content_type actually land.
-          let schemaPatched = false;
-          if (isSchemaKind && (input.body || input.metadata || ct)) {
-            try {
-              await client.update(input.entityType, id, {
-                ...(input.body !== undefined ? { body: input.body } : {}),
-                ...(input.metadata !== undefined ? { metadata: input.metadata } : {}),
-                ...(ct ? { content_type: ct as 1 | 2 } : {}),
-              });
-              schemaPatched = true;
-            } catch {
-              // Leave schemaPatched=false; creation itself succeeded.
-            }
-          }
           const fresh = await client.get(input.entityType, id);
-          // Older elabftw versions ignore content_type on POST. If the
-          // value didn't land, re-PATCH (and re-send body so it renders
-          // through the markdown pipeline cleanly).
-          let contentTypePatched = true;
-          if (!isSchemaKind && ct && fresh.content_type !== ct) {
-            try {
-              await client.update(input.entityType, id, {
-                content_type: ct as 1 | 2,
-                ...(input.body !== undefined ? { body: input.body } : {}),
-              });
-            } catch {
-              contentTypePatched = false;
+
+          // Build a single reconciliation patch:
+          //  1) any optional field whose round-trip value differs from what
+          //     the caller requested (POST may have dropped or normalized it),
+          //  2) for schema kinds, body+metadata always — the POST endpoint
+          //     only honors `title` on templates/items_types,
+          //  3) if content_type is being re-PATCHed and a body was supplied,
+          //     re-send body so it flows through elabftw's md→html pipeline.
+          const reconcilePatch: Partial<ElabEntityUpdate> = {};
+          for (const [key, val] of Object.entries(requestedFields)) {
+            const current = (fresh as Record<string, unknown>)[key];
+            if (fieldMismatch(key, val, current)) {
+              (reconcilePatch as Record<string, unknown>)[key] = val;
             }
           }
-          return {
-            id,
-            landedTeam: fresh.team,
-            schemaPatched,
-            contentTypePatched,
-          };
+          if (isSchemaKind) {
+            if (input.body !== undefined) reconcilePatch.body = input.body;
+            if (input.metadata !== undefined)
+              reconcilePatch.metadata = input.metadata;
+          }
+          if ('content_type' in reconcilePatch && input.body !== undefined) {
+            reconcilePatch.body = input.body;
+          }
+
+          let reconcileFailed: string[] | null = null;
+          if (Object.keys(reconcilePatch).length > 0) {
+            try {
+              await client.update(input.entityType, id, reconcilePatch);
+            } catch {
+              reconcileFailed = Object.keys(reconcilePatch);
+            }
+          }
+          return { id, landedTeam: fresh.team, reconcileFailed };
         },
-        ({ id, landedTeam, schemaPatched, contentTypePatched }) => {
+        ({ id, landedTeam, reconcileFailed }) => {
           if (id == null) {
             return errorText(
               'Create succeeded but elabftw returned no Location header.'
@@ -146,19 +253,11 @@ export function registerWriteTools(
               : input.entityType === 'items_types'
                 ? 'items_type'
                 : input.entityType.slice(0, -1);
-          const notes: string[] = [];
-          if (isSchemaKind && (input.body || input.metadata) && !schemaPatched) {
-            notes.push(
-              'follow-up PATCH for body/metadata failed — use elab_update_entity to retry'
-            );
-          }
-          if (!contentTypePatched) {
-            notes.push(
-              `content_type=${input.content_type} did not land and re-PATCH failed — call elab_update_entity({content_type: "${input.content_type}", body}) to fix rendering`
-            );
-          }
-          const patchNote = notes.length ? ` (${notes.join('; ')})` : '';
-          return text(`Created ${label} #${id} in team ${t}.${patchNote}`);
+          const note =
+            reconcileFailed && reconcileFailed.length
+              ? ` (follow-up PATCH for ${reconcileFailed.join(', ')} failed — call elab_update_entity to retry)`
+              : '';
+          return text(`Created ${label} #${id} in team ${t}.${note}`);
         }
       );
     }
@@ -166,7 +265,7 @@ export function registerWriteTools(
 
   server.tool(
     'elab_update_entity',
-    'Update fields on an experiment or item. Any field not provided is left unchanged. Passing `metadata` replaces the whole blob; for single-field edits use `elab_update_extra_field` instead.',
+    'Update fields on any entity (experiments, items, templates, items_types). Any field not provided is left unchanged. Passing `metadata` replaces the whole blob; for single-field edits use `elab_update_extra_field` instead. To soft-delete an entity use `elab_delete_entity`.',
     {
       entityType: entityTypeSchema,
       id: z.number().int().positive(),
@@ -188,6 +287,12 @@ export function registerWriteTools(
         .string()
         .optional()
         .describe('Full JSON string to replace the metadata blob.'),
+      state: z
+        .enum(['normal', 'archived'])
+        .optional()
+        .describe(
+          'Archive (`archived`) or un-archive (`normal`) the entity. To soft-delete use `elab_delete_entity` — this tool deliberately does not accept `deleted` to keep the audit-trail entry point unambiguous.'
+        ),
     },
     async (args) => {
       const input = args as Record<string, unknown> & {
@@ -195,6 +300,7 @@ export function registerWriteTools(
         id: number;
         team?: number;
         content_type?: 'html' | 'markdown';
+        state?: StateName;
       };
       const ct =
         input.content_type === 'markdown'
@@ -202,7 +308,15 @@ export function registerWriteTools(
           : input.content_type === 'html'
             ? 1
             : undefined;
-      const { entityType, id, content_type: _ct, team, ...rest } = input;
+      const stateNum = input.state ? stateMap[input.state] : undefined;
+      const {
+        entityType,
+        id,
+        content_type: _ct,
+        state: _st,
+        team,
+        ...rest
+      } = input;
       const t = effectiveTeam(registry, team);
       const client = clientFor(registry, team);
       return guard(
@@ -211,6 +325,7 @@ export function registerWriteTools(
           return client.update(entityType, id, {
             ...rest,
             ...(ct ? { content_type: ct as 1 | 2 } : {}),
+            ...(stateNum !== undefined ? { state: stateNum } : {}),
           });
         },
         () => text(`Updated ${entityType.slice(0, -1)} #${id}.`)
@@ -255,33 +370,49 @@ export function registerWriteTools(
 
   server.tool(
     'elab_duplicate_entity',
-    'Duplicate an experiment or item. Optionally copies files and creates a link back to the original.',
+    'Duplicate an experiment or item. Optionally copies files and creates a link back to the original. `team` selects which configured key to use for the duplicate call. `targetTeam` is where the duplicate should land — defaults to the same team as the source. Useful for cloning shared templates into another team’s workspace.',
     {
       entityType: entityTypeSchema,
       id: z.number().int().positive(),
       team: teamParamSchema,
       copyFiles: z.boolean().optional(),
       linkToOriginal: z.boolean().optional(),
+      targetTeam: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe(
+          'Team id where the duplicate should land. Defaults to the source entity’s team. The configured key for `team` must have permission on `targetTeam`.'
+        ),
     },
     async (args) => {
-      const { entityType, id, team, copyFiles, linkToOriginal } = args as {
-        entityType: ElabEntityType;
-        id: number;
-        team?: number;
-        copyFiles?: boolean;
-        linkToOriginal?: boolean;
-      };
+      const { entityType, id, team, copyFiles, linkToOriginal, targetTeam } =
+        args as {
+          entityType: ElabEntityType;
+          id: number;
+          team?: number;
+          copyFiles?: boolean;
+          linkToOriginal?: boolean;
+          targetTeam?: number;
+        };
       const t = effectiveTeam(registry, team);
       const client = clientFor(registry, team);
       return guard(
         async () => {
           await assertTeam(client, entityType, id, t);
-          return client.duplicate(entityType, id, { copyFiles, linkToOriginal });
+          return client.duplicate(entityType, id, {
+            copyFiles,
+            linkToOriginal,
+            ...(targetTeam !== undefined ? { team: targetTeam } : {}),
+          });
         },
         (newId) =>
           newId == null
             ? errorText('Duplicated but elabftw returned no new id.')
-            : text(`Duplicated ${entityType.slice(0, -1)} #${id} → #${newId}.`)
+            : text(
+                `Duplicated ${entityType.slice(0, -1)} #${id} → #${newId}${targetTeam !== undefined ? ` (team ${targetTeam})` : ''}.`
+              )
       );
     }
   );
@@ -355,27 +486,134 @@ export function registerWriteTools(
       team: teamParamSchema,
       body: z.string().min(1),
       deadline: z.string().optional().describe('ISO datetime, optional.'),
+      deadline_notif: z
+        .boolean()
+        .optional()
+        .describe(
+          'If `deadline` is set, `deadline_notif=true` makes elabftw email-notify the step owner before the deadline. Default off. Some elabftw versions ignore `deadline` / `deadline_notif` on step POST; check via `elab_list_steps` after creation. Per-step PATCH for these fields is not exposed (the v2 step PATCH dispatcher restricts to `action: finish`).'
+        ),
     },
     async (args) => {
-      const { entityType, id, team, body, deadline } = args as {
+      const { entityType, id, team, body, deadline, deadline_notif } = args as {
         entityType: ElabEntityType;
         id: number;
         team?: number;
         body: string;
         deadline?: string;
+        deadline_notif?: boolean;
       };
       const t = effectiveTeam(registry, team);
       const client = clientFor(registry, team);
       return guard(
         async () => {
           await assertTeam(client, entityType, id, t);
-          return client.addStep(entityType, id, body, { deadline });
+          return client.addStep(entityType, id, body, {
+            deadline,
+            deadline_notif,
+          });
         },
         (sid) =>
           text(
             sid == null
               ? `Added step on ${entityType.slice(0, -1)} #${id}.`
               : `Added step #${sid} on ${entityType.slice(0, -1)} #${id}.`
+          )
+      );
+    }
+  );
+
+  server.tool(
+    'elab_update_comment',
+    'Edit an existing comment on an entity. Use `elab_list_comments` to find the `commentId`.',
+    {
+      entityType: entityTypeSchema,
+      id: z.number().int().positive(),
+      commentId: z.number().int().positive(),
+      team: teamParamSchema,
+      comment: z.string().min(1),
+    },
+    async (args) => {
+      const { entityType, id, commentId, team, comment } = args as {
+        entityType: ElabEntityType;
+        id: number;
+        commentId: number;
+        team?: number;
+        comment: string;
+      };
+      const t = effectiveTeam(registry, team);
+      const client = clientFor(registry, team);
+      return guard(
+        async () => {
+          await assertTeam(client, entityType, id, t);
+          return client.updateComment(entityType, id, commentId, comment);
+        },
+        () =>
+          text(
+            `Updated comment #${commentId} on ${entityType.slice(0, -1)} #${id}.`
+          )
+      );
+    }
+  );
+
+  server.tool(
+    'elab_delete_comment',
+    'Permanently delete a comment from an entity. Unlike entity deletion, this is not a soft-delete — the row is removed and the audit-trail entry shows the deletion. Use `elab_list_comments` to find the `commentId`.',
+    {
+      entityType: entityTypeSchema,
+      id: z.number().int().positive(),
+      commentId: z.number().int().positive(),
+      team: teamParamSchema,
+    },
+    async (args) => {
+      const { entityType, id, commentId, team } = args as {
+        entityType: ElabEntityType;
+        id: number;
+        commentId: number;
+        team?: number;
+      };
+      const t = effectiveTeam(registry, team);
+      const client = clientFor(registry, team);
+      return guard(
+        async () => {
+          await assertTeam(client, entityType, id, t);
+          await client.deleteComment(entityType, id, commentId);
+          return null;
+        },
+        () =>
+          text(
+            `Deleted comment #${commentId} from ${entityType.slice(0, -1)} #${id}.`
+          )
+      );
+    }
+  );
+
+  server.tool(
+    'elab_delete_step',
+    'Permanently delete a checklist step from an entity. Unlike entity deletion, this is not a soft-delete — the step row is removed. Use `elab_list_steps` to find the `stepId`.',
+    {
+      entityType: entityTypeSchema,
+      id: z.number().int().positive(),
+      stepId: z.number().int().positive(),
+      team: teamParamSchema,
+    },
+    async (args) => {
+      const { entityType, id, stepId, team } = args as {
+        entityType: ElabEntityType;
+        id: number;
+        stepId: number;
+        team?: number;
+      };
+      const t = effectiveTeam(registry, team);
+      const client = clientFor(registry, team);
+      return guard(
+        async () => {
+          await assertTeam(client, entityType, id, t);
+          await client.deleteStep(entityType, id, stepId);
+          return null;
+        },
+        () =>
+          text(
+            `Deleted step #${stepId} from ${entityType.slice(0, -1)} #${id}.`
           )
       );
     }

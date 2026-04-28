@@ -370,7 +370,7 @@ export class ElabftwClient {
         body: {
           body,
           ...(options?.deadline ? { deadline: options.deadline } : {}),
-          ...(options?.deadline_notif
+          ...(options?.deadline_notif !== undefined
             ? { deadline_notif: options.deadline_notif ? 1 : 0 }
             : {}),
         },
