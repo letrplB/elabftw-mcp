@@ -96,7 +96,8 @@ set.** Mixing the two is rejected at startup.
 | `elab_download_attachment` | Raw bytes. Text files returned as text; binary as base64. Files >2 MB are truncated with a note. |
 | `elab_list_comments` | Comments on an entity. |
 | `elab_list_steps` | Checklist steps. Unfinished shown as `[ ]`, finished as `[x]`. |
-| `elab_list_links` | Cross-entity links (pass `targetKind=experiments` or `items`). |
+| `elab_list_links` | Cross-entity links. `targetKind=experiments` / `items` for one kind; `targetKind=all` (default) merges both in parallel. |
+| `elab_list_unfinished_steps` | Open checklist steps across all entities visible to the team key. Cohort-triage shortcut. |
 | `elab_list_templates` | Experiment templates in a team. |
 | `elab_list_items_types` | Items type schemas. |
 | `elab_list_tags` | Tags in a team. |
@@ -110,19 +111,19 @@ set.** Mixing the two is rejected at startup.
 | `elab_get_user` | Fetch one user by `userid`. Identity fields gated behind `ELABFTW_REVEAL_USER_IDENTITIES=true`. |
 | `elab_list_team_users` | Roster for a given team. Works around the lack of a `/teams/{id}/users` endpoint by filtering `/users` client-side. Requires team-admin key. |
 | `elab_export` | PDF / PDF-A / ZIP / ZIP-A / ELN / ELN-HTML / CSV / JSON / QR-PNG / QR-PDF. |
-| `elab_search_all_teams` | (multi-team only) Fan out a search across every configured team in parallel. |
+| `elab_search_all_teams` | (multi-team only) Fan out a search across every configured team in parallel. Accepts the same `q` / `extended` / `category` / `status` / `tags` / `owner` / `scope` / `state` / `order` / `sort` / `limit` / `offset` filters as `elab_search`. |
 
 ### Write (requires `ELABFTW_ALLOW_WRITES=true`)
 
 | Tool | Purpose |
 |---|---|
-| `elab_create_entity` | Create an experiment or item (optionally from a template). Verifies the new entry lands in the requested team. `content_type` toggles body rendering between `"html"` (default) and `"markdown"` — see "Rich body rendering" below. |
-| `elab_update_entity` | Patch title / body / category / status / rating / date / metadata / permissions. `content_type` toggles body rendering between `"html"` (default) and `"markdown"`. Switch to `"markdown"` when your body uses GFM tables, `#` headings, fenced code, etc. — otherwise they render as literal characters. |
+| `elab_create_entity` | Create any of the four kinds (experiments, items, templates, items_types). Accepts `title` / `body` / `content_type` / `tags` / `metadata` / `category_id` plus all PATCH-symmetric fields: `date` / `rating` / `status` / `custom_id` / `canread` / `canwrite` / `state`. Re-PATCHes any field elabftw drops or normalizes on POST so the values land. Verifies the new entry lands in the requested team. |
+| `elab_update_entity` | Patch any of the four kinds. Title / body / content_type / category / status / rating / date / custom_id / metadata / permissions / `state` (`"normal"` / `"archived"` — soft-delete goes through `elab_delete_entity`). |
 | `elab_update_extra_field` | Patch a single `extra_fields` value without rewriting the whole metadata blob. |
-| `elab_duplicate_entity` | Duplicate with optional file copy and back-link. |
+| `elab_duplicate_entity` | Duplicate with optional file copy and back-link. `targetTeam` re-targets the duplicate to a different team than the source. |
 | `elab_delete_entity` | Soft-delete (state=3). Permanent deletion is sysadmin-only and not exposed. |
-| `elab_add_comment` | Add a comment. |
-| `elab_add_step` / `elab_toggle_step` | Manage checklist steps. |
+| `elab_add_comment` / `elab_update_comment` / `elab_delete_comment` | Comment CRUD. Comment delete is permanent (no soft-delete on the elabftw side). |
+| `elab_add_step` / `elab_toggle_step` / `elab_delete_step` | Manage checklist steps. `elab_add_step` accepts `deadline_notif`. Step delete is permanent. |
 | `elab_link_entities` / `elab_unlink_entities` | Cross-entity links. Both ends must be in the same team. |
 | `elab_add_tag` / `elab_remove_tag` | Tag management. |
 

@@ -8,6 +8,26 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- **`elab_create_entity` field parity with PATCH.** The tool now also
+  accepts `date` / `rating` / `status` / `custom_id` / `canread` /
+  `canwrite` / `state` (`"normal"` / `"archived"`) at create time,
+  matching every field `elab_update_entity` exposes. The two
+  ad-hoc fallbacks (templates schemaPatched, content_type re-PATCH)
+  collapsed into one reconciliation path: after POST, fetch the new
+  entity, diff against requested values, and re-PATCH any field
+  elabftw dropped or normalized. `canread` / `canwrite` use deep-equal
+  on parsed JSON so whitespace / key-order normalization doesn't
+  trigger needless re-PATCH. If the reconciliation PATCH itself fails,
+  the response names the unreconciled fields. `ElabCreateEntityInput`
+  gains the same fields for programmatic clients.
+- `elab_update_entity` accepts `state: "normal" | "archived"` —
+  archive (and un-archive) was previously only reachable through the
+  elabftw UI. Soft-delete is deliberately routed through
+  `elab_delete_entity` to keep the audit-trail entry point unambiguous.
+- `elab_duplicate_entity` accepts `targetTeam` — re-targets the
+  duplicate to a different team than the source. Useful for cloning
+  shared templates into another team's workspace. The existing `team`
+  arg still selects the configured key used for the duplicate call.
 - `elab_create_entity` now accepts `content_type: "html" | "markdown"`,
   so markdown bodies (GFM tables, `#` headings, fenced code) render
   correctly without a second tool call. The MCP layer forwards the
@@ -17,6 +37,37 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   fallback PATCH fails, the response includes a note pointing at
   `elab_update_entity` to retry. `ElabCreateEntityInput` gains the same
   field for programmatic clients.
+- `elab_update_comment` / `elab_delete_comment` — comment CRUD parity.
+  Both edits are permanent (elabftw treats comments as a regular write,
+  not a destructive op). Gated by `ELABFTW_ALLOW_WRITES`.
+- `elab_delete_step` — step deletion. Permanent.
+- `elab_add_step` accepts `deadline_notif: boolean`. Note: some elabftw
+  versions silently drop `deadline` / `deadline_notif` on step POST,
+  and the v2 step PATCH dispatcher restricts to `action: finish`,
+  so editing a step's deadline after creation is not currently
+  possible via the API. Documented in the tool description.
+- `elab_search_all_teams` extends the filter set to match
+  `elab_search`: `category` / `status` / `tags` / `owner` / `scope` /
+  `offset` are now honored across the fan-out.
+- `elab_list_unfinished_steps` exposes the `/unfinished_steps` endpoint
+  — a cohort-triage shortcut for finding which entities still have
+  open checklist items.
+- `elab_list_links` defaults `targetKind` to `'all'` (parallel
+  fetch + concatenation of `experiments_links` + `items_links`),
+  matching the merge behaviour of `elab_get(include=["links"])`.
+  Pass `targetKind: 'experiments'` / `'items'` to narrow.
+
+### Fixed
+
+- **`client.addStep` silently dropped `deadline_notif: false`.** The
+  outer ternary was a truthiness check, so passing `false` resulted
+  in no `deadline_notif` field being sent at all instead of `0`. Now
+  uses `!== undefined`, matching the rest of the codebase.
+- **`client.listUnfinishedSteps` return type.** The endpoint actually
+  returns `{ experiments?, items? }` with each entity carrying its
+  open steps as `[stepId, body]` tuples, not the flat array the type
+  previously claimed. Type updated; the new
+  `elab_list_unfinished_steps` MCP tool renders the corrected shape.
 
 ## [0.1.3] — 2026-04-23
 
