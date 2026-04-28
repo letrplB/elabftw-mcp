@@ -24,6 +24,7 @@ import { randomUUID } from 'node:crypto';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
+import { ElabftwClient } from '../client';
 import { loadConfig } from '../mcp/config';
 import { buildMcpServerForToken } from './runtime';
 import { SessionPool } from './sessions';
@@ -248,8 +249,48 @@ export async function main(): Promise<void> {
       return;
     }
 
+    // Validate the key by calling /users/me before minting a token.
+    // Catches typos, revoked keys, and instance-mismatch up front;
+    // also resolves the team id so list responses aren't silently
+    // filtered to an empty set.
+    let team: number;
     try {
-      const reg = await store.create({ apiKey, baseUrl, label });
+      const probe = new ElabftwClient({
+        baseUrl: baseUrl.replace(/\/+$/, ''),
+        apiKey,
+        userAgent: baseConfig.userAgent,
+        timeoutMs: baseConfig.timeoutMs,
+      });
+      const me = await probe.me();
+      if (!me.team || !Number.isFinite(me.team) || me.team <= 0) {
+        res
+          .status(400)
+          .type('html')
+          .send(
+            renderError(
+              `eLabFTW returned no usable team for this key. ` +
+                `me.team=${String(me.team)}.`
+            )
+          );
+        return;
+      }
+      team = me.team;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      res
+        .status(400)
+        .type('html')
+        .send(
+          renderError(
+            `Could not validate API key against ${baseUrl}: ${msg}. ` +
+              `Check the key, base URL, and that this server can reach the instance.`
+          )
+        );
+      return;
+    }
+
+    try {
+      const reg = await store.create({ apiKey, baseUrl, team, label });
       const origin = deriveOrigin(req, env.publicUrl);
       const personalUrl = `${origin}/mcp?token=${reg.token}`;
       const bearerUrl = `${origin}/mcp`;

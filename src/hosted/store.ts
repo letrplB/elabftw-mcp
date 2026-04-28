@@ -20,6 +20,13 @@ export interface Registration {
   token: string;
   apiKey: string;
   baseUrl: string;
+  /**
+   * Team id this key resolves to, discovered via `/users/me` at
+   * registration time. Stored to avoid a per-session round-trip and
+   * to make `defaultTeam` match what eLabFTW returns under this key.
+   * Without this, list filters silently exclude every row.
+   */
+  team: number;
   label?: string;
   createdAt: string;
   lastUsedAt?: string;
@@ -91,12 +98,14 @@ export class RegistrationStore {
   async create(input: {
     apiKey: string;
     baseUrl: string;
+    team: number;
     label?: string;
   }): Promise<Registration> {
     const reg: Registration = {
       token: mintToken(),
       apiKey: input.apiKey,
       baseUrl: input.baseUrl.replace(/\/+$/, ''),
+      team: input.team,
       label: input.label,
       createdAt: new Date().toISOString(),
     };

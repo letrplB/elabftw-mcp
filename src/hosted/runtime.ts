@@ -26,18 +26,22 @@ import type { Registration } from './store';
  * Project a base config + a registration into the per-token config that
  * tools see. Inherits all flags (`allowWrites`, `userAgent`, etc.) from
  * the base; replaces `baseUrl` and `keys` with the registration's own.
+ *
+ * The team id is resolved at registration time by calling `/users/me`
+ * with the supplied key. Falling back to `0` would leave the
+ * registry's `defaultTeam` mismatched against eLabFTW's view of the
+ * key, which silently filters every list response to an empty set.
  */
 export function buildTokenConfig(
   base: ElabMcpConfig,
   reg: Registration
 ): ElabMcpConfig {
-  const team = 1; // Sentinel team id; per-token mode never has multi-team.
   return {
     ...base,
     baseUrl: reg.baseUrl,
-    keys: [{ team, key: reg.apiKey, label: reg.label }],
-    defaultTeam: team,
-    teamDeclaredByUser: false,
+    keys: [{ team: reg.team, key: reg.apiKey, label: reg.label }],
+    defaultTeam: reg.team,
+    teamDeclaredByUser: true,
   };
 }
 
