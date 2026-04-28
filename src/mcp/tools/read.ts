@@ -441,28 +441,76 @@ export function registerReadTools(
 
   server.tool(
     'elab_list_links',
-    'List cross-entity links. `targetKind=experiments` returns linked experiments; `targetKind=items` returns linked items. Run both if you need everything.',
+    'List cross-entity links. `targetKind=experiments` returns linked experiments; `targetKind=items` returns linked items; `targetKind=all` (default) returns both kinds merged.',
     {
       entityType: entityTypeSchema,
       id: z.number().int().positive(),
-      targetKind: z.enum(['experiments', 'items']),
+      targetKind: z
+        .enum(['experiments', 'items', 'all'])
+        .optional()
+        .describe('Default `all` — fetches both kinds in parallel and concatenates.'),
       team: teamParamSchema,
     },
     async (args) => {
       const { entityType, id, targetKind, team } = args as {
         entityType: ElabEntityType;
         id: number;
-        targetKind: 'experiments' | 'items';
+        targetKind?: 'experiments' | 'items' | 'all';
         team?: number;
       };
+      const kind = targetKind ?? 'all';
       const t = effectiveTeam(registry, team);
       const client = clientFor(registry, team);
       return guard(
         async () => {
           await assertTeam(client, entityType, id, t);
-          return client.listLinks(entityType, id, targetKind);
+          if (kind === 'all') {
+            const [exp, items] = await Promise.all([
+              client.listLinks(entityType, id, 'experiments'),
+              client.listLinks(entityType, id, 'items'),
+            ]);
+            return [...exp, ...items];
+          }
+          return client.listLinks(entityType, id, kind);
         },
         (links) => text(formatLinks(links))
+      );
+    }
+  );
+
+  server.tool(
+    'elab_list_unfinished_steps',
+    'List open checklist steps across all entities visible to the configured team key, grouped by entity kind. Useful for cohort triage (e.g. which students still have unfinished safety-check steps). Pass `team` to pick the configured key/team.',
+    {
+      team: teamParamSchema,
+    },
+    async (args) => {
+      const { team } = args as { team?: number };
+      const client = clientFor(registry, team);
+      return guard(
+        async () => client.listUnfinishedSteps(),
+        (data) => {
+          const lines: string[] = [];
+          const render = (
+            kind: 'experiments' | 'items',
+            entries: Array<{ id: number; title: string; steps: Array<[string, string]> }>
+          ): void => {
+            if (!entries || entries.length === 0) return;
+            lines.push(`## ${kind} (${entries.length})`);
+            for (const e of entries) {
+              lines.push(`- ${kind}/${e.id} ${e.title}`);
+              for (const [sid, body] of e.steps ?? []) {
+                const trimmed = String(body ?? '').replace(/\s+/g, ' ').trim();
+                const snippet =
+                  trimmed.length > 80 ? `${trimmed.slice(0, 77)}...` : trimmed;
+                lines.push(`  - #${sid}: ${snippet}`);
+              }
+            }
+          };
+          render('experiments', data.experiments ?? []);
+          render('items', data.items ?? []);
+          return text(lines.length === 0 ? 'No unfinished steps.' : lines.join('\n'));
+        }
       );
     }
   );

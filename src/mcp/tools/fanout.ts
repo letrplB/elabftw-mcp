@@ -11,15 +11,39 @@ import { filterByTeam } from './team-guard';
 
 const allTeamsInput = z.object({
   entityType: entityTypeSchema,
-  q: z.string().optional(),
-  extended: z.string().optional(),
+  q: z
+    .string()
+    .optional()
+    .describe('Full-text search against title and body.'),
+  extended: z
+    .string()
+    .optional()
+    .describe(
+      'Advanced elabftw query DSL, e.g. `rating:5 and tag:"buffer" and date:>2024-01-01`. Takes precedence over `q`.'
+    ),
+  category: z.number().int().optional().describe('Filter by category id.'),
+  status: z.number().int().optional().describe('Filter by status id.'),
+  tags: z
+    .array(z.number().int())
+    .optional()
+    .describe('Filter by tag ids (AND).'),
+  owner: z
+    .number()
+    .int()
+    .optional()
+    .describe('Restrict to a specific owner userid.'),
+  scope: z
+    .enum(['self', 'team', 'everything'])
+    .optional()
+    .describe('Visibility scope. Defaults to the instance default.'),
   limit: z
     .number()
     .int()
     .min(1)
     .max(200)
     .optional()
-    .describe('Per-team limit. Merged result is at most limit × team_count rows.'),
+    .describe('Per-team limit. Merged result is at most limit × team_count rows before dedupe by team/id.'),
+  offset: z.number().int().min(0).optional(),
   order: z
     .enum([
       'cat',
@@ -38,6 +62,7 @@ const allTeamsInput = z.object({
   state: z.enum(['normal', 'archived', 'deleted']).optional(),
 });
 
+const scopeMap = { self: 1, team: 2, everything: 3 } as const;
 const stateMap = { normal: 1, archived: 2, deleted: 3 } as const;
 
 export function registerFanoutTools(
@@ -59,10 +84,16 @@ export function registerFanoutTools(
                 {
                   q: input.q,
                   extended: input.extended,
+                  cat: input.category,
+                  status: input.status,
+                  tags: input.tags,
+                  owner: input.owner,
+                  scope: input.scope ? scopeMap[input.scope] : undefined,
                   order: input.order,
                   sort: input.sort,
                   state: input.state ? stateMap[input.state] : undefined,
                   limit: input.limit ?? 25,
+                  offset: input.offset,
                 }
               );
               return filterByTeam(rows, team);

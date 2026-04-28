@@ -559,10 +559,15 @@ export class ElabftwClient {
     return elabJson(this.config, '/events', query);
   }
 
-  /** `GET /unfinished_steps` — open checklist items across accessible entries. */
-  listUnfinishedSteps(): Promise<
-    Array<{ id: number; entity_id: number; entity_type: string; body: string }>
-  > {
+  /**
+   * `GET /unfinished_steps` — open checklist items across accessible entries
+   * for the API key's team. Response groups by entity kind, with each entity
+   * carrying its open steps as `[stepId, body]` tuples (string-typed).
+   */
+  listUnfinishedSteps(): Promise<{
+    experiments?: Array<{ id: number; title: string; steps: Array<[string, string]> }>;
+    items?: Array<{ id: number; title: string; steps: Array<[string, string]> }>;
+  }> {
     return elabJson(this.config, '/unfinished_steps');
   }
 
