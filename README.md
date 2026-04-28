@@ -319,7 +319,50 @@ subprocess. The same tool surface is exposed, but reached via the MCP
 A registration is the long-lived "account"; a session is the per-tab
 connection.
 
-### Quick start (Docker)
+### Quick start — choose your stack
+
+Two supported deploy shapes. Pick the one that matches your VPS.
+
+#### Option A — Coolify / Dokploy / any PaaS that builds from a Dockerfile
+
+If your VPS already runs Coolify (or Dokploy, CapRover, etc.), the bundled
+`Dockerfile` is everything you need — the platform's built-in reverse proxy
+handles TLS, you don't ship Caddy.
+
+1. **Coolify → New Resource → Public Repository.** Point at this repo, set
+   the branch (`main` once merged, otherwise `feat/hosted-mode`).
+2. **Build pack:** `Dockerfile` (Coolify auto-detects from the file at the
+   repo root).
+3. **Domain:** `mcp.example.tum.de`. Coolify provisions a Let's Encrypt cert
+   for it via Traefik automatically.
+4. **Port:** `8000` (matches `EXPOSE 8000` in the Dockerfile).
+5. **Environment variables** (Coolify UI → Environment Variables):
+
+   | Key | Value |
+   |---|---|
+   | `ELABFTW_BASE_URL` | `https://elab.example.com` |
+   | `MCP_PUBLIC_URL` | `https://mcp.example.tum.de` |
+   | `MCP_ALLOWED_HOSTS` | `mcp.example.tum.de` |
+   | `MCP_ALLOWED_ORIGINS` | `https://mcp.example.tum.de` |
+   | `ELABFTW_ALLOW_WRITES` | `true` (optional) |
+
+   `MCP_MODE` / `MCP_HOST` / `MCP_PORT` / `MCP_REGISTRATIONS_PATH` are
+   pre-set in the Dockerfile — Coolify inherits them, no need to repeat.
+
+6. **Persistent storage** (Coolify UI → Storages → Add). Mount a named
+   volume at `/var/lib/elabftw-mcp` — that's where the JSON registrations
+   file lives. Without this, every container rebuild wipes your users.
+7. **Deploy.** Coolify pulls, builds, runs, exposes the domain.
+   `https://mcp.example.tum.de/healthz` should return `ok` once the
+   healthcheck passes (~30s after first start).
+
+The bundled `docker-compose.yml` and `Caddyfile` are ignored on this path.
+They are for Option B.
+
+#### Option B — Bare VPS (Docker + the bundled Caddy)
+
+Use this if your VPS doesn't run a PaaS and you want a full stack in one
+command.
 
 ```bash
 cp .env.example .env  # set ELABFTW_BASE_URL, MCP_DOMAIN, MCP_PUBLIC_URL
@@ -334,6 +377,16 @@ users. Tail logs with `docker compose logs -f mcp-elabftw`.
 Once it's up, point a browser at `https://${MCP_DOMAIN}/register`,
 fill the form, copy the URL the success page returns, and paste it
 into your MCP client.
+
+#### Either way
+
+Pre-flight check the night before:
+
+- DNS: `dig mcp.example.tum.de` returns the VPS IP.
+- Firewall: ports 80 (for the ACME challenge) and 443 are open inbound.
+  Note: the MCP container's `EXPOSE 8000` is *internal* — it's reached via
+  the reverse proxy (Coolify's Traefik or the bundled Caddy) on 443; you
+  do not open 8000 publicly.
 
 ### Auth
 
