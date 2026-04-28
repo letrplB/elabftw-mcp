@@ -88,17 +88,30 @@ eLabFTW as you.</p>`
   );
 }
 
-export function renderRegisterSuccess(personalUrl: string): string {
+export function renderRegisterSuccess(
+  personalUrl: string,
+  bearerUrl: string,
+  bearerToken: string
+): string {
   return layout(
     'Registered · elabftw MCP',
     `<h1>You're registered.</h1>
-<p>Use this URL in your MCP client:</p>
 
+<p><strong>Recommended — Authorization header:</strong></p>
+<div class="url">URL:    ${escape(bearerUrl)}
+Header: Authorization: Bearer ${escape(bearerToken)}</div>
+<p class="hint">Paste these into a client that supports custom MCP headers
+(Claude Desktop ≥ Apr 2026, VS Code, mcp-inspector). Header-based auth
+keeps the token out of access logs and browser history.</p>
+
+<p style="margin-top: 24px;"><strong>Fallback — token in URL:</strong></p>
 <div class="url">${escape(personalUrl)}</div>
+<p class="hint">For older clients that only accept a URL. The MCP server
+emits a <code>Deprecation</code> response header on every call when this
+path is used.</p>
 
-<p class="hint">In Claude Desktop, paste it under Settings → Developer →
-Custom MCP. The token in the URL is your bearer secret; it does not expire
-on its own. Lose it and ask your administrator to revoke + re-issue.</p>
+<p class="hint" style="margin-top: 24px;">The token does not expire on its
+own. Lose it and ask your administrator to revoke + re-issue.</p>
 
 <p style="margin-top: 24px;"><a href="/register">← Register another key</a></p>`
   );
