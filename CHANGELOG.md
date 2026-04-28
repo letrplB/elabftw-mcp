@@ -6,6 +6,61 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-04-28
+
+### Added
+
+- **Hosted mode** (`MCP_MODE=hosted`). HTTP server alongside the
+  default stdio transport, exposing the same tool surface to remote
+  MCP clients (Claude mobile, claude.ai web, browser-based clients,
+  shared institutional deployments). Implements the current MCP
+  Streamable HTTP transport (single `/mcp` endpoint, spec
+  `2025-06-18`).
+
+  - **Self-service registration.** `GET /register` serves an HTML
+    form; `POST /register` mints a 256-bit hex token, persists the
+    user's API key + base URL, and returns a personal MCP URL. No
+    OAuth dance for institutional deployments — bearer-token simplicity.
+  - **Per-token isolation.** One `McpServer` instance per registered
+    token, each with its own `ClientRegistry` built from that user's
+    eLabFTW credentials. The existing tool-registration code
+    (`registerReadTools` / `registerWriteTools` / `registerFanoutTools`)
+    is unchanged — its `(server, registry, config)` signature now sees
+    a per-token registry instead of a shared one.
+  - **Durable registrations.** JSON file with atomic write (`tmp + rename`)
+    and a per-process write-chain mutex. Registrations survive restart;
+    only ephemeral MCP-protocol sessions are in-memory.
+  - **Auth.** `Authorization: Bearer <token>` is the documented primary
+    path. `?token=<token>` query-string is accepted as a fallback for
+    clients that only take a URL (older Claude Desktop builds), but
+    the response carries `Deprecation: true` plus a `Link` header to
+    RFC 6750 to nudge migration.
+  - **Spec-compliant 401s.** Every 401 now carries
+    `WWW-Authenticate: Bearer realm="elabftw-mcp", error="..."`
+    (`invalid_request` for missing token, `invalid_token` for
+    unknown / revoked).
+  - **DNS-rebinding protection on by default** (the spec is explicit:
+    servers MUST validate `Origin`). Allow-lists derive from
+    `MCP_PUBLIC_URL` when not set explicitly; bind-address fallback
+    with a startup warning if neither is configured.
+  - **Cross-token session isolation.** A request authenticated with
+    token A cannot use a session id minted by token B — returns 404
+    (no leak that the session id is even valid).
+  - **Deploy assets.** Multi-stage `Dockerfile` (Node 20, non-root
+    user, healthcheck). `docker-compose.yml` with named volumes for
+    registrations + Caddy data. `Caddyfile` with auto-TLS, security
+    headers, and SSE-friendly stream timeouts (`flush_interval -1`,
+    `read_timeout 300s`).
+
+  Stdio mode remains the default — no behavioural change for existing
+  installs. Set `MCP_MODE=hosted` to opt in.
+
+### Changed
+
+- `loadConfig()` accepts an optional `{ requireKeys: false }` to support
+  hosted mode (where per-token credentials supersede boot creds).
+  Stdio path still requires keys at startup.
+
 ## [0.2.0] — 2026-04-28
 
 ### Added

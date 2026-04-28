@@ -8,6 +8,18 @@ MCP-aware AI client.
 Target: elabftw **5.5+** via the [API v2](https://doc.elabftw.net/api/v2/).
 Node 18+.
 
+Two run modes:
+
+- **stdio** (default) — runs as a subprocess of a desktop MCP client
+  (Claude Desktop, Claude Code, Cursor, …). Single user, your own API
+  key, no port opened. This is what the *Quick start* below describes.
+- **hosted** (opt-in via `MCP_MODE=hosted`) — runs as an HTTP server,
+  serves multiple users from one process, each with their own API
+  key minted via a self-service `/register` form. Designed for
+  institutional deployments (lab group, PI, research-group server)
+  and for MCP clients that need a remote URL (Claude mobile,
+  claude.ai web, browser-based clients). See [Hosted mode](#hosted-mode).
+
 ## Quick start
 
 ### Single team
@@ -77,9 +89,11 @@ team in parallel and merges results.
 | `ELABFTW_REVEAL_USER_IDENTITIES` | no | `false` | `true` to surface user names / emails / orcids in formatter output. Default-off means user tools and comment listings return `user <id>` instead of PII. `elab_me` is exempt (callers always see their own identity). |
 | `ELABFTW_TIMEOUT_MS` | no | `30000` | Per-request timeout. |
 | `ELABFTW_USER_AGENT` | no | `sura-elabftw-mcp/<version>` | Shows up in instance access logs. |
+| `MCP_MODE` | no | `stdio` | `stdio` runs as an MCP subprocess (default). `hosted` runs an HTTP server — see [Hosted mode](#hosted-mode) for the additional env vars (`MCP_PUBLIC_URL`, `MCP_REGISTRATIONS_PATH`, `MCP_ALLOWED_HOSTS`, …). |
 
-**Exactly one of `ELABFTW_API_KEY` or `ELABFTW_KEY_<teamId>` must be
-set.** Mixing the two is rejected at startup.
+**In stdio mode, exactly one of `ELABFTW_API_KEY` or `ELABFTW_KEY_<teamId>`
+must be set.** Mixing the two is rejected at startup. In hosted mode,
+boot-time keys are not required (per-token credentials supersede them).
 
 ## Tools
 
@@ -273,6 +287,136 @@ for await (const row of client.paginate('experiments', { q: 'stöber' })) {
 Everything exposed as an MCP tool is also available as a `client.*`
 method. See `src/client/client.ts` for the full surface.
 
+## Hosted mode
+
+Set `MCP_MODE=hosted` to run as an HTTP server instead of a stdio
+subprocess. The same tool surface is exposed, but reached via the MCP
+[Streamable HTTP transport](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports)
+(spec `2025-06-18`).
+
+### When to use it
+
+- **Mobile / web clients.** Claude mobile, claude.ai web, and other
+  browser-based MCP clients can only talk to a remote URL. Stdio is
+  desktop-only.
+- **Shared institutional deployments.** A PI / lab group / research
+  server hosts one process; researchers register their own API key
+  via a self-service form, paste the resulting URL into their client,
+  and go. No Node install, no env-var wiring per user.
+- **Non-technical users.** Registration is a 30-second web form; the
+  user never sees Docker, npm, or a config file.
+
+### Two-layer session model
+
+- **Registration** (durable). One per user. Maps a 256-bit bearer
+  token to that user's `apiKey` + `baseUrl`. Created via `/register`,
+  persisted to a JSON file with atomic write, survives restart.
+- **MCP session** (ephemeral). One per active MCP connection,
+  identified by the `Mcp-Session-Id` header per spec. Lives in memory;
+  clients reconnect cheaply and persisting these across restarts buys
+  nothing.
+
+A registration is the long-lived "account"; a session is the per-tab
+connection.
+
+### Quick start (Docker)
+
+```bash
+cp .env.example .env  # set ELABFTW_BASE_URL, MCP_DOMAIN, MCP_PUBLIC_URL
+docker compose up -d
+```
+
+Caddy auto-provisions a Let's Encrypt cert for `MCP_DOMAIN` and
+reverse-proxies to the MCP container. Registrations persist to a
+named volume (`mcp_registrations`) so container rebuilds don't lose
+users. Tail logs with `docker compose logs -f mcp-elabftw`.
+
+Once it's up, point a browser at `https://${MCP_DOMAIN}/register`,
+fill the form, copy the URL the success page returns, and paste it
+into your MCP client.
+
+### Auth
+
+Two paths, header preferred:
+
+```
+# Recommended: header-based auth (bearer token, never in URLs / logs)
+URL:    https://mcp.example.tum.de/mcp
+Header: Authorization: Bearer 64hexchars...
+
+# Fallback: token in URL (for clients that don't yet support custom MCP headers)
+URL:    https://mcp.example.tum.de/mcp?token=64hexchars...
+```
+
+Query-token requests get a `Deprecation: true` response header. Header
+auth is the documented primary path; the URL form is preserved only
+because some MCP clients still only accept a single URL string.
+
+### Environment
+
+| Variable | Required | Default | Purpose |
+|---|---|---|---|
+| `MCP_MODE` | yes | `stdio` | Set to `hosted` to start the HTTP server. |
+| `ELABFTW_BASE_URL` | yes | — | Default base URL prefilled into the registration form. |
+| `MCP_HOST` | no | `0.0.0.0` | Bind address. Behind a reverse proxy, leave at `0.0.0.0`. |
+| `MCP_PORT` | no | `8000` | Bind port. |
+| `MCP_PUBLIC_URL` | recommended | derived | Public origin for personal URLs (e.g. `https://mcp.example.tum.de`). Also auto-derives the DNS-rebind allow-list. Without this you get a startup warning and fallback to bind-address-only. |
+| `MCP_REGISTRATIONS_PATH` | no | `./registrations.json` | Where the JSON store lives. Mount a volume here in Docker. The Dockerfile sets it to `/var/lib/elabftw-mcp/registrations.json`. |
+| `MCP_ALLOWED_HOSTS` | no | derived from `MCP_PUBLIC_URL` | Comma-list, DNS-rebind allow-list (overrides the derived value). |
+| `MCP_ALLOWED_ORIGINS` | no | derived from `MCP_PUBLIC_URL` | Comma-list, CORS-style origin validation (overrides derived). |
+
+`ELABFTW_ALLOW_WRITES` / `ELABFTW_ALLOW_DESTRUCTIVE` /
+`ELABFTW_REVEAL_USER_IDENTITIES` apply globally to the process — every
+registered user sees the same flag set. There is currently no
+per-user write gating.
+
+### Security posture
+
+This is **institutional, not public-SaaS.** The auth model is a static
+bearer token per registration, no OAuth dance. That fits a
+PI/lab/research-group server behind a reverse proxy with controlled
+access. It does **not** fit "register here for free, anyone on the
+internet can use it" — for that, layer OAuth 2.1 with PKCE on top
+(via `oauth2-proxy`, your IdP, or a future upstream feature).
+
+What's implemented:
+
+- TLS terminated at the reverse proxy (Caddy auto-TLS in the bundled
+  Compose).
+- Bearer-token auth required on every `/mcp` request. 401s carry a
+  spec-compliant `WWW-Authenticate` header so clients can discover
+  the auth scheme.
+- DNS-rebinding protection on by default (spec-mandated). Reject any
+  request whose `Origin` doesn't match the allow-list.
+- Cross-token session isolation: a session id minted by user A is a
+  404 for user B's token (no information leak about whether the id is
+  valid).
+- Tokens are 256-bit random hex (not UUIDs — UUID v4 is only 122
+  random bits). Stored verbatim in a 0o600 JSON file.
+- Health probe at `GET /healthz` for orchestrator wiring.
+
+What is **out of scope** for this release:
+
+- Token revocation API (delete the line from the JSON file by hand
+  for now).
+- Hashed token storage (stored verbatim — encrypt the volume / set
+  filesystem ACLs accordingly).
+- Per-user audit logs.
+- Rate limiting on `/register`.
+- OAuth / OIDC for institutional SSO.
+
+If your deployment posture requires any of those, file an issue —
+they are deliberate v1 omissions, not inherent limitations.
+
+### Acknowledgements
+
+Hosted-mode deployment shape (Caddy + Compose + `/register` UX)
+follows the design that [@harrytyp](https://github.com/harrytyp)
+prototyped in his fork. The upstream implementation ports the idea
+to the current Streamable HTTP transport, threads per-token
+credentials through to the actual tool calls, and tightens spec
+compliance.
+
 ## Development
 
 ```bash
@@ -298,15 +442,30 @@ the elabftw community (see
 upstream declined to build an official MCP, citing tool-poisoning and
 firewall concerns).
 
-- **stdio only, no network exposure.** The server talks MCP over
-  stdin/stdout to a locally-trusted parent process (Claude Desktop,
-  Claude Code, Cursor, etc.). No port is opened.
-- **The user's own API key.** All elabftw calls are authenticated with
-  a key you minted in *your* UI, with *your* permissions. The MCP has
-  no elevated access — it can only do what you could do by hand.
+### Stdio mode (default)
+
+- **No network exposure.** The server talks MCP over stdin/stdout to
+  a locally-trusted parent process (Claude Desktop, Claude Code,
+  Cursor, etc.). No port is opened.
+- **The user's own API key.** All elabftw calls are authenticated
+  with a key you minted in *your* UI, with *your* permissions. The
+  MCP has no elevated access — it can only do what you could do by
+  hand.
 - **Firewall-bound instances stay that way.** The MCP runs on your
-  machine; only your machine talks to elabftw. It does not route data
-  through any third-party service.
+  machine; only your machine talks to elabftw. It does not route
+  data through any third-party service.
+
+### Hosted mode (opt-in)
+
+See [Hosted mode → Security posture](#security-posture) above for the
+full hosted-mode model. The short version: it is designed for
+institutional deployment behind a reverse proxy, with each user
+registering their own API key against their own bearer token. It
+is **not** designed as a public-internet SaaS — for that, layer OAuth
+on top.
+
+### Both modes
+
 - **Writes are off by default.** Even a read-write API key is exposed
   to the model as read-only unless you set `ELABFTW_ALLOW_WRITES=true`.
   Audit-trail actions (lock/sign/timestamp/bloxberg) require a second
