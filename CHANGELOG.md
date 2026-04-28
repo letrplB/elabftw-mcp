@@ -6,6 +6,18 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Added
+
+- `elab_create_entity` now accepts `content_type: "html" | "markdown"`,
+  so markdown bodies (GFM tables, `#` headings, fenced code) render
+  correctly without a second tool call. The MCP layer forwards the
+  field on POST and, for older elabftw versions that drop it there,
+  transparently re-PATCHes after the initial fetch (re-sending `body`
+  so it flows through elabftw's markdown → HTML pipeline). If the
+  fallback PATCH fails, the response includes a note pointing at
+  `elab_update_entity` to retry. `ElabCreateEntityInput` gains the same
+  field for programmatic clients.
+
 ## [0.1.3] — 2026-04-23
 
 ### Added

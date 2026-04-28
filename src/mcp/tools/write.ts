@@ -38,6 +38,12 @@ export function registerWriteTools(
         ),
       title: z.string().optional(),
       body: z.string().optional(),
+      content_type: z
+        .enum(['html', 'markdown'])
+        .optional()
+        .describe(
+          'Body rendering mode. Default `html`. Pass `markdown` when `body` uses GFM tables, `#` headings, fenced code, etc. — otherwise they render as literal characters. Older elabftw versions ignore this on POST; the tool transparently re-PATCHes if the value did not land.'
+        ),
       tags: z.array(z.string()).optional(),
       metadata: z
         .string()
@@ -53,9 +59,16 @@ export function registerWriteTools(
         category_id?: number;
         title?: string;
         body?: string;
+        content_type?: 'html' | 'markdown';
         tags?: string[];
         metadata?: string;
       };
+      const ct =
+        input.content_type === 'markdown'
+          ? 2
+          : input.content_type === 'html'
+            ? 1
+            : undefined;
       const t = effectiveTeam(registry, input.team);
       const client = clientFor(registry, input.team);
       const isSchemaKind =
@@ -69,26 +82,53 @@ export function registerWriteTools(
             body: input.body,
             tags: input.tags,
             metadata: input.metadata,
+            ...(ct ? { content_type: ct as 1 | 2 } : {}),
           });
-          if (id == null) return { id, landedTeam: undefined as number | undefined, patched: false };
+          if (id == null)
+            return {
+              id,
+              landedTeam: undefined as number | undefined,
+              schemaPatched: false,
+              contentTypePatched: false,
+            };
           // For templates/items_types, POST accepts only `title` reliably;
-          // follow up with PATCH so body/metadata actually land.
-          let patched = false;
-          if (isSchemaKind && (input.body || input.metadata)) {
+          // follow up with PATCH so body/metadata/content_type actually land.
+          let schemaPatched = false;
+          if (isSchemaKind && (input.body || input.metadata || ct)) {
             try {
               await client.update(input.entityType, id, {
                 ...(input.body !== undefined ? { body: input.body } : {}),
                 ...(input.metadata !== undefined ? { metadata: input.metadata } : {}),
+                ...(ct ? { content_type: ct as 1 | 2 } : {}),
               });
-              patched = true;
+              schemaPatched = true;
             } catch {
-              // Leave patched=false; creation itself succeeded.
+              // Leave schemaPatched=false; creation itself succeeded.
             }
           }
           const fresh = await client.get(input.entityType, id);
-          return { id, landedTeam: fresh.team, patched };
+          // Older elabftw versions ignore content_type on POST. If the
+          // value didn't land, re-PATCH (and re-send body so it renders
+          // through the markdown pipeline cleanly).
+          let contentTypePatched = true;
+          if (!isSchemaKind && ct && fresh.content_type !== ct) {
+            try {
+              await client.update(input.entityType, id, {
+                content_type: ct as 1 | 2,
+                ...(input.body !== undefined ? { body: input.body } : {}),
+              });
+            } catch {
+              contentTypePatched = false;
+            }
+          }
+          return {
+            id,
+            landedTeam: fresh.team,
+            schemaPatched,
+            contentTypePatched,
+          };
         },
-        ({ id, landedTeam, patched }) => {
+        ({ id, landedTeam, schemaPatched, contentTypePatched }) => {
           if (id == null) {
             return errorText(
               'Create succeeded but elabftw returned no Location header.'
@@ -106,10 +146,18 @@ export function registerWriteTools(
               : input.entityType === 'items_types'
                 ? 'items_type'
                 : input.entityType.slice(0, -1);
-          const patchNote =
-            isSchemaKind && (input.body || input.metadata) && !patched
-              ? ' (POST ok; follow-up PATCH for body/metadata failed — use elab_update_entity to retry)'
-              : '';
+          const notes: string[] = [];
+          if (isSchemaKind && (input.body || input.metadata) && !schemaPatched) {
+            notes.push(
+              'follow-up PATCH for body/metadata failed — use elab_update_entity to retry'
+            );
+          }
+          if (!contentTypePatched) {
+            notes.push(
+              `content_type=${input.content_type} did not land and re-PATCH failed — call elab_update_entity({content_type: "${input.content_type}", body}) to fix rendering`
+            );
+          }
+          const patchNote = notes.length ? ` (${notes.join('; ')})` : '';
           return text(`Created ${label} #${id} in team ${t}.${patchNote}`);
         }
       );

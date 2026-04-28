@@ -237,6 +237,12 @@ export interface ElabCreateEntityInput {
   template?: number;
   title?: string;
   body?: string;
+  /**
+   * 1 = HTML (default), 2 = Markdown. Older elabftw versions may ignore
+   * this on POST; the MCP `elab_create_entity` tool re-PATCHes when the
+   * value doesn't land on the new entity.
+   */
+  content_type?: 1 | 2;
   tags?: string[];
   /** Metadata as a JSON string (safest across versions). */
   metadata?: string;

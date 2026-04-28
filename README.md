@@ -116,7 +116,7 @@ set.** Mixing the two is rejected at startup.
 
 | Tool | Purpose |
 |---|---|
-| `elab_create_entity` | Create an experiment or item (optionally from a template). Verifies the new entry lands in the requested team. Bodies are stored as HTML by default — see "Rich body rendering" below if you want markdown. |
+| `elab_create_entity` | Create an experiment or item (optionally from a template). Verifies the new entry lands in the requested team. `content_type` toggles body rendering between `"html"` (default) and `"markdown"` — see "Rich body rendering" below. |
 | `elab_update_entity` | Patch title / body / category / status / rating / date / metadata / permissions. `content_type` toggles body rendering between `"html"` (default) and `"markdown"`. Switch to `"markdown"` when your body uses GFM tables, `#` headings, fenced code, etc. — otherwise they render as literal characters. |
 | `elab_update_extra_field` | Patch a single `extra_fields` value without rewriting the whole metadata blob. |
 | `elab_duplicate_entity` | Duplicate with optional file copy and back-link. |
@@ -142,23 +142,25 @@ intervention. Gated behind a second flag on purpose.
 ### Rich body rendering
 
 elabftw stores each entity body with a `content_type`: **HTML (default)**
-or **markdown**. This matters because `elab_create_entity` does not
-currently expose `content_type` — every new entry is created in HTML
-mode. If you send a markdown-flavoured body at creation time
-(`# heading`, GFM tables, `**bold**`), it will be stored verbatim as
-HTML and rendered as raw characters in the UI.
+or **markdown**. If you send a markdown-flavoured body
+(`# heading`, GFM tables, `**bold**`) under `content_type: "html"`, it
+is stored verbatim as HTML and rendered as raw characters in the UI.
 
-Two-step pattern that works:
+Both `elab_create_entity` and `elab_update_entity` accept
+`content_type: "html" | "markdown"`. Pass `"markdown"` whenever the body
+uses GFM constructs:
 
 ```
-elab_create_entity({ entityType: "experiments", title, body, tags })
+elab_create_entity({ entityType: "experiments", title, body, content_type: "markdown", tags })
 elab_update_entity({ entityType: "experiments", id, content_type: "markdown", body })
 ```
 
-The `update` call flips the stored `content_type` *and* re-serves the
-body through elabftw's markdown → HTML pipeline so tables, headings,
-and links render correctly. You can also use `content_type: "markdown"`
-on any later update that touches `body`.
+elabftw's POST endpoints honor `content_type` on recent versions. On
+older instances that ignore it on POST, `elab_create_entity`
+transparently re-PATCHes after creation so the value lands and the body
+is re-served through elabftw's markdown → HTML pipeline. If the
+fallback PATCH itself fails, the tool surfaces a note in its response
+pointing you at `elab_update_entity` to retry.
 
 ## How team scoping works
 
@@ -245,10 +247,9 @@ sanity-check that tool exists for.
   MCP tool for adding files to an entry — those still need to go
   through the elabftw UI. The underlying client method
   (`ElabftwClient.uploadFile`) exists for programmatic use.
-- **Bodies are HTML by default on create.** If you seed an entry with
-  markdown content, follow up with
-  `elab_update_entity({content_type: "markdown", body: ...})` — see
-  "Rich body rendering" above.
+- **Bodies are HTML by default on create.** Pass
+  `content_type: "markdown"` to `elab_create_entity` for markdown bodies
+  — see "Rich body rendering" above.
 
 ## Programmatic use
 
