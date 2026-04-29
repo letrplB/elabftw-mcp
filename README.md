@@ -1,4 +1,4 @@
-# @sura_ai/elabftw
+# elabftw MCP
 
 Model Context Protocol server for [elabftw](https://www.elabftw.net/) —
 search, read, and (optionally) mutate experiments, items, attachments,
@@ -6,21 +6,19 @@ comments, steps, and links in an electronic lab notebook from any
 MCP-aware AI client.
 
 Target: elabftw **5.5+** via the [API v2](https://doc.elabftw.net/api/v2/).
-Node 18+.
 
-Two ways to run:
+This repo ships **two npm packages** that share the same MCP tool
+surface but run in different shapes:
 
-- **stdio** — runs as a subprocess of a desktop MCP client
-  (Claude Desktop, Claude Code, Cursor, …). Single user, your own API
-  key, no port opened. This is the npm package `@sura_ai/elabftw` and
-  what the *Quick start* below describes.
-- **hosted** — multi-tenant HTTP server. Each user mints their own
-  token via a self-service `/register` form and manages it from
-  `/manage`. Designed for institutional deployments (lab group, PI,
-  research-group server) and for MCP clients that need a remote URL
-  (Claude mobile, claude.ai web, browser-based clients). Lives in a
-  separate package, `@sura_ai/elabftw-hosted`, distributed primarily
-  via the bundled `Dockerfile`. See [Hosted mode](#hosted-mode).
+| Package | Run shape | Who it's for |
+|---|---|---|
+| **`@sura_ai/elabftw`** | Local subprocess over stdio | A single user with their own API key, plugging the server into a desktop MCP client (Claude Desktop, Claude Code, Cursor, VS Code…). Node 18+. |
+| **`@sura_ai/elabftw-hosted`** | HTTP server (multi-tenant) | A lab / PI / research-group / institutional deployment. Each user self-registers their API key on a `/register` page, gets a personal MCP URL, and manages it at `/manage`. Reachable from Claude mobile, claude.ai web, mcp-inspector, and any other client that takes a remote URL. Distributed via the bundled `Dockerfile`. Node 20+. |
+
+If you're a single user adding eLabFTW to your own AI client, you want
+**`@sura_ai/elabftw`** — see [Quick start](#quick-start). If you're
+running a lab server that several people will share, you want
+**`@sura_ai/elabftw-hosted`** — see [Hosted mode](#hosted-mode).
 
 ## Quick start
 
@@ -76,7 +74,11 @@ pass `team=7` to route a call through the team-7 key. The tool
 `elab_search_all_teams` runs the same query across every configured
 team in parallel and merges results.
 
-## Environment
+## Environment (stdio package)
+
+These apply to `@sura_ai/elabftw` running as a stdio subprocess.
+Hosted-mode env vars are documented separately in
+[Hosted mode → Environment](#environment).
 
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
@@ -91,9 +93,9 @@ team in parallel and merges results.
 | `ELABFTW_REVEAL_USER_IDENTITIES` | no | `false` | `true` to surface user names / emails / orcids in formatter output. Default-off means user tools and comment listings return `user <id>` instead of PII. `elab_me` is exempt (callers always see their own identity). |
 | `ELABFTW_TIMEOUT_MS` | no | `30000` | Per-request timeout. |
 | `ELABFTW_USER_AGENT` | no | `sura-elabftw-mcp/<version>` | Shows up in instance access logs. |
-**In stdio mode, exactly one of `ELABFTW_API_KEY` or `ELABFTW_KEY_<teamId>`
-must be set.** Mixing the two is rejected at startup. Hosted mode is
-configured separately — see [Hosted mode](#hosted-mode).
+
+**Exactly one of `ELABFTW_API_KEY` or `ELABFTW_KEY_<teamId>` must be
+set.** Mixing the two is rejected at startup.
 
 ## Tools
 
@@ -289,12 +291,11 @@ method. See `src/client/client.ts` for the full surface.
 
 ## Hosted mode
 
-The hosted server is a separate npm package: `@sura_ai/elabftw-hosted`
-(in `packages/hosted/`). It exposes the same MCP tool surface as stdio
-but reached via the MCP
+The hosted server is the second package, **`@sura_ai/elabftw-hosted`**.
+Same MCP tool surface as the stdio package, served over the MCP
 [Streamable HTTP transport](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports)
-(spec `2025-06-18`). Distribution is primarily via the bundled
-`Dockerfile`; npm publish of the hosted package is decided per-release.
+(spec `2025-06-18`). The supported install path is the bundled
+`Dockerfile` — clone the repo, point your platform at it, you're done.
 
 ### When to use it
 
@@ -507,18 +508,35 @@ compliance.
 
 ## Development
 
-```bash
-npm install
-npm run typecheck
-npm run build      # emits dist/index.js, dist/cli.js, and dist/*.d.ts via tsup
+The repo is an npm workspace. Two packages live under `packages/`:
+
+```
+packages/
+  toolkit/   →  @sura_ai/elabftw          (stdio CLI + programmatic client)
+  hosted/    →  @sura_ai/elabftw-hosted   (Express HTTP server)
 ```
 
-Run the server locally against your instance:
+```bash
+npm install
+npm run typecheck      # both packages
+npm run build          # both packages — toolkit must build before hosted typechecks
+```
+
+Run the stdio server locally against your instance:
 
 ```bash
 ELABFTW_BASE_URL=https://elab.example.com \
 ELABFTW_API_KEY=3-... \
-node dist/cli.js
+node packages/toolkit/dist/cli.js
+```
+
+Run the hosted server locally:
+
+```bash
+ELABFTW_BASE_URL=https://elab.example.com \
+MCP_REGISTRATIONS_PATH=./.dev-registrations.json \
+node packages/hosted/dist/cli.js
+# then browser → http://localhost:8000/register
 ```
 
 ## Security model
