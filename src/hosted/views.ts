@@ -22,6 +22,14 @@ const LAYOUT_STYLE = `
            border-radius: 8px; font: inherit; font-weight: 600; cursor: pointer;
            width: 100%; margin-top: 24px; }
   button:hover { background: #005bb5; }
+  .copy-row { display: flex; gap: 8px; align-items: stretch; margin-top: 6px; }
+  .copy-row .url { flex: 1; margin: 0; }
+  .copy-btn { width: auto; margin: 0; padding: 0 14px; font-size: 0.85em;
+              white-space: nowrap; min-width: 80px; }
+  .copy-btn.copied { background: #34c759; }
+  .field-label { color: #6e6e73; font-size: 0.8em; font-weight: 600;
+                 text-transform: uppercase; letter-spacing: 0.04em;
+                 margin-top: 14px; margin-bottom: 4px; }
   .url { background: #f5f5f7; padding: 14px; border-radius: 8px;
          font-family: ui-monospace, SF Mono, Menlo, monospace; font-size: 0.85em;
          word-break: break-all; border: 1px solid #e5e5ea; }
@@ -29,6 +37,30 @@ const LAYOUT_STYLE = `
   .footer { color: #86868b; font-size: 0.8em; text-align: center; margin-top: 24px; }
   a { color: #0071e3; text-decoration: none; }
   a:hover { text-decoration: underline; }
+`.trim();
+
+const COPY_SCRIPT = `
+  document.addEventListener('click', async (e) => {
+    const btn = e.target.closest('[data-copy]');
+    if (!btn) return;
+    const value = btn.getAttribute('data-copy');
+    try {
+      await navigator.clipboard.writeText(value);
+    } catch {
+      // Fallback for browsers without async clipboard (insecure contexts).
+      const ta = document.createElement('textarea');
+      ta.value = value; ta.style.position = 'fixed'; ta.style.opacity = '0';
+      document.body.appendChild(ta); ta.select();
+      try { document.execCommand('copy'); } finally { ta.remove(); }
+    }
+    const original = btn.textContent;
+    btn.textContent = 'Copied';
+    btn.classList.add('copied');
+    setTimeout(() => {
+      btn.textContent = original;
+      btn.classList.remove('copied');
+    }, 1500);
+  });
 `.trim();
 
 function escape(s: string): string {
@@ -40,7 +72,7 @@ function escape(s: string): string {
     .replace(/'/g, '&#39;');
 }
 
-function layout(title: string, body: string): string {
+function layout(title: string, body: string, withScript = false): string {
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -55,8 +87,16 @@ function layout(title: string, body: string): string {
 ${body}
 </div>
 <p class="footer">elabftw MCP — hosted mode</p>
+${withScript ? `<script>${COPY_SCRIPT}</script>` : ''}
 </body>
 </html>`;
+}
+
+function copyRow(value: string): string {
+  return `<div class="copy-row">
+  <div class="url">${escape(value)}</div>
+  <button type="button" class="copy-btn" data-copy="${escape(value)}">Copy</button>
+</div>`;
 }
 
 export function renderRegisterForm(defaultBaseUrl: string): string {
@@ -93,19 +133,28 @@ export function renderRegisterSuccess(
   bearerUrl: string,
   bearerToken: string
 ): string {
+  const headerValue = `Bearer ${bearerToken}`;
   return layout(
     'Registered · elabftw MCP',
     `<h1>You're registered.</h1>
 
-<p><strong>Recommended — Authorization header:</strong></p>
-<div class="url">URL:    ${escape(bearerUrl)}
-Header: Authorization: Bearer ${escape(bearerToken)}</div>
+<p style="margin-top: 18px;"><strong>Recommended — Authorization header</strong></p>
+
+<div class="field-label">URL</div>
+${copyRow(bearerUrl)}
+
+<div class="field-label">Header — name</div>
+${copyRow('Authorization')}
+
+<div class="field-label">Header — value</div>
+${copyRow(headerValue)}
+
 <p class="hint">Paste these into a client that supports custom MCP headers
-(Claude Desktop ≥ Apr 2026, VS Code, mcp-inspector). Header-based auth
+(claude.ai Custom Connector, VS Code, mcp-inspector). Header-based auth
 keeps the token out of access logs and browser history.</p>
 
-<p style="margin-top: 24px;"><strong>Fallback — token in URL:</strong></p>
-<div class="url">${escape(personalUrl)}</div>
+<p style="margin-top: 28px;"><strong>Fallback — token in URL</strong></p>
+${copyRow(personalUrl)}
 <p class="hint">For older clients that only accept a URL. The MCP server
 emits a <code>Deprecation</code> response header on every call when this
 path is used.</p>
@@ -113,7 +162,8 @@ path is used.</p>
 <p class="hint" style="margin-top: 24px;">The token does not expire on its
 own. Lose it and ask your administrator to revoke + re-issue.</p>
 
-<p style="margin-top: 24px;"><a href="/register">← Register another key</a></p>`
+<p style="margin-top: 24px;"><a href="/register">← Register another key</a></p>`,
+    true
   );
 }
 
