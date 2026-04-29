@@ -8,17 +8,19 @@ MCP-aware AI client.
 Target: elabftw **5.5+** via the [API v2](https://doc.elabftw.net/api/v2/).
 Node 18+.
 
-Two run modes:
+Two ways to run:
 
-- **stdio** (default) — runs as a subprocess of a desktop MCP client
+- **stdio** — runs as a subprocess of a desktop MCP client
   (Claude Desktop, Claude Code, Cursor, …). Single user, your own API
-  key, no port opened. This is what the *Quick start* below describes.
-- **hosted** (opt-in via `MCP_MODE=hosted`) — runs as an HTTP server,
-  serves multiple users from one process, each with their own API
-  key minted via a self-service `/register` form. Designed for
-  institutional deployments (lab group, PI, research-group server)
-  and for MCP clients that need a remote URL (Claude mobile,
-  claude.ai web, browser-based clients). See [Hosted mode](#hosted-mode).
+  key, no port opened. This is the npm package `@sura_ai/elabftw` and
+  what the *Quick start* below describes.
+- **hosted** — multi-tenant HTTP server. Each user mints their own
+  token via a self-service `/register` form and manages it from
+  `/manage`. Designed for institutional deployments (lab group, PI,
+  research-group server) and for MCP clients that need a remote URL
+  (Claude mobile, claude.ai web, browser-based clients). Lives in a
+  separate package, `@sura_ai/elabftw-hosted`, distributed primarily
+  via the bundled `Dockerfile`. See [Hosted mode](#hosted-mode).
 
 ## Quick start
 
@@ -89,11 +91,9 @@ team in parallel and merges results.
 | `ELABFTW_REVEAL_USER_IDENTITIES` | no | `false` | `true` to surface user names / emails / orcids in formatter output. Default-off means user tools and comment listings return `user <id>` instead of PII. `elab_me` is exempt (callers always see their own identity). |
 | `ELABFTW_TIMEOUT_MS` | no | `30000` | Per-request timeout. |
 | `ELABFTW_USER_AGENT` | no | `sura-elabftw-mcp/<version>` | Shows up in instance access logs. |
-| `MCP_MODE` | no | `stdio` | `stdio` runs as an MCP subprocess (default). `hosted` runs an HTTP server — see [Hosted mode](#hosted-mode) for the additional env vars (`MCP_PUBLIC_URL`, `MCP_REGISTRATIONS_PATH`, `MCP_ALLOWED_HOSTS`, …). |
-
 **In stdio mode, exactly one of `ELABFTW_API_KEY` or `ELABFTW_KEY_<teamId>`
-must be set.** Mixing the two is rejected at startup. In hosted mode,
-boot-time keys are not required (per-token credentials supersede them).
+must be set.** Mixing the two is rejected at startup. Hosted mode is
+configured separately — see [Hosted mode](#hosted-mode).
 
 ## Tools
 
@@ -289,10 +289,12 @@ method. See `src/client/client.ts` for the full surface.
 
 ## Hosted mode
 
-Set `MCP_MODE=hosted` to run as an HTTP server instead of a stdio
-subprocess. The same tool surface is exposed, but reached via the MCP
+The hosted server is a separate npm package: `@sura_ai/elabftw-hosted`
+(in `packages/hosted/`). It exposes the same MCP tool surface as stdio
+but reached via the MCP
 [Streamable HTTP transport](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports)
-(spec `2025-06-18`).
+(spec `2025-06-18`). Distribution is primarily via the bundled
+`Dockerfile`; npm publish of the hosted package is decided per-release.
 
 ### When to use it
 
@@ -306,11 +308,22 @@ subprocess. The same tool surface is exposed, but reached via the MCP
 - **Non-technical users.** Registration is a 30-second web form; the
   user never sees Docker, npm, or a config file.
 
+### Network topology
+
+The hosted server makes outbound HTTPS calls to the eLabFTW instance
+on every MCP tool call. **The server, not the client, needs network
+reach to eLabFTW.** If your eLabFTW is firewalled to a uni / corp
+network (e.g. `elabftw-lin.uni-ulm.de`), the hosted server must run
+*inside* that same network — typically a uni-IT-provisioned VM with a
+public reverse proxy in front. A personal cloud VPS will not be able
+to reach it.
+
 ### Two-layer session model
 
 - **Registration** (durable). One per user. Maps a 256-bit bearer
-  token to that user's `apiKey` + `baseUrl`. Created via `/register`,
-  persisted to a JSON file with atomic write, survives restart.
+  token to that user's `apiKey` + `baseUrl` + eLabFTW `userid`.
+  Created via `/register`, persisted to a JSON file (default) or
+  SQLite (opt-in), survives restart.
 - **MCP session** (ephemeral). One per active MCP connection,
   identified by the `Mcp-Session-Id` header per spec. Lives in memory;
   clients reconnect cheaply and persisting these across restarts buys
@@ -318,6 +331,19 @@ subprocess. The same tool surface is exposed, but reached via the MCP
 
 A registration is the long-lived "account"; a session is the per-tab
 connection.
+
+### Self-service token management
+
+`/manage` is a paste-your-eLabFTW-key page. Users see every token
+registered for *their eLabFTW user* (joined by `userid`, not API-key
+value, so rotating their eLabFTW key keeps every token visible),
+revoke any of them, or mint a fresh one. Cross-linked from
+`/register` and the post-registration success page so "lost the link"
+has a one-click recovery path.
+
+There is no admin dashboard — operators still SSH in for sysadmin-
+grade actions (banning a user, bulk audit). The plain JSON / SQLite
+file is the source of truth.
 
 ### Quick start — choose your stack
 
@@ -345,9 +371,12 @@ handles TLS, you don't ship Caddy.
    | `MCP_ALLOWED_HOSTS` | `mcp.example.tum.de` |
    | `MCP_ALLOWED_ORIGINS` | `https://mcp.example.tum.de` |
    | `ELABFTW_ALLOW_WRITES` | `true` (optional) |
+   | `MCP_STORE_BACKEND` | `json` (default) or `sqlite` |
 
-   `MCP_MODE` / `MCP_HOST` / `MCP_PORT` / `MCP_REGISTRATIONS_PATH` are
-   pre-set in the Dockerfile — Coolify inherits them, no need to repeat.
+   `MCP_HOST` / `MCP_PORT` / `MCP_REGISTRATIONS_PATH` are pre-set in
+   the Dockerfile — Coolify inherits them, no need to repeat. For
+   SQLite, point `MCP_REGISTRATIONS_PATH` at a `.db` file under the
+   same volume mount.
 
 6. **Persistent storage** (Coolify UI → Storages → Add). Mount a named
    volume at `/var/lib/elabftw-mcp` — that's where the JSON registrations
@@ -409,12 +438,12 @@ because some MCP clients still only accept a single URL string.
 
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
-| `MCP_MODE` | yes | `stdio` | Set to `hosted` to start the HTTP server. |
 | `ELABFTW_BASE_URL` | yes | — | Default base URL prefilled into the registration form. |
 | `MCP_HOST` | no | `0.0.0.0` | Bind address. Behind a reverse proxy, leave at `0.0.0.0`. |
 | `MCP_PORT` | no | `8000` | Bind port. |
 | `MCP_PUBLIC_URL` | recommended | derived | Public origin for personal URLs (e.g. `https://mcp.example.tum.de`). Also auto-derives the DNS-rebind allow-list. Without this you get a startup warning and fallback to bind-address-only. |
-| `MCP_REGISTRATIONS_PATH` | no | `./registrations.json` | Where the JSON store lives. Mount a volume here in Docker. The Dockerfile sets it to `/var/lib/elabftw-mcp/registrations.json`. |
+| `MCP_STORE_BACKEND` | no | `json` | `json` (default; atomic-write JSON file, fine to a few hundred tokens) or `sqlite` (`better-sqlite3`, WAL, indexed lookups, recommended for institutional scale). |
+| `MCP_REGISTRATIONS_PATH` | no | `./registrations.json` | Where the store lives. JSON file or SQLite database depending on `MCP_STORE_BACKEND`. Mount a volume here in Docker. The Dockerfile sets it to `/var/lib/elabftw-mcp/registrations.json`. |
 | `MCP_ALLOWED_HOSTS` | no | derived from `MCP_PUBLIC_URL` | Comma-list, DNS-rebind allow-list (overrides the derived value). |
 | `MCP_ALLOWED_ORIGINS` | no | derived from `MCP_PUBLIC_URL` | Comma-list, CORS-style origin validation (overrides derived). |
 
@@ -445,18 +474,24 @@ What's implemented:
   404 for user B's token (no information leak about whether the id is
   valid).
 - Tokens are 256-bit random hex (not UUIDs — UUID v4 is only 122
-  random bits). Stored verbatim in a 0o600 JSON file.
+  random bits). Stored verbatim in a `0o600` JSON file or SQLite db.
+- **Self-service revocation.** Users revoke their own tokens at
+  `/manage` after re-authenticating with their eLabFTW key.
+  Revocation closes any live MCP sessions belonging to that token.
+- **Tokens joined to eLabFTW userid**, not API-key value — rotating
+  the eLabFTW key keeps tokens manageable.
+- Per-IP rate limit on `/manage` POSTs (10 req/min sliding window).
 - Health probe at `GET /healthz` for orchestrator wiring.
 
 What is **out of scope** for this release:
 
-- Token revocation API (delete the line from the JSON file by hand
-  for now).
 - Hashed token storage (stored verbatim — encrypt the volume / set
   filesystem ACLs accordingly).
 - Per-user audit logs.
-- Rate limiting on `/register`.
-- OAuth / OIDC for institutional SSO.
+- Rate limiting on `/register` itself (the underlying eLabFTW API
+  rate-limits failed key probes already).
+- OAuth 2.1 / OIDC for institutional SSO. Tracked for v0.5; until
+  then the eLabFTW API key is the only credential we accept.
 
 If your deployment posture requires any of those, file an issue —
 they are deliberate v1 omissions, not inherent limitations.

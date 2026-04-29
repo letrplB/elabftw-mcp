@@ -21,13 +21,13 @@ services:
       - "8000"
     environment:
       ELABFTW_BASE_URL: ${ELABFTW_BASE_URL:?must be set}
-      MCP_MODE: hosted
       MCP_HOST: 0.0.0.0
       MCP_PORT: "8000"
       MCP_PUBLIC_URL: ${MCP_PUBLIC_URL:-}
       MCP_ALLOWED_HOSTS: ${MCP_ALLOWED_HOSTS:-}
       MCP_ALLOWED_ORIGINS: ${MCP_ALLOWED_ORIGINS:-}
-      MCP_REGISTRATIONS_PATH: /var/lib/elabftw-mcp/registrations.json
+      MCP_STORE_BACKEND: ${MCP_STORE_BACKEND:-json}
+      MCP_REGISTRATIONS_PATH: ${MCP_REGISTRATIONS_PATH:-/var/lib/elabftw-mcp/registrations.json}
     volumes:
       - mcp_registrations:/var/lib/elabftw-mcp
 

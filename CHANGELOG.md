@@ -6,6 +6,66 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-04-29
+
+### Added
+
+- **Self-service token management** at `/manage`. Users paste any
+  current eLabFTW API key and see every MCP token registered for
+  their eLabFTW user — across rotated API keys, across multiple
+  registrations. Per-token revoke buttons, mint-new-token form,
+  cross-links from `/register` and the post-registration success page.
+  No more "ask your administrator to revoke."
+  - Tokens are joined to the eLabFTW *user id* (resolved via
+    `/users/me` at registration), not to the API-key value. Rotating
+    the eLabFTW key keeps every token manageable.
+  - Auth on every action by re-probing the API key — no session
+    cookies, no CSRF token plumbing. Per-IP sliding-window rate limit
+    (10 req/min) on the manage POSTs.
+  - The plaintext token value is shown only at mint time; the list
+    view never displays more than the first 8 chars + `…`.
+  - Revoking a token closes any in-flight MCP sessions that belonged
+    to it, so live tool calls fail closed.
+- **Pluggable store backend** via `MCP_STORE_BACKEND=json|sqlite`.
+  - `json` (default): unchanged behaviour from 0.3, still atomic-write,
+    still mode `0o600`. Fine to a few hundred tokens.
+  - `sqlite` (new): `better-sqlite3`-backed store with WAL journaling
+    and an indexed `(userid, base_url)` lookup path. Single-row
+    UPDATEs for `lastUsedAt` instead of full-file rewrites.
+    `MCP_REGISTRATIONS_PATH` becomes the database file when this
+    backend is selected.
+
+### Changed
+
+- **Repo split into npm workspaces.** Two packages, one repo:
+  - `@sura_ai/elabftw` (`packages/toolkit/`) — the stdio MCP server
+    and programmatic eLabFTW v2 client. Loses `express` from
+    dependencies; stdio installs are leaner. Same npm package name,
+    same bin (`sura-elabftw-mcp`), `engines: >=18` unchanged.
+  - `@sura_ai/elabftw-hosted` (`packages/hosted/`) — the Express
+    HTTP wrapper and registration store. Depends on `@sura_ai/elabftw`
+    via the workspace symlink. `engines: >=20`. Not auto-published
+    to npm — Docker is the canonical install for institutional
+    deployments.
+  - Tool wiring is centralised in the toolkit's new `buildElabMcpServer`
+    factory; both stdio and hosted runtimes consume it. The hosted
+    package no longer touches the tool registrars directly.
+- **Registration shape.** Adds `userid` (number, from `/users/me` at
+  registration). The JSON store bumps schema to v2; v1 entries are
+  dropped at startup with a warning. No production deployments to
+  migrate (0.3 was unreleased).
+- **Dockerfile** rebased on `node:22-slim` (was `node:22-alpine`) so
+  `better-sqlite3` prebuilt binaries (glibc) work out of the box.
+  Adds an `MCP_STORE_BACKEND=json` default to make the choice
+  explicit; switch to `sqlite` and point `MCP_REGISTRATIONS_PATH`
+  at a `.db` file for the SQLite path.
+
+### Removed
+
+- `MCP_MODE=hosted` dispatch in the stdio CLI. Hosted mode is now its
+  own bin (`sura-elabftw-mcp-hosted` from `@sura_ai/elabftw-hosted`),
+  reachable via Docker or the workspace's local script.
+
 ## [0.3.0] — 2026-04-28
 
 ### Added
