@@ -362,6 +362,14 @@ tool, mirroring stdio multi-key mode. Each team chip on a 2+-team
 token has an inline `×` button to remove that team without revoking
 the whole token.
 
+**Edit a token in place.** Each row also has an *Edit token settings*
+fold-out that lets you change the label, toggle permission flags, and
+(on multi-team tokens) pick the default team. The bearer token value
+is never touched — clients keep using the same URL + Authorization
+header across edits. Live MCP sessions on the token are dropped when
+permissions or default team change so the next reconnect picks up the
+new shape.
+
 There is no admin dashboard — operators still SSH in for sysadmin-
 grade actions (banning a user, bulk audit). The plain JSON / SQLite
 file is the source of truth.
@@ -469,9 +477,13 @@ because some MCP clients still only accept a single URL string.
 | `MCP_ALLOWED_ORIGINS` | no | derived from `MCP_PUBLIC_URL` | Comma-list, CORS-style origin validation (overrides derived). |
 
 `ELABFTW_ALLOW_WRITES` / `ELABFTW_ALLOW_DESTRUCTIVE` /
-`ELABFTW_REVEAL_USER_IDENTITIES` apply globally to the process — every
-registered user sees the same flag set. There is currently no
-per-user write gating.
+`ELABFTW_REVEAL_USER_IDENTITIES` are the operator's **upper bound**.
+The effective value at request time is the AND of the env-var setting
+and the user's own per-token setting (chosen via checkboxes on the
+`/register` and *Mint a new token* forms). Set the env var to `true`
+to allow users to opt in; leave it `false` to deny across the whole
+process regardless of what users tick. `ELABFTW_ALLOW_DESTRUCTIVE`
+additionally requires `ELABFTW_ALLOW_WRITES` at both layers.
 
 ### Security posture
 
@@ -496,9 +508,17 @@ What's implemented:
   valid).
 - Tokens are 256-bit random hex (not UUIDs — UUID v4 is only 122
   random bits). Stored verbatim in a `0o600` JSON file or SQLite db.
-- **Self-service revocation.** Users revoke their own tokens at
-  `/manage` after re-authenticating with their eLabFTW key.
-  Revocation closes any live MCP sessions belonging to that token.
+- **Self-service revocation + edit.** Users revoke their own tokens
+  at `/manage` after re-authenticating with their eLabFTW key. They
+  can also edit a token in place (label, permission flags, default
+  team for multi-team tokens) without invalidating the bearer value.
+  Revocation and flag changes close any live MCP sessions on the
+  affected token.
+- **Per-token permission flags.** Each registration carries its own
+  `allowWrites` / `allowDestructive` / `revealUserIdentities`. The
+  operator's env vars cap the maximum; the registration opts in.
+  Hosted servers can serve a PI with writes and students with
+  read-only on the same process.
 - **Tokens joined to eLabFTW userid**, not API-key value — rotating
   the eLabFTW key keeps tokens manageable.
 - Per-IP rate limit on `/manage` POSTs (10 req/min sliding window).
@@ -550,7 +570,7 @@ ELABFTW_API_KEY=3-... \
 node packages/toolkit/dist/cli.js
 ```
 
-Run the hosted server locally:
+Run the hosted server locally — JSON backend (default):
 
 ```bash
 ELABFTW_BASE_URL=https://elab.example.com \
@@ -558,6 +578,20 @@ MCP_REGISTRATIONS_PATH=./.dev-registrations.json \
 node packages/hosted/dist/cli.js
 # then browser → http://localhost:8000/register
 ```
+
+Or SQLite backend:
+
+```bash
+MCP_STORE_BACKEND=sqlite \
+ELABFTW_BASE_URL=https://elab.example.com \
+MCP_REGISTRATIONS_PATH=./.dev-registrations.db \
+node packages/hosted/dist/cli.js
+```
+
+Add `ELABFTW_ALLOW_WRITES=true` (and optionally `ELABFTW_ALLOW_DESTRUCTIVE=true`,
+`ELABFTW_REVEAL_USER_IDENTITIES=true`) to the env if you want users to be able
+to opt into those flags from the registration form — env vars cap, the
+checkboxes opt in.
 
 ## Security model
 
@@ -593,9 +627,13 @@ on top.
 ### Both modes
 
 - **Writes are off by default.** Even a read-write API key is exposed
-  to the model as read-only unless you set `ELABFTW_ALLOW_WRITES=true`.
-  Audit-trail actions (lock/sign/timestamp/bloxberg) require a second
-  flag, `ELABFTW_ALLOW_DESTRUCTIVE=true`.
+  to the model as read-only unless writes are enabled. In stdio mode
+  set `ELABFTW_ALLOW_WRITES=true`; in hosted mode the env var caps
+  the operator's policy *and* each registration must tick the
+  matching checkbox at `/register` or `/manage`. Audit-trail actions
+  (lock/sign/timestamp/bloxberg) require a second flag,
+  `ELABFTW_ALLOW_DESTRUCTIVE=true`, with the same hosted-mode AND
+  rule.
 - **Tool-poisoning surface.** Tool descriptions and argument schemas
   are the only thing the model sees and acts on. They live in-repo,
   are reviewable, and don't fetch remote content. If you fork, audit
