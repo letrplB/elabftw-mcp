@@ -2,11 +2,9 @@
  * Per-token MCP server factory.
  *
  * Each registered token gets its own `McpServer` instance, lazily built
- * on first connect. The instance carries a `ClientRegistry` constructed
- * from that token's API key only — so the existing tool registration
- * code (`registerReadTools`, etc.) keeps its `(server, registry, config)`
- * signature, with no async-local-storage tricks and no per-call client
- * lookup.
+ * on first connect. Tool wiring is delegated to the toolkit's
+ * `buildElabMcpServer` factory so this package never has to know which
+ * tools exist.
  *
  * Cost: one `McpServer` + tool-registration pass per active token.
  * Trade-off vs. shared-server-with-per-call-creds: simpler, immune to
@@ -14,12 +12,8 @@
  * institutional scale.
  */
 
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { ClientRegistry } from '../mcp/clients';
-import type { ElabMcpConfig } from '../mcp/config';
-import { registerFanoutTools } from '../mcp/tools/fanout';
-import { registerReadTools } from '../mcp/tools/read';
-import { registerWriteTools } from '../mcp/tools/write';
+import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { buildElabMcpServer, type ElabMcpConfig } from '@sura_ai/elabftw';
 import type { Registration } from './store';
 
 /**
@@ -54,21 +48,5 @@ export function buildMcpServerForToken(
   base: ElabMcpConfig,
   reg: Registration
 ): McpServer {
-  const config = buildTokenConfig(base, reg);
-  const registry = new ClientRegistry(config);
-
-  const server = new McpServer({
-    name: 'sura-elabftw',
-    version: '0.2.0',
-  });
-
-  registerReadTools(server, registry, config);
-  registerWriteTools(server, registry, config);
-  // Fanout is multi-team only; per-token mode is single-team by
-  // construction, so we deliberately skip it here.
-  if (registry.teams().length > 1) {
-    registerFanoutTools(server, registry);
-  }
-
-  return server;
+  return buildElabMcpServer(buildTokenConfig(base, reg));
 }

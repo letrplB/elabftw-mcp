@@ -1,0 +1,69 @@
+{
+  "name": "@sura_ai/elabftw",
+  "version": "0.4.0",
+  "description": "Model Context Protocol toolkit for elabftw (electronic lab notebook). Stdio MCP server + programmatic eLabFTW v2 client. Search, read, and write experiments, items, attachments, comments, steps, and links from any MCP-aware AI client.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "sura-elabftw-mcp": "./dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run typecheck && npm run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.25.1",
+    "turndown": "^7.2.4",
+    "zod": "^4.2.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "@types/turndown": "^5.0.6",
+    "tsup": "^8.3.5",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/letrplB/elabftw-mcp.git",
+    "directory": "packages/toolkit"
+  },
+  "bugs": {
+    "url": "https://github.com/letrplB/elabftw-mcp/issues"
+  },
+  "homepage": "https://github.com/letrplB/elabftw-mcp#readme",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "elabftw",
+    "eln",
+    "electronic-lab-notebook",
+    "laboratory",
+    "research",
+    "science",
+    "anthropic",
+    "claude",
+    "ai"
+  ],
+  "author": "bstn",
+  "license": "MIT"
+}

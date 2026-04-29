@@ -1,0 +1,57 @@
+{
+  "name": "@sura_ai/elabftw-hosted",
+  "version": "0.4.0",
+  "description": "Hosted-mode HTTP server for the elabftw MCP toolkit. Self-service registration, per-token isolation, JSON or SQLite token store. Wraps @sura_ai/elabftw for remote MCP clients.",
+  "type": "module",
+  "main": "./dist/cli.js",
+  "bin": {
+    "sura-elabftw-mcp-hosted": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run typecheck && npm run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.25.1",
+    "@sura_ai/elabftw": "^0.4.0",
+    "express": "^5.1.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.10.5",
+    "tsup": "^8.3.5",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/letrplB/elabftw-mcp.git",
+    "directory": "packages/hosted"
+  },
+  "bugs": {
+    "url": "https://github.com/letrplB/elabftw-mcp/issues"
+  },
+  "homepage": "https://github.com/letrplB/elabftw-mcp#readme",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "elabftw",
+    "eln",
+    "self-hosted",
+    "hosted-mcp"
+  ],
+  "author": "bstn",
+  "license": "MIT"
+}
