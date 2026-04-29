@@ -413,7 +413,23 @@ export async function main(): Promise<void> {
   // Body parsers — applied per-route so we don't pay for them on /mcp,
   // where the MCP SDK consumes the raw stream.
   const jsonBody = express.json({ limit: '4mb' });
-  const formBody = express.urlencoded({ extended: false, limit: '64kb' });
+  // Express 5's urlencoded middleware leaves req.body undefined when
+  // the request's Content-Type doesn't match application/x-www-form-
+  // urlencoded (e.g. a stray POST with Content-Type: application/json
+  // or none). Handlers then crash on `req.body.apiKey`. Wrap the
+  // middleware so req.body is always at least {} after it runs.
+  const urlencoded = express.urlencoded({ extended: false, limit: '64kb' });
+  const formBody = (
+    req: Request,
+    res: Response,
+    next: NextFunction
+  ): void => {
+    urlencoded(req, res, (err?: unknown) => {
+      if (err) return next(err as Error);
+      if (!req.body || typeof req.body !== 'object') req.body = {};
+      next();
+    });
+  };
 
   app.get('/healthz', (_req, res) => {
     res.type('text/plain').send('ok');
