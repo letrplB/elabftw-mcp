@@ -487,12 +487,14 @@ additionally requires `ELABFTW_ALLOW_WRITES` at both layers.
 
 ### Security posture
 
-This is **institutional, not public-SaaS.** The auth model is a static
-bearer token per registration, no OAuth dance. That fits a
-PI/lab/research-group server behind a reverse proxy with controlled
-access. It does **not** fit "register here for free, anyone on the
-internet can use it" — for that, layer OAuth 2.1 with PKCE on top
-(via `oauth2-proxy`, your IdP, or a future upstream feature).
+This is **designed for controlled-access institutional deployment**,
+not for an open-to-the-public registration page. The auth model is a
+static bearer token per registration, no OAuth dance. That fits a
+PI / lab / research-group server behind a reverse proxy where access
+is gated by an institutional firewall, VPN, or IdP. It does **not**
+fit "anyone on the internet can hit `/register` and mint a token" —
+for that, layer OAuth 2.1 with PKCE on top (via `oauth2-proxy`, your
+IdP, or a future upstream feature).
 
 What's implemented:
 
@@ -619,10 +621,10 @@ firewall concerns).
 
 See [Hosted mode → Security posture](#security-posture) above for the
 full hosted-mode model. The short version: it is designed for
-institutional deployment behind a reverse proxy, with each user
-registering their own API key against their own bearer token. It
-is **not** designed as a public-internet SaaS — for that, layer OAuth
-on top.
+controlled-access institutional deployment behind a reverse proxy,
+with each user registering their own API key against their own
+bearer token. It is **not** designed for an open-to-the-public
+registration page — for that, layer OAuth on top.
 
 ### Both modes
 
