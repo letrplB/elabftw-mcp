@@ -228,6 +228,84 @@ export function renderError(message: string): string {
   );
 }
 
+export interface JustMintedFlash {
+  personalUrl: string;
+  bearerUrl: string;
+  token: string;
+  label?: string;
+}
+
+/**
+ * Banner-only success page reached via 303 redirect from
+ * `POST /manage/mint`. Refreshing this page is harmless — the
+ * one-shot cookie that fed it is already cleared, so a refresh just
+ * shows the empty state. No form re-submission, no duplicate tokens.
+ */
+export function renderJustMinted(flash: JustMintedFlash): string {
+  const headerValue = `Bearer ${flash.token}`;
+  const labelLine = flash.label
+    ? `<p>Label: <strong>${escape(flash.label)}</strong></p>`
+    : '';
+  return layout(
+    'New token · elabftw MCP',
+    `<h1>New token minted.</h1>
+${labelLine}
+<p>Copy these now — the plaintext value is only shown on this page.
+Reload, navigate away, or close the tab and the value is gone for good
+(use it in a client first, or revoke + re-mint from the manage page).</p>
+
+<div class="field-label">URL</div>
+${copyRow(flash.bearerUrl)}
+
+<div class="field-label">Header — name</div>
+${copyRow('Authorization')}
+
+<div class="field-label">Header — value</div>
+${copyRow(headerValue)}
+
+<p class="hint" style="margin-top: 14px;">Fallback URL with the token in
+the query string (for clients that don't support custom MCP headers):</p>
+${copyRow(flash.personalUrl)}
+
+<p class="cross-link" style="margin-top: 28px;"><a href="/manage">←
+Back to all my tokens</a></p>`,
+    true
+  );
+}
+
+/**
+ * Empty state for `GET /manage/minted` when the one-shot cookie is
+ * gone (e.g. user reloaded the success page or landed on it cold).
+ */
+export function renderJustMintedEmpty(): string {
+  return layout(
+    'New token · elabftw MCP',
+    `<h1>Nothing to show.</h1>
+<p>The one-shot link to a freshly minted token has expired (cookies are
+short-lived and single-use). Mint a new token from the manage page if
+you need another.</p>
+<p class="cross-link" style="margin-top: 18px;"><a href="/manage">←
+Back to manage</a></p>`
+  );
+}
+
+/**
+ * Confirmation page reached via 303 redirect from
+ * `POST /manage/revoke`. Same PRG pattern: refreshing is harmless.
+ */
+export function renderJustRevoked(label: string): string {
+  return layout(
+    'Token revoked · elabftw MCP',
+    `<h1>Token revoked.</h1>
+<div class="flash ok" style="margin-top: 14px;">Revoked: ${escape(label)}</div>
+<p style="margin-top: 18px;">Any active MCP sessions using this token
+have been closed. Re-paste your eLabFTW key from the manage page to see
+your remaining tokens.</p>
+<p class="cross-link" style="margin-top: 24px;"><a href="/manage">←
+Back to manage</a></p>`
+  );
+}
+
 export function renderManageLogin(
   defaultBaseUrl: string,
   errorMessage?: string
@@ -263,45 +341,14 @@ export interface ManageUser {
   email?: string;
 }
 
-export interface ManageListOptions {
-  /**
-   * If a token was just minted, the success block (URL + Bearer header)
-   * is rendered above the list. The plaintext token is only shown here
-   * — the list itself only ever displays an 8-char prefix.
-   */
-  justMinted?: { personalUrl: string; bearerUrl: string; token: string };
-  /** Flash message after a successful revoke. */
-  justRevokedLabel?: string;
-}
-
 export function renderManageList(
   baseUrl: string,
   user: ManageUser,
-  registrations: Registration[],
-  options: ManageListOptions = {}
+  registrations: Registration[]
 ): string {
   const userLine = user.fullname
     ? `${user.fullname} · userid ${user.userid}`
     : `userid ${user.userid}`;
-
-  const flashRevoked = options.justRevokedLabel
-    ? `<div class="flash ok">Revoked: ${escape(options.justRevokedLabel)}</div>`
-    : '';
-
-  const newTokenBanner = options.justMinted
-    ? `<div class="new-token-banner">
-<h2>New token</h2>
-<p>Copy these now — the plaintext value is only shown once.</p>
-<div class="field-label">URL</div>
-${copyRow(options.justMinted.bearerUrl)}
-<div class="field-label">Header — name</div>
-${copyRow('Authorization')}
-<div class="field-label">Header — value</div>
-${copyRow(`Bearer ${options.justMinted.token}`)}
-<p class="hint" style="margin-top: 14px;">Fallback URL with token in query string:</p>
-${copyRow(options.justMinted.personalUrl)}
-</div>`
-    : '';
 
   const rows = registrations.length
     ? `<div class="token-list">${registrations
@@ -313,9 +360,6 @@ ${copyRow(options.justMinted.personalUrl)}
     'Manage tokens · elabftw MCP',
     `<h1>Your MCP tokens</h1>
 <p>${escape(userLine)} on <code>${escape(baseUrl)}</code></p>
-
-${flashRevoked}
-${newTokenBanner}
 
 <h2>Tokens</h2>
 ${rows}

@@ -30,8 +30,12 @@ import { SessionPool } from './sessions';
 import { openRegistrationStore, type StoreBackend } from './store';
 import {
   HIDDEN_KEY_PLACEHOLDER,
+  type JustMintedFlash,
   type ManageUser,
   renderError,
+  renderJustMinted,
+  renderJustMintedEmpty,
+  renderJustRevoked,
   renderManageList,
   renderManageLogin,
   renderRegisterForm,
@@ -298,6 +302,64 @@ class RateLimiter {
   }
 }
 
+const FLASH_MINT_COOKIE = 'mcp_just_minted';
+const FLASH_REVOKE_COOKIE = 'mcp_just_revoked';
+const FLASH_MAX_AGE_S = 120;
+
+/**
+ * Parse Cookie request header into a flat record. Tiny, dep-free —
+ * we only ever read two cookies, both server-set and JSON-encoded.
+ */
+function parseCookies(req: Request): Record<string, string> {
+  const header = req.headers.cookie;
+  if (!header) return {};
+  const out: Record<string, string> = {};
+  for (const pair of header.split(';')) {
+    const idx = pair.indexOf('=');
+    if (idx < 0) continue;
+    const name = pair.slice(0, idx).trim();
+    const value = pair.slice(idx + 1).trim();
+    if (name) {
+      try {
+        out[name] = decodeURIComponent(value);
+      } catch {
+        // ignore malformed cookies
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Set a one-shot HttpOnly flash cookie. Scoped to /manage so it never
+ * leaks onto /mcp or /register. Marked Secure when the request came
+ * over https (works behind Caddy / Coolify Traefik via the
+ * `trust proxy` setting + `x-forwarded-proto`).
+ */
+function setFlashCookie(
+  res: Response,
+  req: Request,
+  name: string,
+  value: object
+): void {
+  res.cookie(name, JSON.stringify(value), {
+    httpOnly: true,
+    sameSite: 'strict',
+    secure: req.secure,
+    path: '/manage',
+    maxAge: FLASH_MAX_AGE_S * 1000,
+  });
+}
+
+/**
+ * Clear a flash cookie unconditionally. Cookies are read once and
+ * burned — refreshing the success page after that shows an empty
+ * state, never a duplicate action.
+ */
+function clearFlashCookie(res: Response, name: string): void {
+  res.clearCookie(name, { path: '/manage' });
+}
+
 /**
  * Replace the hidden-key placeholder in rendered HTML with the real
  * eLabFTW API key. Centralised here so views never see the key — they
@@ -520,11 +582,8 @@ export async function main(): Promise<void> {
     // in-flight tool calls fail closed.
     pool.closeForToken(token);
 
-    const tokens = store.listForUser(probe.userid, baseUrl);
-    const html = renderManageList(baseUrl.replace(/\/+$/, ''), probe.user, tokens, {
-      justRevokedLabel: labelForFlash,
-    });
-    res.type('html').send(injectHiddenKey(html, apiKey));
+    setFlashCookie(res, req, FLASH_REVOKE_COOKIE, { label: labelForFlash });
+    res.redirect(303, '/manage/revoked');
   });
 
   app.post('/manage/mint', formBody, async (req, res) => {
@@ -565,15 +624,48 @@ export async function main(): Promise<void> {
       label,
     });
     const origin = deriveOrigin(req, env.publicUrl);
-    const tokens = store.listForUser(probe.userid, baseUrl);
-    const html = renderManageList(baseUrl.replace(/\/+$/, ''), probe.user, tokens, {
-      justMinted: {
-        personalUrl: `${origin}/mcp?token=${reg.token}`,
-        bearerUrl: `${origin}/mcp`,
-        token: reg.token,
-      },
-    });
-    res.type('html').send(injectHiddenKey(html, apiKey));
+    const flash: JustMintedFlash = {
+      personalUrl: `${origin}/mcp?token=${reg.token}`,
+      bearerUrl: `${origin}/mcp`,
+      token: reg.token,
+      label: reg.label,
+    };
+    setFlashCookie(res, req, FLASH_MINT_COOKIE, flash);
+    res.redirect(303, '/manage/minted');
+  });
+
+  app.get('/manage/minted', (req, res) => {
+    const cookies = parseCookies(req);
+    const raw = cookies[FLASH_MINT_COOKIE];
+    clearFlashCookie(res, FLASH_MINT_COOKIE);
+    if (!raw) {
+      res.type('html').send(renderJustMintedEmpty());
+      return;
+    }
+    let flash: JustMintedFlash;
+    try {
+      flash = JSON.parse(raw) as JustMintedFlash;
+    } catch {
+      res.type('html').send(renderJustMintedEmpty());
+      return;
+    }
+    res.type('html').send(renderJustMinted(flash));
+  });
+
+  app.get('/manage/revoked', (req, res) => {
+    const cookies = parseCookies(req);
+    const raw = cookies[FLASH_REVOKE_COOKIE];
+    clearFlashCookie(res, FLASH_REVOKE_COOKIE);
+    if (!raw) {
+      res.redirect(302, '/manage');
+      return;
+    }
+    try {
+      const flash = JSON.parse(raw) as { label: string };
+      res.type('html').send(renderJustRevoked(flash.label ?? 'token'));
+    } catch {
+      res.redirect(302, '/manage');
+    }
   });
 
   // ---- MCP endpoint ----
