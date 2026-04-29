@@ -21,16 +21,18 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.25.1",
     "@sura_ai/elabftw": "^0.4.0",
+    "better-sqlite3": "^11.7.0",
     "express": "^5.1.0"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
     "@types/express": "^5.0.0",
     "@types/node": "^22.10.5",
     "tsup": "^8.3.5",
     "typescript": "^5.7.2"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=20"
   },
   "publishConfig": {
     "access": "public"

@@ -27,7 +27,7 @@ import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import { ElabftwClient, loadConfig } from '@sura_ai/elabftw';
 import { buildMcpServerForToken } from './runtime';
 import { SessionPool } from './sessions';
-import { RegistrationStore } from './store';
+import { openRegistrationStore, type StoreBackend } from './store';
 import {
   renderError,
   renderRegisterForm,
@@ -46,6 +46,7 @@ interface HostedEnv {
   port: number;
   publicUrl?: string;
   registrationsPath: string;
+  storeBackend: StoreBackend;
   allowedHosts: string[];
   allowedOrigins: string[];
 }
@@ -134,12 +135,24 @@ function readHostedEnv(): HostedEnv {
     // biome-ignore lint/suspicious/noConsole: startup diagnostic
     console.error(`[elabftw-mcp] ${w}`);
   }
+  const backendRaw = process.env.MCP_STORE_BACKEND?.trim().toLowerCase();
+  let storeBackend: StoreBackend;
+  if (!backendRaw || backendRaw === 'json') {
+    storeBackend = 'json';
+  } else if (backendRaw === 'sqlite') {
+    storeBackend = 'sqlite';
+  } else {
+    throw new Error(
+      `MCP_STORE_BACKEND must be 'json' or 'sqlite', got: ${backendRaw}`
+    );
+  }
   return {
     host,
     port,
     publicUrl,
     registrationsPath:
       process.env.MCP_REGISTRATIONS_PATH?.trim() || DEFAULT_REG_PATH,
+    storeBackend,
     allowedHosts: hosts,
     allowedOrigins: origins,
   };
@@ -204,7 +217,10 @@ function deriveOrigin(req: Request, fallback?: string): string {
 export async function main(): Promise<void> {
   const baseConfig = loadConfig({ requireKeys: false });
   const env = readHostedEnv();
-  const store = await RegistrationStore.open(env.registrationsPath);
+  const store = await openRegistrationStore({
+    path: env.registrationsPath,
+    backend: env.storeBackend,
+  });
   const pool = new SessionPool();
 
   const app = express();
@@ -250,9 +266,11 @@ export async function main(): Promise<void> {
 
     // Validate the key by calling /users/me before minting a token.
     // Catches typos, revoked keys, and instance-mismatch up front;
-    // also resolves the team id so list responses aren't silently
-    // filtered to an empty set.
+    // also resolves the user + team ids so list responses aren't
+    // silently filtered to an empty set, and so the manage page can
+    // recognise this user even after their eLabFTW key rotates.
     let team: number;
+    let userid: number;
     try {
       const probe = new ElabftwClient({
         baseUrl: baseUrl.replace(/\/+$/, ''),
@@ -273,7 +291,20 @@ export async function main(): Promise<void> {
           );
         return;
       }
+      if (!me.userid || !Number.isFinite(me.userid) || me.userid <= 0) {
+        res
+          .status(400)
+          .type('html')
+          .send(
+            renderError(
+              `eLabFTW returned no usable user id for this key. ` +
+                `me.userid=${String(me.userid)}.`
+            )
+          );
+        return;
+      }
       team = me.team;
+      userid = me.userid;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       res
@@ -289,7 +320,7 @@ export async function main(): Promise<void> {
     }
 
     try {
-      const reg = await store.create({ apiKey, baseUrl, team, label });
+      const reg = await store.create({ apiKey, baseUrl, userid, team, label });
       const origin = deriveOrigin(req, env.publicUrl);
       const personalUrl = `${origin}/mcp?token=${reg.token}`;
       const bearerUrl = `${origin}/mcp`;
@@ -469,6 +500,7 @@ export async function main(): Promise<void> {
     console.error(`[elabftw-mcp] received ${signal}, shutting down`);
     httpServer.close();
     await pool.closeAll();
+    await store.close();
     process.exit(0);
   };
   process.on('SIGINT', () => void shutdown('SIGINT'));
