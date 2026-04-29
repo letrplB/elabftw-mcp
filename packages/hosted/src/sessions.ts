@@ -54,4 +54,19 @@ export class SessionPool {
     this.sessions.clear();
     await Promise.allSettled(all.map((s) => s.transport.close()));
   }
+
+  /**
+   * Close every live session belonging to a single token. Called when
+   * the manage page revokes a token so in-flight tool calls fail
+   * closed instead of running with the about-to-be-deleted credential.
+   */
+  closeForToken(token: string): void {
+    for (const s of [...this.sessions.values()]) {
+      if (s.token !== token) continue;
+      this.sessions.delete(s.sessionId);
+      // Best-effort close; the transport's own onclose handler runs
+      // after this returns and may try to remove() again — tolerated.
+      void s.transport.close();
+    }
+  }
 }

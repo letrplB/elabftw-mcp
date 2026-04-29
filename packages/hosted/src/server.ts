@@ -29,7 +29,11 @@ import { buildMcpServerForToken } from './runtime';
 import { SessionPool } from './sessions';
 import { openRegistrationStore, type StoreBackend } from './store';
 import {
+  HIDDEN_KEY_PLACEHOLDER,
+  type ManageUser,
   renderError,
+  renderManageList,
+  renderManageLogin,
   renderRegisterForm,
   renderRegisterSuccess,
 } from './views';
@@ -214,6 +218,103 @@ function deriveOrigin(req: Request, fallback?: string): string {
   return `${proto}://${host}`;
 }
 
+interface ProbeResult {
+  userid: number;
+  team: number;
+  user: ManageUser;
+}
+
+/**
+ * Validate an eLabFTW API key by calling `/users/me` and pull the bits
+ * we need (userid, team, friendly name). Throws with a human-readable
+ * message on any failure — caller renders the error page.
+ *
+ * Used by /register (mint a fresh token under this user) and by every
+ * /manage action (the eLabFTW key *is* the auth credential for the
+ * manage page; we re-probe it on every request rather than carrying a
+ * session cookie).
+ */
+async function probeAndAuth(
+  apiKey: string,
+  baseUrl: string,
+  userAgent: string | undefined,
+  timeoutMs: number | undefined
+): Promise<ProbeResult> {
+  const probe = new ElabftwClient({
+    baseUrl: baseUrl.replace(/\/+$/, ''),
+    apiKey,
+    userAgent,
+    timeoutMs,
+  });
+  const me = await probe.me();
+  if (!me.userid || !Number.isFinite(me.userid) || me.userid <= 0) {
+    throw new Error(
+      `eLabFTW returned no usable user id for this key. me.userid=${String(me.userid)}.`
+    );
+  }
+  if (!me.team || !Number.isFinite(me.team) || me.team <= 0) {
+    throw new Error(
+      `eLabFTW returned no usable team for this key. me.team=${String(me.team)}.`
+    );
+  }
+  return {
+    userid: me.userid,
+    team: me.team,
+    user: {
+      userid: me.userid,
+      fullname: me.fullname,
+      email: me.email,
+    },
+  };
+}
+
+/**
+ * Per-IP sliding-window rate limiter for /manage POSTs. In-memory only;
+ * resets on process restart. eLabFTW's own API rate-limits failed key
+ * lookups, so this is belt-and-braces.
+ */
+class RateLimiter {
+  private readonly windowMs: number;
+  private readonly limit: number;
+  private readonly hits = new Map<string, number[]>();
+
+  constructor(windowMs: number, limit: number) {
+    this.windowMs = windowMs;
+    this.limit = limit;
+  }
+
+  check(key: string): boolean {
+    const now = Date.now();
+    const cutoff = now - this.windowMs;
+    const record = this.hits.get(key) ?? [];
+    const recent = record.filter((t) => t > cutoff);
+    if (recent.length >= this.limit) {
+      this.hits.set(key, recent);
+      return false;
+    }
+    recent.push(now);
+    this.hits.set(key, recent);
+    return true;
+  }
+}
+
+/**
+ * Replace the hidden-key placeholder in rendered HTML with the real
+ * eLabFTW API key. Centralised here so views never see the key — they
+ * emit the marker, the route fills it in.
+ */
+function injectHiddenKey(html: string, apiKey: string): string {
+  // Escape the same way views.escape does — the hidden input is inside
+  // a value="…" attribute.
+  const escaped = apiKey
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+  return html.replaceAll(HIDDEN_KEY_PLACEHOLDER, escaped);
+}
+
 export async function main(): Promise<void> {
   const baseConfig = loadConfig({ requireKeys: false });
   const env = readHostedEnv();
@@ -269,42 +370,14 @@ export async function main(): Promise<void> {
     // also resolves the user + team ids so list responses aren't
     // silently filtered to an empty set, and so the manage page can
     // recognise this user even after their eLabFTW key rotates.
-    let team: number;
-    let userid: number;
+    let probe: ProbeResult;
     try {
-      const probe = new ElabftwClient({
-        baseUrl: baseUrl.replace(/\/+$/, ''),
+      probe = await probeAndAuth(
         apiKey,
-        userAgent: baseConfig.userAgent,
-        timeoutMs: baseConfig.timeoutMs,
-      });
-      const me = await probe.me();
-      if (!me.team || !Number.isFinite(me.team) || me.team <= 0) {
-        res
-          .status(400)
-          .type('html')
-          .send(
-            renderError(
-              `eLabFTW returned no usable team for this key. ` +
-                `me.team=${String(me.team)}.`
-            )
-          );
-        return;
-      }
-      if (!me.userid || !Number.isFinite(me.userid) || me.userid <= 0) {
-        res
-          .status(400)
-          .type('html')
-          .send(
-            renderError(
-              `eLabFTW returned no usable user id for this key. ` +
-                `me.userid=${String(me.userid)}.`
-            )
-          );
-        return;
-      }
-      team = me.team;
-      userid = me.userid;
+        baseUrl,
+        baseConfig.userAgent,
+        baseConfig.timeoutMs
+      );
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       res
@@ -320,7 +393,13 @@ export async function main(): Promise<void> {
     }
 
     try {
-      const reg = await store.create({ apiKey, baseUrl, userid, team, label });
+      const reg = await store.create({
+        apiKey,
+        baseUrl,
+        userid: probe.userid,
+        team: probe.team,
+        label,
+      });
       const origin = deriveOrigin(req, env.publicUrl);
       const personalUrl = `${origin}/mcp?token=${reg.token}`;
       const bearerUrl = `${origin}/mcp`;
@@ -335,6 +414,166 @@ export async function main(): Promise<void> {
         .type('html')
         .send(renderError('Failed to persist registration. Check server logs.'));
     }
+  });
+
+  // ---- /manage — self-service token management ----
+  // Auth model: every action submits the eLabFTW API key, which we
+  // re-probe via /users/me. No session cookies, no CSRF token plumbing.
+  // Tokens are scoped by (userid, baseUrl) so cross-instance / cross-
+  // user leakage is impossible from this surface.
+  const manageLimiter = new RateLimiter(60_000, 10);
+
+  function rateLimitOrFail(req: Request, res: Response): boolean {
+    const key = req.ip ?? 'unknown';
+    if (!manageLimiter.check(key)) {
+      res
+        .status(429)
+        .type('html')
+        .send(
+          renderError(
+            'Too many attempts from this address. Wait a minute and try again.'
+          )
+        );
+      return false;
+    }
+    return true;
+  }
+
+  app.get('/manage', (_req, res) => {
+    res.type('html').send(renderManageLogin(baseConfig.baseUrl));
+  });
+
+  app.post('/manage', formBody, async (req, res) => {
+    if (!rateLimitOrFail(req, res)) return;
+    const apiKey = (req.body.apiKey as string | undefined)?.trim();
+    const baseUrl = (req.body.baseUrl as string | undefined)?.trim();
+    if (!apiKey || !baseUrl) {
+      res
+        .status(400)
+        .type('html')
+        .send(
+          renderManageLogin(
+            baseConfig.baseUrl,
+            'Both API key and base URL are required.'
+          )
+        );
+      return;
+    }
+
+    let probe: ProbeResult;
+    try {
+      probe = await probeAndAuth(
+        apiKey,
+        baseUrl,
+        baseConfig.userAgent,
+        baseConfig.timeoutMs
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      res
+        .status(401)
+        .type('html')
+        .send(renderManageLogin(baseConfig.baseUrl, msg));
+      return;
+    }
+
+    const tokens = store.listForUser(probe.userid, baseUrl);
+    const html = renderManageList(baseUrl.replace(/\/+$/, ''), probe.user, tokens);
+    res.type('html').send(injectHiddenKey(html, apiKey));
+  });
+
+  app.post('/manage/revoke', formBody, async (req, res) => {
+    if (!rateLimitOrFail(req, res)) return;
+    const apiKey = (req.body.apiKey as string | undefined)?.trim();
+    const baseUrl = (req.body.baseUrl as string | undefined)?.trim();
+    const token = (req.body.token as string | undefined)?.trim();
+    if (!apiKey || !baseUrl || !token) {
+      res
+        .status(400)
+        .type('html')
+        .send(renderError('Missing fields on revoke form.'));
+      return;
+    }
+
+    let probe: ProbeResult;
+    try {
+      probe = await probeAndAuth(
+        apiKey,
+        baseUrl,
+        baseConfig.userAgent,
+        baseConfig.timeoutMs
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      res
+        .status(401)
+        .type('html')
+        .send(renderManageLogin(baseConfig.baseUrl, msg));
+      return;
+    }
+
+    const target = store.get(token);
+    const labelForFlash = target?.label ?? `${token.slice(0, 8)}…`;
+    await store.revokeForUser(probe.userid, baseUrl, token);
+
+    // Drop any live MCP sessions that belonged to this token so
+    // in-flight tool calls fail closed.
+    pool.closeForToken(token);
+
+    const tokens = store.listForUser(probe.userid, baseUrl);
+    const html = renderManageList(baseUrl.replace(/\/+$/, ''), probe.user, tokens, {
+      justRevokedLabel: labelForFlash,
+    });
+    res.type('html').send(injectHiddenKey(html, apiKey));
+  });
+
+  app.post('/manage/mint', formBody, async (req, res) => {
+    if (!rateLimitOrFail(req, res)) return;
+    const apiKey = (req.body.apiKey as string | undefined)?.trim();
+    const baseUrl = (req.body.baseUrl as string | undefined)?.trim();
+    const label = (req.body.label as string | undefined)?.trim() || undefined;
+    if (!apiKey || !baseUrl) {
+      res
+        .status(400)
+        .type('html')
+        .send(renderError('Missing fields on mint form.'));
+      return;
+    }
+
+    let probe: ProbeResult;
+    try {
+      probe = await probeAndAuth(
+        apiKey,
+        baseUrl,
+        baseConfig.userAgent,
+        baseConfig.timeoutMs
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      res
+        .status(401)
+        .type('html')
+        .send(renderManageLogin(baseConfig.baseUrl, msg));
+      return;
+    }
+
+    const reg = await store.create({
+      apiKey,
+      baseUrl,
+      userid: probe.userid,
+      team: probe.team,
+      label,
+    });
+    const origin = deriveOrigin(req, env.publicUrl);
+    const tokens = store.listForUser(probe.userid, baseUrl);
+    const html = renderManageList(baseUrl.replace(/\/+$/, ''), probe.user, tokens, {
+      justMinted: {
+        personalUrl: `${origin}/mcp?token=${reg.token}`,
+        bearerUrl: `${origin}/mcp`,
+        token: reg.token,
+      },
+    });
+    res.type('html').send(injectHiddenKey(html, apiKey));
   });
 
   // ---- MCP endpoint ----
