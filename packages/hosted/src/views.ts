@@ -64,6 +64,43 @@ const LAYOUT_STYLE = `
                             width: auto; }
   .empty-state { padding: 24px 16px; text-align: center; color: #86868b;
                   font-size: 0.9em; }
+  .chips { margin-top: 6px; }
+  .chip { display: inline-block; padding: 2px 8px; margin: 2px 4px 2px 0;
+          border-radius: 999px; font-size: 0.75em; font-weight: 600;
+          background: #eef1f5; color: #4a4a52; border: 1px solid #dde1e8; }
+  .chip.team { background: #e8f1ff; color: #0040a0; border-color: #b3d0ff; }
+  .chip.flag { background: #f4ecff; color: #5a2d9b; border-color: #d6c2f0; }
+  .chip.flag.danger { background: #fdecea; color: #a8261c; border-color: #f5c6c2; }
+  .chip-action { display: inline-flex; align-items: stretch; margin: 2px 4px 2px 0; }
+  .chip-action .chip { margin: 0; border-top-right-radius: 0;
+                       border-bottom-right-radius: 0; border-right: 0; }
+  .chip-action button { width: auto; margin: 0; padding: 0 8px;
+                        font-size: 0.7em; border-radius: 0 999px 999px 0;
+                        background: #ff3b30; color: #fff; border: 1px solid #ff3b30; }
+  .chip-action button:hover { background: #c1281f; border-color: #c1281f; }
+  details.add-team-fold { margin-top: 10px; }
+  details.add-team-fold summary { cursor: pointer; font-size: 0.85em;
+                                   color: #0071e3; user-select: none;
+                                   list-style: none; }
+  details.add-team-fold summary::-webkit-details-marker { display: none; }
+  details.add-team-fold summary::before { content: "+ "; font-weight: 700; }
+  details.add-team-fold[open] summary::before { content: "− "; }
+  details.add-team-fold form { margin-top: 10px; }
+  details.add-team-fold input { font-size: 0.9em; padding: 8px 10px; }
+  details.add-team-fold button { font-size: 0.9em; padding: 8px 14px;
+                                  margin-top: 12px; }
+  fieldset { border: 1px solid #e5e5ea; border-radius: 8px; padding: 12px 14px;
+             margin: 18px 0 8px; }
+  fieldset legend { padding: 0 6px; font-weight: 600; font-size: 0.9em; }
+  .checkbox-row { display: flex; gap: 10px; align-items: flex-start;
+                   margin: 10px 0; font-size: 0.9em; }
+  .checkbox-row input[type="checkbox"] { width: 18px; height: 18px;
+                                          margin: 1px 0 0; flex: 0 0 18px; }
+  .checkbox-row .label-block { color: #4a4a52; }
+  .checkbox-row .label-block .name { font-weight: 600; color: #1d1d1f;
+                                      display: block; }
+  .checkbox-row .label-block .hint { font-size: 0.85em; color: #6e6e73;
+                                      margin: 2px 0 0; }
   .new-token-banner { background: #e8f4ff; border: 1px solid #b3d7ff;
                        border-radius: 8px; padding: 14px 16px; margin: 18px 0; }
   .new-token-banner h2 { margin-top: 0; }
@@ -141,6 +178,56 @@ function formatTimestamp(iso: string | undefined): string {
   return d.toISOString().replace('T', ' ').slice(0, 16) + ' UTC';
 }
 
+/**
+ * Three-checkbox permission group used on /register and /manage/mint.
+ * The checkboxes default to off so a fresh registration is least-
+ * privilege; the user explicitly opts into write/destructive/reveal.
+ *
+ * The destructive box's enable-state is tied to the writes box via a
+ * tiny inline script — when writes is unchecked, destructive becomes
+ * disabled and unchecks itself. Server-side `parseCheckbox` enforces
+ * the same rule belt-and-braces.
+ */
+function permissionsFieldset(): string {
+  return `<fieldset>
+<legend>Permissions</legend>
+<div class="checkbox-row">
+  <input type="checkbox" id="allowWrites" name="allowWrites" value="on">
+  <label for="allowWrites" class="label-block">
+    <span class="name">Allow write tools</span>
+    <span class="hint">create / update / delete entities, comments, steps, links, tags.</span>
+  </label>
+</div>
+<div class="checkbox-row">
+  <input type="checkbox" id="allowDestructive" name="allowDestructive" value="on" disabled>
+  <label for="allowDestructive" class="label-block">
+    <span class="name">Allow destructive tools</span>
+    <span class="hint">lock / sign / timestamp / bloxberg. Irreversible. Requires write tools.</span>
+  </label>
+</div>
+<div class="checkbox-row">
+  <input type="checkbox" id="revealUserIdentities" name="revealUserIdentities" value="on">
+  <label for="revealUserIdentities" class="label-block">
+    <span class="name">Reveal real names</span>
+    <span class="hint">surface user names / emails / orcids in tool output. Off = "user &lt;id&gt;" only.</span>
+  </label>
+</div>
+<script>
+(function () {
+  var w = document.getElementById('allowWrites');
+  var d = document.getElementById('allowDestructive');
+  if (!w || !d) return;
+  var sync = function () {
+    d.disabled = !w.checked;
+    if (!w.checked) d.checked = false;
+  };
+  w.addEventListener('change', sync);
+  sync();
+})();
+</script>
+</fieldset>`;
+}
+
 export function renderRegisterForm(defaultBaseUrl: string): string {
   return layout(
     'Register · elabftw MCP',
@@ -161,6 +248,8 @@ Claude Desktop, Claude mobile, or any other MCP-aware client.</p>
   <input id="label" name="label" type="text"
          placeholder="e.g. Lab notebook · MacBook">
 
+  ${permissionsFieldset()}
+
   <button type="submit">Generate MCP URL</button>
 </form>
 
@@ -168,7 +257,11 @@ Claude Desktop, Claude mobile, or any other MCP-aware client.</p>
 permissions. Treat the resulting URL as a secret — anyone with it can act on
 eLabFTW as you.</p>
 
-<p class="cross-link">Already registered? <a href="/manage">Manage your tokens</a>.</p>`
+<p class="hint">Multi-team users: register with one team's key here, then add
+more teams from the manage page.</p>
+
+<p class="cross-link">Already registered? <a href="/manage">Manage your tokens</a>.</p>`,
+    true
   );
 }
 
@@ -371,6 +464,9 @@ ${rows}
   <label for="label">Label (optional)</label>
   <input id="label" name="label" type="text"
          placeholder="e.g. Lab notebook · MacBook">
+
+  ${permissionsFieldset()}
+
   <button type="submit">Mint new token</button>
 </form>
 
@@ -378,6 +474,37 @@ ${rows}
 <a href="/manage">the manage page</a> if this form complains — for security
 the API key is not stored in your browser session.</p>`,
     true
+  );
+}
+
+export function renderTeamAdded(tokenLabel: string, team: number): string {
+  return layout(
+    'Team added · elabftw MCP',
+    `<h1>Team added.</h1>
+<div class="flash ok" style="margin-top: 14px;">
+  Team ${team} added to <strong>${escape(tokenLabel)}</strong>.
+</div>
+<p style="margin-top: 18px;">Any in-flight MCP sessions for this token
+were closed so the next reconnect picks up the new team list. Multi-team
+tokens automatically expose the <code>elab_search_all_teams</code> fanout
+tool.</p>
+<p class="cross-link" style="margin-top: 24px;"><a href="/manage">←
+Back to manage</a></p>`
+  );
+}
+
+export function renderTeamRemoved(tokenLabel: string, team: number): string {
+  return layout(
+    'Team removed · elabftw MCP',
+    `<h1>Team removed.</h1>
+<div class="flash ok" style="margin-top: 14px;">
+  Team ${team} removed from <strong>${escape(tokenLabel)}</strong>.
+</div>
+<p style="margin-top: 18px;">The token still authenticates for the
+remaining teams. Live MCP sessions on this token were closed; new
+sessions will see the reduced team set.</p>
+<p class="cross-link" style="margin-top: 24px;"><a href="/manage">←
+Back to manage</a></p>`
   );
 }
 
@@ -402,6 +529,19 @@ function renderTokenRow(reg: Registration, baseUrl: string): string {
     : '<div class="label-text empty">(no label)</div>';
 
   const prefix = `${reg.token.slice(0, 8)}…`;
+  const teamChips = reg.keys
+    .map((k) => renderTeamChip(reg, k.team, baseUrl))
+    .join('');
+
+  const flagChips: string[] = ['<span class="chip flag">read</span>'];
+  if (reg.allowWrites) flagChips.push('<span class="chip flag">write</span>');
+  if (reg.allowDestructive)
+    flagChips.push('<span class="chip flag danger">destructive</span>');
+  if (reg.revealUserIdentities)
+    flagChips.push('<span class="chip flag">names</span>');
+
+  const defaultMarker =
+    reg.keys.length > 1 ? ` · default team ${reg.defaultTeam}` : '';
 
   return `<div class="token-row">
 <div>
@@ -409,8 +549,23 @@ function renderTokenRow(reg: Registration, baseUrl: string): string {
   <div class="meta">
     <span class="token-prefix">${escape(prefix)}</span>
     · created ${escape(formatTimestamp(reg.createdAt))}
-    · last used ${escape(formatTimestamp(reg.lastUsedAt))}
+    · last used ${escape(formatTimestamp(reg.lastUsedAt))}${escape(defaultMarker)}
   </div>
+  <div class="chips">${teamChips}${flagChips.join('')}</div>
+  <details class="add-team-fold">
+    <summary>Add a team to this token</summary>
+    <form method="post" action="/manage/add-team">
+      <input type="hidden" name="apiKey" value="${escape(HIDDEN_KEY_PLACEHOLDER)}">
+      <input type="hidden" name="baseUrl" value="${escape(baseUrl)}">
+      <input type="hidden" name="token" value="${escape(reg.token)}">
+      <label>Additional eLabFTW API key (must belong to the same user)</label>
+      <input name="newApiKey" type="password" required autocomplete="off"
+             placeholder="3-cb2314b00d2845…">
+      <label>Per-team label (optional)</label>
+      <input name="keyLabel" type="text" placeholder="e.g. Teaching Group">
+      <button type="submit">Add team</button>
+    </form>
+  </details>
 </div>
 <form method="post" action="/manage/revoke">
   <input type="hidden" name="apiKey" value="${escape(HIDDEN_KEY_PLACEHOLDER)}">
@@ -419,4 +574,26 @@ function renderTokenRow(reg: Registration, baseUrl: string): string {
   <button type="submit" class="danger" onclick="return confirm('Revoke this token? This cannot be undone.');">Revoke</button>
 </form>
 </div>`;
+}
+
+/**
+ * Team chip — plain when the token has only one team (revoke covers
+ * removal), with an inline remove button when the token has 2+ teams.
+ */
+function renderTeamChip(
+  reg: Registration,
+  team: number,
+  baseUrl: string
+): string {
+  if (reg.keys.length <= 1) {
+    return `<span class="chip team">team ${team}</span>`;
+  }
+  return `<form method="post" action="/manage/remove-team" class="chip-action" onsubmit="return confirm('Remove team ${team} from this token? The token will keep working for the remaining teams.');">
+  <input type="hidden" name="apiKey" value="${escape(HIDDEN_KEY_PLACEHOLDER)}">
+  <input type="hidden" name="baseUrl" value="${escape(baseUrl)}">
+  <input type="hidden" name="token" value="${escape(reg.token)}">
+  <input type="hidden" name="team" value="${team}">
+  <span class="chip team">team ${team}</span>
+  <button type="submit" title="Remove team ${team}">×</button>
+</form>`;
 }

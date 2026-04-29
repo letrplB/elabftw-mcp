@@ -18,13 +18,16 @@ import type { Registration } from './store';
 
 /**
  * Project a base config + a registration into the per-token config that
- * tools see. Inherits all flags (`allowWrites`, `userAgent`, etc.) from
- * the base; replaces `baseUrl` and `keys` with the registration's own.
+ * tools see. Replaces `baseUrl` and `keys` with the registration's own.
  *
- * The team id is resolved at registration time by calling `/users/me`
- * with the supplied key. Falling back to `0` would leave the
- * registry's `defaultTeam` mismatched against eLabFTW's view of the
- * key, which silently filters every list response to an empty set.
+ * Per-token flags (`allowWrites`, `allowDestructive`,
+ * `revealUserIdentities`) are AND-ed against the base config — the
+ * operator's env-var settings are the upper bound, the registration is
+ * the user's opt-in subset.
+ *
+ * Multi-key registrations route the toolkit's existing per-team
+ * registry: every tool gets a `team` parameter, and the
+ * `elab_search_all_teams` fanout tool auto-registers on >1 keys.
  */
 export function buildTokenConfig(
   base: ElabMcpConfig,
@@ -33,9 +36,18 @@ export function buildTokenConfig(
   return {
     ...base,
     baseUrl: reg.baseUrl,
-    keys: [{ team: reg.team, key: reg.apiKey, label: reg.label }],
-    defaultTeam: reg.team,
+    keys: reg.keys.map((k) => ({
+      team: k.team,
+      key: k.apiKey,
+      label: k.label,
+    })),
+    defaultTeam: reg.defaultTeam,
     teamDeclaredByUser: true,
+    allowWrites: base.allowWrites && reg.allowWrites,
+    allowDestructive:
+      base.allowDestructive && reg.allowDestructive && reg.allowWrites,
+    revealUserIdentities:
+      base.revealUserIdentities && reg.revealUserIdentities,
   };
 }
 

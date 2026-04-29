@@ -5,16 +5,18 @@
  * to ~hundreds of tokens; every mutation rewrites the whole file, so
  * heavier deployments should pick the SQLite backend.
  *
- * Schema is versioned. v1 (pre-userid) entries are dropped on load
- * with a startup warning — there are no production deployments to
- * migrate, and silently re-using v1 rows would leave the userid join
- * key empty. Operators who hit this can re-register in a few seconds.
+ * Schema is versioned. v1 (pre-userid) and v2 (single-key, no per-token
+ * flags) entries are dropped on load with a startup warning — there are
+ * no production deployments to migrate, and silently re-using older
+ * rows would leave the new fields empty. Operators who hit this can
+ * re-register in a few seconds.
  */
 
 import { existsSync } from 'node:fs';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import {
+  type AddTeamInput,
   type CreateInput,
   type Registration,
   type RegistrationStore,
@@ -22,10 +24,10 @@ import {
   normaliseBaseUrl,
 } from './index';
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
-interface PersistedShapeV2 {
-  version: 2;
+interface PersistedShapeV3 {
+  version: 3;
   registrations: Registration[];
 }
 
@@ -49,7 +51,7 @@ export class JsonRegistrationStore implements RegistrationStore {
     const absPath = resolve(path);
     if (!existsSync(absPath)) {
       await mkdir(dirname(absPath), { recursive: true });
-      const empty: PersistedShapeV2 = {
+      const empty: PersistedShapeV3 = {
         version: SCHEMA_VERSION,
         registrations: [],
       };
@@ -72,13 +74,14 @@ export class JsonRegistrationStore implements RegistrationStore {
       );
     }
 
-    if (parsed.version === 1) {
+    if (parsed.version === 1 || parsed.version === 2) {
       // biome-ignore lint/suspicious/noConsole: startup migration notice
       console.error(
-        `[elabftw-mcp] ${absPath} is schema v1 (pre-userid). All entries ` +
-          `dropped — re-register tokens via /register. Writing a fresh v${SCHEMA_VERSION} file.`
+        `[elabftw-mcp] ${absPath} is schema v${parsed.version} (pre-multi-team / pre-flags). ` +
+          `All entries dropped — re-register tokens via /register. ` +
+          `Writing a fresh v${SCHEMA_VERSION} file.`
       );
-      const empty: PersistedShapeV2 = {
+      const empty: PersistedShapeV3 = {
         version: SCHEMA_VERSION,
         registrations: [],
       };
@@ -118,14 +121,79 @@ export class JsonRegistrationStore implements RegistrationStore {
   async create(input: CreateInput): Promise<Registration> {
     const reg: Registration = {
       token: mintToken(),
-      apiKey: input.apiKey,
       baseUrl: normaliseBaseUrl(input.baseUrl),
       userid: input.userid,
-      team: input.team,
+      keys: [
+        {
+          apiKey: input.apiKey,
+          team: input.team,
+          label: input.keyLabel,
+        },
+      ],
+      defaultTeam: input.team,
+      allowWrites: input.allowWrites ?? false,
+      allowDestructive: input.allowDestructive ?? false,
+      revealUserIdentities: input.revealUserIdentities ?? false,
       label: input.label,
       createdAt: new Date().toISOString(),
     };
     this.registrations.set(reg.token, reg);
+    await this.flush();
+    return reg;
+  }
+
+  async addKey(
+    userid: number,
+    baseUrl: string,
+    input: AddTeamInput
+  ): Promise<Registration | undefined> {
+    const reg = this.registrations.get(input.token);
+    if (!reg) return undefined;
+    if (reg.userid !== userid || reg.baseUrl !== normaliseBaseUrl(baseUrl)) {
+      return undefined;
+    }
+    if (reg.keys.some((k) => k.team === input.team)) {
+      // Caller should have caught this; if it slips through we keep
+      // the registration unchanged rather than create a duplicate row.
+      return reg;
+    }
+    reg.keys.push({
+      apiKey: input.apiKey,
+      team: input.team,
+      label: input.label,
+    });
+    await this.flush();
+    return reg;
+  }
+
+  async removeKey(
+    userid: number,
+    baseUrl: string,
+    token: string,
+    team: number
+  ): Promise<Registration | undefined> {
+    const reg = this.registrations.get(token);
+    if (!reg) return undefined;
+    if (reg.userid !== userid || reg.baseUrl !== normaliseBaseUrl(baseUrl)) {
+      return undefined;
+    }
+    if (reg.keys.length <= 1) {
+      // Last team: caller should have used revoke. No-op for safety.
+      return reg;
+    }
+    const next = reg.keys.filter((k) => k.team !== team);
+    if (next.length === reg.keys.length) {
+      // Team not found on this token — no-op.
+      return reg;
+    }
+    reg.keys = next;
+    if (reg.defaultTeam === team) {
+      // Smallest remaining team becomes the new default.
+      reg.defaultTeam = next.reduce(
+        (lo, k) => (k.team < lo ? k.team : lo),
+        next[0]!.team
+      );
+    }
     await this.flush();
     return reg;
   }
@@ -195,7 +263,7 @@ export class JsonRegistrationStore implements RegistrationStore {
   }
 
   private async flushNow(): Promise<void> {
-    const payload: PersistedShapeV2 = {
+    const payload: PersistedShapeV3 = {
       version: SCHEMA_VERSION,
       registrations: this.list(),
     };

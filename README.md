@@ -342,6 +342,26 @@ revoke any of them, or mint a fresh one. Cross-linked from
 `/register` and the post-registration success page so "lost the link"
 has a one-click recovery path.
 
+**Per-token permission flags.** The `/register` and *Mint a new
+token* forms expose three checkboxes — *Allow write tools*, *Allow
+destructive tools*, *Reveal real names*. Each token carries its own
+set; effective behaviour at request time is the AND of the
+registration setting and the operator's env-var setting (the env
+vars listed in the *Environment* section below cap institutional
+policy; the registration opts in). A PI can mint themselves a
+read-write token and student tokens that stay read-only on the same
+server.
+
+**Multi-team tokens.** Each token in the list shows team chips
+(`team 19`, `team 4`). Expand the *Add a team to this token* fold
+under a token to paste an additional eLabFTW API key — it gets
+`/users/me`-validated to confirm it belongs to the same user, then
+appended. Multi-team tokens automatically light up the `team`
+parameter on every tool plus the `elab_search_all_teams` fanout
+tool, mirroring stdio multi-key mode. Each team chip on a 2+-team
+token has an inline `×` button to remove that team without revoking
+the whole token.
+
 There is no admin dashboard — operators still SSH in for sysadmin-
 grade actions (banning a user, bulk audit). The plain JSON / SQLite
 file is the source of truth.

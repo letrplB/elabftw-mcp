@@ -40,6 +40,8 @@ import {
   renderManageLogin,
   renderRegisterForm,
   renderRegisterSuccess,
+  renderTeamAdded,
+  renderTeamRemoved,
 } from './views';
 
 const MCP_SESSION_HEADER = 'mcp-session-id';
@@ -304,6 +306,8 @@ class RateLimiter {
 
 const FLASH_MINT_COOKIE = 'mcp_just_minted';
 const FLASH_REVOKE_COOKIE = 'mcp_just_revoked';
+const FLASH_TEAM_ADDED_COOKIE = 'mcp_team_added';
+const FLASH_TEAM_REMOVED_COOKIE = 'mcp_team_removed';
 const FLASH_MAX_AGE_S = 120;
 
 /**
@@ -358,6 +362,17 @@ function setFlashCookie(
  */
 function clearFlashCookie(res: Response, name: string): void {
   res.clearCookie(name, { path: '/manage' });
+}
+
+/**
+ * Parse a checkbox value from a form POST. HTML checkboxes only send
+ * a value when checked, so an absent field means false. Common
+ * truthy strings ("on" — the default checkbox value, "true", "1",
+ * "yes") all map to true.
+ */
+function parseCheckbox(v: unknown): boolean {
+  if (typeof v !== 'string') return false;
+  return v === 'on' || v === 'true' || v === '1' || v === 'yes';
 }
 
 /**
@@ -454,6 +469,14 @@ export async function main(): Promise<void> {
       return;
     }
 
+    const allowWrites = parseCheckbox(req.body.allowWrites);
+    const rawDestructive = parseCheckbox(req.body.allowDestructive);
+    // allowDestructive requires allowWrites — UI tries to enforce
+    // this with disabled-when-unchecked logic but we belt-and-braces
+    // it server-side too.
+    const allowDestructive = rawDestructive && allowWrites;
+    const revealUserIdentities = parseCheckbox(req.body.revealUserIdentities);
+
     try {
       const reg = await store.create({
         apiKey,
@@ -461,6 +484,9 @@ export async function main(): Promise<void> {
         userid: probe.userid,
         team: probe.team,
         label,
+        allowWrites,
+        allowDestructive,
+        revealUserIdentities,
       });
       const origin = deriveOrigin(req, env.publicUrl);
       const personalUrl = `${origin}/mcp?token=${reg.token}`;
@@ -616,12 +642,20 @@ export async function main(): Promise<void> {
       return;
     }
 
+    const allowWrites = parseCheckbox(req.body.allowWrites);
+    const allowDestructive =
+      parseCheckbox(req.body.allowDestructive) && allowWrites;
+    const revealUserIdentities = parseCheckbox(req.body.revealUserIdentities);
+
     const reg = await store.create({
       apiKey,
       baseUrl,
       userid: probe.userid,
       team: probe.team,
       label,
+      allowWrites,
+      allowDestructive,
+      revealUserIdentities,
     });
     const origin = deriveOrigin(req, env.publicUrl);
     const flash: JustMintedFlash = {
@@ -632,6 +666,232 @@ export async function main(): Promise<void> {
     };
     setFlashCookie(res, req, FLASH_MINT_COOKIE, flash);
     res.redirect(303, '/manage/minted');
+  });
+
+  // ---- /manage/add-team ----
+  // Append another (apiKey, team) pair to an existing token. The
+  // session apiKey authenticates the action; the new key is probed
+  // separately and rejected unless it resolves to the same `userid`.
+  app.post('/manage/add-team', formBody, async (req, res) => {
+    if (!rateLimitOrFail(req, res)) return;
+    const apiKey = (req.body.apiKey as string | undefined)?.trim();
+    const baseUrl = (req.body.baseUrl as string | undefined)?.trim();
+    const token = (req.body.token as string | undefined)?.trim();
+    const newApiKey = (req.body.newApiKey as string | undefined)?.trim();
+    const keyLabel =
+      (req.body.keyLabel as string | undefined)?.trim() || undefined;
+    if (!apiKey || !baseUrl || !token || !newApiKey) {
+      res
+        .status(400)
+        .type('html')
+        .send(renderError('Missing fields on add-team form.'));
+      return;
+    }
+
+    let auth: ProbeResult;
+    try {
+      auth = await probeAndAuth(
+        apiKey,
+        baseUrl,
+        baseConfig.userAgent,
+        baseConfig.timeoutMs
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      res
+        .status(401)
+        .type('html')
+        .send(renderManageLogin(baseConfig.baseUrl, msg));
+      return;
+    }
+
+    const target = store.get(token);
+    if (
+      !target ||
+      target.userid !== auth.userid ||
+      target.baseUrl !== baseUrl.replace(/\/+$/, '')
+    ) {
+      res
+        .status(404)
+        .type('html')
+        .send(renderError('Token not found under this user / base URL.'));
+      return;
+    }
+
+    let newKeyProbe: ProbeResult;
+    try {
+      newKeyProbe = await probeAndAuth(
+        newApiKey,
+        baseUrl,
+        baseConfig.userAgent,
+        baseConfig.timeoutMs
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      res
+        .status(400)
+        .type('html')
+        .send(
+          renderError(
+            `Could not validate the new API key: ${msg}. The token was not changed.`
+          )
+        );
+      return;
+    }
+
+    if (newKeyProbe.userid !== auth.userid) {
+      res
+        .status(400)
+        .type('html')
+        .send(
+          renderError(
+            `The new key resolves to a different eLabFTW user (userid ` +
+              `${newKeyProbe.userid}) than this token (${auth.userid}). ` +
+              `Tokens cannot mix identities — pick a key from your own account.`
+          )
+        );
+      return;
+    }
+
+    if (target.keys.some((k) => k.team === newKeyProbe.team)) {
+      res
+        .status(400)
+        .type('html')
+        .send(
+          renderError(
+            `This token already covers team ${newKeyProbe.team}. ` +
+              `Adding another key for the same team is a no-op.`
+          )
+        );
+      return;
+    }
+
+    await store.addKey(auth.userid, baseUrl, {
+      token,
+      apiKey: newApiKey,
+      team: newKeyProbe.team,
+      label: keyLabel,
+    });
+
+    // Drop live MCP sessions for this token so the next connect
+    // picks up the new ClientRegistry with the additional team.
+    pool.closeForToken(token);
+
+    setFlashCookie(res, req, FLASH_TEAM_ADDED_COOKIE, {
+      tokenLabel: target.label ?? `${token.slice(0, 8)}…`,
+      team: newKeyProbe.team,
+    });
+    res.redirect(303, '/manage/team-added');
+  });
+
+  app.get('/manage/team-added', (req, res) => {
+    const cookies = parseCookies(req);
+    const raw = cookies[FLASH_TEAM_ADDED_COOKIE];
+    clearFlashCookie(res, FLASH_TEAM_ADDED_COOKIE);
+    if (!raw) {
+      res.redirect(302, '/manage');
+      return;
+    }
+    try {
+      const flash = JSON.parse(raw) as { tokenLabel: string; team: number };
+      res
+        .type('html')
+        .send(renderTeamAdded(flash.tokenLabel ?? 'token', flash.team));
+    } catch {
+      res.redirect(302, '/manage');
+    }
+  });
+
+  // ---- /manage/remove-team ----
+  app.post('/manage/remove-team', formBody, async (req, res) => {
+    if (!rateLimitOrFail(req, res)) return;
+    const apiKey = (req.body.apiKey as string | undefined)?.trim();
+    const baseUrl = (req.body.baseUrl as string | undefined)?.trim();
+    const token = (req.body.token as string | undefined)?.trim();
+    const teamRaw = (req.body.team as string | undefined)?.trim();
+    const team = teamRaw ? Number.parseInt(teamRaw, 10) : Number.NaN;
+    if (!apiKey || !baseUrl || !token || !Number.isFinite(team)) {
+      res
+        .status(400)
+        .type('html')
+        .send(renderError('Missing fields on remove-team form.'));
+      return;
+    }
+
+    let auth: ProbeResult;
+    try {
+      auth = await probeAndAuth(
+        apiKey,
+        baseUrl,
+        baseConfig.userAgent,
+        baseConfig.timeoutMs
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      res
+        .status(401)
+        .type('html')
+        .send(renderManageLogin(baseConfig.baseUrl, msg));
+      return;
+    }
+
+    const target = store.get(token);
+    if (
+      !target ||
+      target.userid !== auth.userid ||
+      target.baseUrl !== baseUrl.replace(/\/+$/, '')
+    ) {
+      res
+        .status(404)
+        .type('html')
+        .send(renderError('Token not found under this user / base URL.'));
+      return;
+    }
+    if (target.keys.length <= 1) {
+      res
+        .status(400)
+        .type('html')
+        .send(
+          renderError(
+            'A token must keep at least one team. Use revoke if you want to delete the whole token.'
+          )
+        );
+      return;
+    }
+    if (!target.keys.some((k) => k.team === team)) {
+      res
+        .status(400)
+        .type('html')
+        .send(renderError(`Team ${team} is not on this token.`));
+      return;
+    }
+
+    await store.removeKey(auth.userid, baseUrl, token, team);
+    pool.closeForToken(token);
+
+    setFlashCookie(res, req, FLASH_TEAM_REMOVED_COOKIE, {
+      tokenLabel: target.label ?? `${token.slice(0, 8)}…`,
+      team,
+    });
+    res.redirect(303, '/manage/team-removed');
+  });
+
+  app.get('/manage/team-removed', (req, res) => {
+    const cookies = parseCookies(req);
+    const raw = cookies[FLASH_TEAM_REMOVED_COOKIE];
+    clearFlashCookie(res, FLASH_TEAM_REMOVED_COOKIE);
+    if (!raw) {
+      res.redirect(302, '/manage');
+      return;
+    }
+    try {
+      const flash = JSON.parse(raw) as { tokenLabel: string; team: number };
+      res
+        .type('html')
+        .send(renderTeamRemoved(flash.tokenLabel ?? 'token', flash.team));
+    } catch {
+      res.redirect(302, '/manage');
+    }
   });
 
   app.get('/manage/minted', (req, res) => {

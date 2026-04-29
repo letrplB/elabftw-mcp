@@ -6,6 +6,59 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-04-29
+
+### Added
+
+- **Per-token permission flags** in hosted mode. The `/register` and
+  `/manage/mint` forms now expose three checkboxes — *Allow write
+  tools*, *Allow destructive tools*, *Reveal real names* — that map
+  directly to the existing `ELABFTW_ALLOW_WRITES`,
+  `ELABFTW_ALLOW_DESTRUCTIVE`, `ELABFTW_REVEAL_USER_IDENTITIES`
+  toolkit flags. Effective values at request time are the AND of the
+  registration setting and the operator's env-var setting — env caps,
+  registration opts in. Previously, hosted mode was stuck on whatever
+  the operator chose for the whole process.
+- **Multi-team registrations.** A single token can now cover multiple
+  teams. The `/manage` token list shows team chips (`team 19`,
+  `team 4`); each row has a fold-out *Add a team to this token* form
+  that takes another eLabFTW API key, validates that it resolves to
+  the same `userid` via `/users/me`, and appends it to the token's
+  key list. Multi-team tokens automatically expose the `team`
+  parameter on every tool plus the `elab_search_all_teams` fanout
+  tool — same behaviour the stdio package gets from
+  `ELABFTW_KEY_<teamId>` env vars.
+- **Inline team removal.** Each team chip on a multi-team token has
+  an `×` button that removes that team after confirmation. Last team
+  cannot be removed (revoke deletes the whole token instead). When
+  the removed team was the default, the smallest remaining team
+  becomes the new default.
+- **PRG flow for the new actions.** Both *Add team* and *Remove
+  team* set a one-shot cookie and 303-redirect to a confirmation
+  page (`/manage/team-added` / `/manage/team-removed`), matching the
+  v0.4 mint/revoke pattern. Live MCP sessions for the affected token
+  are dropped so the next reconnect picks up the new key set.
+
+### Changed
+
+- **`Registration` shape.** The top-level `apiKey` and `team` fields
+  are gone, replaced by `keys: Array<{apiKey, team, label?}>` plus a
+  `defaultTeam` and three boolean flag fields. Single-team
+  registrations still mint with `keys.length === 1`.
+- **JSON store** bumps schema to v3. v1 and v2 entries are dropped on
+  load with a startup warning. No production deployments to migrate.
+- **SQLite store** bumps `user_version` to 2. v1 tables are dropped
+  and recreated empty (same warning). Schema gains `keys_json`,
+  `default_team`, and three INTEGER bool columns.
+
+### Fixed
+
+- **Form-resubmit duplicate-token bug** (carried from v0.4 PRG fix
+  but worth re-stating). After mint or revoke, refreshing the page no
+  longer triggers Safari's "resend the form?" prompt or creates
+  duplicate tokens — the same PRG pattern now applies to add-team and
+  remove-team.
+
 ## [0.4.0] — 2026-04-29
 
 ### Added

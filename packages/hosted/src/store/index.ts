@@ -16,26 +16,54 @@
 import { randomBytes } from 'node:crypto';
 import { JsonRegistrationStore } from './json';
 
+export interface RegistrationKey {
+  /** Raw eLabFTW API key — sent verbatim as the Authorization header. */
+  apiKey: string;
+  /** Team id `/users/me` returned for this key at probe time. */
+  team: number;
+  /** Optional human-readable label, shown by `elab_configured_teams`. */
+  label?: string;
+}
+
 export interface Registration {
   /** Bearer secret. 64 hex chars (256 bits). */
   token: string;
-  /** Raw eLabFTW API key — sent verbatim as the Authorization header. */
-  apiKey: string;
   /** Instance root URL, no trailing slash, no `/api/v2` suffix. */
   baseUrl: string;
   /**
    * eLabFTW user id (from `/users/me` at registration time). Joins
-   * tokens to the *user* rather than the API key, so rotating the
-   * eLabFTW key doesn't orphan tokens — the manage page can still
-   * recognise them with any current key for the same user.
+   * tokens to the *user* rather than any one API key. Rotating an
+   * eLabFTW key never orphans the token; adding a team just appends
+   * another row to `keys` under the same `userid`.
    */
   userid: number;
   /**
-   * Team id from `/users/me`. Stored to avoid a per-session round-trip
-   * and so `defaultTeam` matches what eLabFTW returns under this key.
-   * Without this, list filters silently exclude every row.
+   * One entry per team this token covers. Single-team registrations
+   * have `keys.length === 1`; multi-team unlocks the `team` parameter
+   * routing on every tool plus the `elab_search_all_teams` fanout
+   * tool, exactly like stdio multi-key mode.
+   *
+   * Invariant: every key in this array resolves to the same `userid`
+   * via `/users/me`, and no two share a `team`.
    */
-  team: number;
+  keys: RegistrationKey[];
+  /**
+   * Default team id used when a tool call omits the `team` parameter.
+   * Always matches one of `keys[].team`. On registration we set it to
+   * the first (and only) key's team; multi-team users can override on
+   * a future "set default" action.
+   */
+  defaultTeam: number;
+  /**
+   * Per-token permission gates. Effective values at request time are
+   * AND-ed with the operator's env-var settings — env caps, the
+   * registration opts in. `allowDestructive` requires `allowWrites`
+   * at both layers.
+   */
+  allowWrites: boolean;
+  allowDestructive: boolean;
+  revealUserIdentities: boolean;
+  /** Human-readable token label, distinct from per-key labels. */
   label?: string;
   createdAt: string;
   lastUsedAt?: string;
@@ -45,6 +73,19 @@ export interface CreateInput {
   apiKey: string;
   baseUrl: string;
   userid: number;
+  team: number;
+  /** Per-team label that ends up on `keys[0]`. */
+  keyLabel?: string;
+  /** Token label (separate from per-team label). */
+  label?: string;
+  allowWrites?: boolean;
+  allowDestructive?: boolean;
+  revealUserIdentities?: boolean;
+}
+
+export interface AddTeamInput {
+  token: string;
+  apiKey: string;
   team: number;
   label?: string;
 }
@@ -68,6 +109,30 @@ export interface RegistrationStore {
     baseUrl: string,
     token: string
   ): Promise<boolean>;
+  /**
+   * Append a `(apiKey, team, label?)` tuple to a token's `keys[]`.
+   * Caller must have already validated that the new key resolves to
+   * the same `userid` via `/users/me` and that the team isn't already
+   * present. Returns the updated registration, or `undefined` if the
+   * token / userid pair didn't match.
+   */
+  addKey(
+    userid: number,
+    baseUrl: string,
+    input: AddTeamInput
+  ): Promise<Registration | undefined>;
+  /**
+   * Drop a team from a token's `keys[]`. Last team can't be removed
+   * (use `revoke` instead). If the removed team was `defaultTeam`,
+   * the smallest remaining team becomes the new default. Returns the
+   * updated registration, or `undefined` on no-op.
+   */
+  removeKey(
+    userid: number,
+    baseUrl: string,
+    token: string,
+    team: number
+  ): Promise<Registration | undefined>;
   touch(token: string): Promise<void>;
   close(): Promise<void>;
 }

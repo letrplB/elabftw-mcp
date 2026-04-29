@@ -27,25 +27,30 @@ import { chmod, mkdir } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import Database, { type Database as DatabaseInstance } from 'better-sqlite3';
 import {
+  type AddTeamInput,
   type CreateInput,
   type Registration,
+  type RegistrationKey,
   type RegistrationStore,
   mintToken,
   normaliseBaseUrl,
 } from './index';
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 const SCHEMA_SQL = `
   CREATE TABLE IF NOT EXISTS registrations (
-    token        TEXT PRIMARY KEY,
-    api_key      TEXT NOT NULL,
-    base_url     TEXT NOT NULL,
-    userid       INTEGER NOT NULL,
-    team         INTEGER NOT NULL,
-    label        TEXT,
-    created_at   TEXT NOT NULL,
-    last_used_at TEXT
+    token                  TEXT PRIMARY KEY,
+    base_url               TEXT NOT NULL,
+    userid                 INTEGER NOT NULL,
+    keys_json              TEXT NOT NULL,
+    default_team           INTEGER NOT NULL,
+    allow_writes           INTEGER NOT NULL DEFAULT 0,
+    allow_destructive      INTEGER NOT NULL DEFAULT 0,
+    reveal_user_identities INTEGER NOT NULL DEFAULT 0,
+    label                  TEXT,
+    created_at             TEXT NOT NULL,
+    last_used_at           TEXT
   );
   CREATE INDEX IF NOT EXISTS idx_registrations_user
     ON registrations (userid, base_url);
@@ -53,22 +58,34 @@ const SCHEMA_SQL = `
 
 interface RegistrationRow {
   token: string;
-  api_key: string;
   base_url: string;
   userid: number;
-  team: number;
+  keys_json: string;
+  default_team: number;
+  allow_writes: number;
+  allow_destructive: number;
+  reveal_user_identities: number;
   label: string | null;
   created_at: string;
   last_used_at: string | null;
 }
 
 function rowToRegistration(row: RegistrationRow): Registration {
+  let keys: RegistrationKey[];
+  try {
+    keys = JSON.parse(row.keys_json) as RegistrationKey[];
+  } catch {
+    keys = [];
+  }
   return {
     token: row.token,
-    apiKey: row.api_key,
     baseUrl: row.base_url,
     userid: row.userid,
-    team: row.team,
+    keys,
+    defaultTeam: row.default_team,
+    allowWrites: row.allow_writes !== 0,
+    allowDestructive: row.allow_destructive !== 0,
+    revealUserIdentities: row.reveal_user_identities !== 0,
     label: row.label ?? undefined,
     createdAt: row.created_at,
     lastUsedAt: row.last_used_at ?? undefined,
@@ -101,6 +118,15 @@ export class SqliteRegistrationStore implements RegistrationStore {
     const currentVersion = db.pragma('user_version', { simple: true }) as number;
 
     if (currentVersion === 0) {
+      db.exec(SCHEMA_SQL);
+      db.pragma(`user_version = ${SCHEMA_VERSION}`);
+    } else if (currentVersion === 1) {
+      // biome-ignore lint/suspicious/noConsole: startup migration notice
+      console.error(
+        `[elabftw-mcp] ${absPath} is SQLite schema v1 (single-key, no flags). ` +
+          `Dropping the old table and recreating empty — re-register tokens via /register.`
+      );
+      db.exec('DROP TABLE IF EXISTS registrations');
       db.exec(SCHEMA_SQL);
       db.pragma(`user_version = ${SCHEMA_VERSION}`);
     } else if (currentVersion !== SCHEMA_VERSION) {
@@ -154,29 +180,101 @@ export class SqliteRegistrationStore implements RegistrationStore {
   async create(input: CreateInput): Promise<Registration> {
     const reg: Registration = {
       token: mintToken(),
-      apiKey: input.apiKey,
       baseUrl: normaliseBaseUrl(input.baseUrl),
       userid: input.userid,
-      team: input.team,
+      keys: [
+        {
+          apiKey: input.apiKey,
+          team: input.team,
+          label: input.keyLabel,
+        },
+      ],
+      defaultTeam: input.team,
+      allowWrites: input.allowWrites ?? false,
+      allowDestructive: input.allowDestructive ?? false,
+      revealUserIdentities: input.revealUserIdentities ?? false,
       label: input.label,
       createdAt: new Date().toISOString(),
     };
     this.db
       .prepare(
         `INSERT INTO registrations
-           (token, api_key, base_url, userid, team, label, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`
+           (token, base_url, userid, keys_json, default_team,
+            allow_writes, allow_destructive, reveal_user_identities,
+            label, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         reg.token,
-        reg.apiKey,
         reg.baseUrl,
         reg.userid,
-        reg.team,
+        JSON.stringify(reg.keys),
+        reg.defaultTeam,
+        reg.allowWrites ? 1 : 0,
+        reg.allowDestructive ? 1 : 0,
+        reg.revealUserIdentities ? 1 : 0,
         reg.label ?? null,
         reg.createdAt
       );
     return reg;
+  }
+
+  async addKey(
+    userid: number,
+    baseUrl: string,
+    input: AddTeamInput
+  ): Promise<Registration | undefined> {
+    const existing = this.get(input.token);
+    if (!existing) return undefined;
+    if (
+      existing.userid !== userid ||
+      existing.baseUrl !== normaliseBaseUrl(baseUrl)
+    ) {
+      return undefined;
+    }
+    if (existing.keys.some((k) => k.team === input.team)) {
+      return existing;
+    }
+    const nextKeys = [
+      ...existing.keys,
+      { apiKey: input.apiKey, team: input.team, label: input.label },
+    ];
+    this.db
+      .prepare('UPDATE registrations SET keys_json = ? WHERE token = ?')
+      .run(JSON.stringify(nextKeys), input.token);
+    return { ...existing, keys: nextKeys };
+  }
+
+  async removeKey(
+    userid: number,
+    baseUrl: string,
+    token: string,
+    team: number
+  ): Promise<Registration | undefined> {
+    const existing = this.get(token);
+    if (!existing) return undefined;
+    if (
+      existing.userid !== userid ||
+      existing.baseUrl !== normaliseBaseUrl(baseUrl)
+    ) {
+      return undefined;
+    }
+    if (existing.keys.length <= 1) return existing;
+    const nextKeys = existing.keys.filter((k) => k.team !== team);
+    if (nextKeys.length === existing.keys.length) return existing;
+    let nextDefault = existing.defaultTeam;
+    if (nextDefault === team) {
+      nextDefault = nextKeys.reduce(
+        (lo, k) => (k.team < lo ? k.team : lo),
+        nextKeys[0]!.team
+      );
+    }
+    this.db
+      .prepare(
+        'UPDATE registrations SET keys_json = ?, default_team = ? WHERE token = ?'
+      )
+      .run(JSON.stringify(nextKeys), nextDefault, token);
+    return { ...existing, keys: nextKeys, defaultTeam: nextDefault };
   }
 
   async revoke(token: string): Promise<boolean> {
