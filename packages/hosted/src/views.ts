@@ -477,6 +477,27 @@ the API key is not stored in your browser session.</p>`,
   );
 }
 
+export function renderManageEdited(
+  tokenLabel: string,
+  changes: string[]
+): string {
+  const lines = changes.map((c) => `<li>${escape(c)}</li>`).join('');
+  return layout(
+    'Token updated · elabftw MCP',
+    `<h1>Token updated.</h1>
+<div class="flash ok" style="margin-top: 14px;">
+  <strong>${escape(tokenLabel)}</strong>
+</div>
+<ul style="margin-top: 14px;">${lines}</ul>
+<p style="margin-top: 18px;">If permissions or the default team
+changed, any live MCP sessions on this token were closed so the next
+reconnect picks up the new shape. The bearer token value itself is
+unchanged — clients keep using the same URL + header.</p>
+<p class="cross-link" style="margin-top: 24px;"><a href="/manage">←
+Back to manage</a></p>`
+  );
+}
+
 export function renderTeamAdded(tokenLabel: string, team: number): string {
   return layout(
     'Team added · elabftw MCP',
@@ -553,6 +574,10 @@ function renderTokenRow(reg: Registration, baseUrl: string): string {
   </div>
   <div class="chips">${teamChips}${flagChips.join('')}</div>
   <details class="add-team-fold">
+    <summary>Edit token settings</summary>
+    ${renderEditForm(reg, baseUrl)}
+  </details>
+  <details class="add-team-fold">
     <summary>Add a team to this token</summary>
     <form method="post" action="/manage/add-team">
       <input type="hidden" name="apiKey" value="${escape(HIDDEN_KEY_PLACEHOLDER)}">
@@ -574,6 +599,88 @@ function renderTokenRow(reg: Registration, baseUrl: string): string {
   <button type="submit" class="danger" onclick="return confirm('Revoke this token? This cannot be undone.');">Revoke</button>
 </form>
 </div>`;
+}
+
+/**
+ * Edit-in-place form. Pre-populates label + flag checkboxes + (when
+ * multi-team) default-team radios with the registration's current
+ * values. Submitting POSTs to /manage/edit; the route applies only
+ * the diffs.
+ */
+function renderEditForm(reg: Registration, baseUrl: string): string {
+  const labelValue = reg.label ?? '';
+  const writesChecked = reg.allowWrites ? 'checked' : '';
+  const destructiveChecked = reg.allowDestructive ? 'checked' : '';
+  const destructiveDisabled = reg.allowWrites ? '' : 'disabled';
+  const namesChecked = reg.revealUserIdentities ? 'checked' : '';
+
+  const defaultTeamSection =
+    reg.keys.length >= 2
+      ? `<label>Default team (used when a tool call omits <code>team</code>)</label>
+<div class="checkbox-row" style="flex-wrap: wrap;">
+${reg.keys
+  .map(
+    (k) => `<label class="label-block" style="margin-right: 14px;">
+  <input type="radio" name="defaultTeam" value="${k.team}" ${k.team === reg.defaultTeam ? 'checked' : ''}>
+  team ${k.team}${k.label ? ` — ${escape(k.label)}` : ''}
+</label>`
+  )
+  .join('')}
+</div>`
+      : '';
+
+  const formId = `edit-${reg.token.slice(0, 8)}`;
+
+  return `<form method="post" action="/manage/edit" id="${formId}">
+  <input type="hidden" name="apiKey" value="${escape(HIDDEN_KEY_PLACEHOLDER)}">
+  <input type="hidden" name="baseUrl" value="${escape(baseUrl)}">
+  <input type="hidden" name="token" value="${escape(reg.token)}">
+
+  <label>Label</label>
+  <input name="label" type="text" value="${escape(labelValue)}"
+         placeholder="(empty = clear)">
+
+  <fieldset>
+    <legend>Permissions</legend>
+    <div class="checkbox-row">
+      <input type="checkbox" id="${formId}-w" name="allowWrites" value="on" ${writesChecked}>
+      <label for="${formId}-w" class="label-block">
+        <span class="name">Allow write tools</span>
+        <span class="hint">create / update / delete entities, comments, steps, links, tags.</span>
+      </label>
+    </div>
+    <div class="checkbox-row">
+      <input type="checkbox" id="${formId}-d" name="allowDestructive" value="on" ${destructiveChecked} ${destructiveDisabled}>
+      <label for="${formId}-d" class="label-block">
+        <span class="name">Allow destructive tools</span>
+        <span class="hint">lock / sign / timestamp / bloxberg. Irreversible. Requires write tools.</span>
+      </label>
+    </div>
+    <div class="checkbox-row">
+      <input type="checkbox" id="${formId}-n" name="revealUserIdentities" value="on" ${namesChecked}>
+      <label for="${formId}-n" class="label-block">
+        <span class="name">Reveal real names</span>
+        <span class="hint">surface user names / emails / orcids in tool output.</span>
+      </label>
+    </div>
+    <script>
+    (function () {
+      var w = document.getElementById('${formId}-w');
+      var d = document.getElementById('${formId}-d');
+      if (!w || !d) return;
+      var sync = function () {
+        d.disabled = !w.checked;
+        if (!w.checked) d.checked = false;
+      };
+      w.addEventListener('change', sync);
+    })();
+    </script>
+  </fieldset>
+
+  ${defaultTeamSection}
+
+  <button type="submit">Save changes</button>
+</form>`;
 }
 
 /**

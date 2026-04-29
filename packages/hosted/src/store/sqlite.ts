@@ -219,6 +219,85 @@ export class SqliteRegistrationStore implements RegistrationStore {
     return reg;
   }
 
+  async updateLabel(
+    userid: number,
+    baseUrl: string,
+    token: string,
+    label: string | undefined
+  ): Promise<Registration | undefined> {
+    const existing = this.assertOwned(userid, baseUrl, token);
+    if (!existing) return undefined;
+    this.db
+      .prepare('UPDATE registrations SET label = ? WHERE token = ?')
+      .run(label ?? null, token);
+    return { ...existing, label };
+  }
+
+  async updateFlags(
+    userid: number,
+    baseUrl: string,
+    token: string,
+    flags: {
+      allowWrites: boolean;
+      allowDestructive: boolean;
+      revealUserIdentities: boolean;
+    }
+  ): Promise<Registration | undefined> {
+    const existing = this.assertOwned(userid, baseUrl, token);
+    if (!existing) return undefined;
+    const allowDestructive = flags.allowDestructive && flags.allowWrites;
+    this.db
+      .prepare(
+        `UPDATE registrations
+         SET allow_writes = ?, allow_destructive = ?, reveal_user_identities = ?
+         WHERE token = ?`
+      )
+      .run(
+        flags.allowWrites ? 1 : 0,
+        allowDestructive ? 1 : 0,
+        flags.revealUserIdentities ? 1 : 0,
+        token
+      );
+    return {
+      ...existing,
+      allowWrites: flags.allowWrites,
+      allowDestructive,
+      revealUserIdentities: flags.revealUserIdentities,
+    };
+  }
+
+  async updateDefaultTeam(
+    userid: number,
+    baseUrl: string,
+    token: string,
+    team: number
+  ): Promise<Registration | undefined> {
+    const existing = this.assertOwned(userid, baseUrl, token);
+    if (!existing) return undefined;
+    if (!existing.keys.some((k) => k.team === team)) return existing;
+    this.db
+      .prepare('UPDATE registrations SET default_team = ? WHERE token = ?')
+      .run(team, token);
+    return { ...existing, defaultTeam: team };
+  }
+
+  /**
+   * Mirror of the JSON store's `assertOwned` — fetches a registration
+   * and rejects if it doesn't belong to the calling user.
+   */
+  private assertOwned(
+    userid: number,
+    baseUrl: string,
+    token: string
+  ): Registration | undefined {
+    const reg = this.get(token);
+    if (!reg) return undefined;
+    if (reg.userid !== userid || reg.baseUrl !== normaliseBaseUrl(baseUrl)) {
+      return undefined;
+    }
+    return reg;
+  }
+
   async addKey(
     userid: number,
     baseUrl: string,

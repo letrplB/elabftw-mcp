@@ -6,6 +6,33 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.4.2] — 2026-04-29
+
+### Added
+
+- **Edit a token in place** from `/manage`. Each row gets an *Edit
+  token settings* fold-out with the token's current label,
+  permission flags, and (for multi-team tokens) default-team radio
+  buttons all pre-populated. One *Save changes* button POSTs to a
+  combined `/manage/edit` endpoint that applies only the diffs and
+  redirects (PRG) to a `/manage/edited` confirmation page listing
+  what changed.
+- Live MCP sessions on the token are dropped when permissions or
+  default team change, so the next reconnect picks up the new tool
+  surface. Pure label edits don't disturb sessions.
+- The bearer token value itself is unchanged across edits — clients
+  keep using the same URL + header. Previously, fixing a typo'd
+  label or escalating from read-only to read-write meant revoke +
+  re-mint, which forced re-pasting the new Bearer URL into every
+  client that referenced the old token.
+
+### Changed
+
+- `RegistrationStore` interface gains `updateLabel`, `updateFlags`,
+  `updateDefaultTeam`. Both backends share the same pattern as
+  `revokeForUser` — scoped by `(userid, baseUrl)` so cross-user
+  edits are impossible from this surface.
+
 ## [0.4.1] — 2026-04-29
 
 ### Added

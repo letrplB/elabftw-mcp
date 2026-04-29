@@ -1,6 +1,6 @@
 {
   "name": "@sura_ai/elabftw-hosted",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "Hosted-mode HTTP server for the elabftw MCP toolkit. Self-service registration, per-token isolation, JSON or SQLite token store. Wraps @sura_ai/elabftw for remote MCP clients.",
   "type": "module",
   "main": "./dist/cli.js",
@@ -20,7 +20,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.25.1",
-    "@sura_ai/elabftw": "^0.4.1",
+    "@sura_ai/elabftw": "^0.4.2",
     "better-sqlite3": "^11.7.0",
     "express": "^5.1.0"
   },

@@ -40,6 +40,7 @@ import {
   renderManageLogin,
   renderRegisterForm,
   renderRegisterSuccess,
+  renderManageEdited,
   renderTeamAdded,
   renderTeamRemoved,
 } from './views';
@@ -308,6 +309,7 @@ const FLASH_MINT_COOKIE = 'mcp_just_minted';
 const FLASH_REVOKE_COOKIE = 'mcp_just_revoked';
 const FLASH_TEAM_ADDED_COOKIE = 'mcp_team_added';
 const FLASH_TEAM_REMOVED_COOKIE = 'mcp_team_removed';
+const FLASH_EDITED_COOKIE = 'mcp_edited';
 const FLASH_MAX_AGE_S = 120;
 
 /**
@@ -889,6 +891,146 @@ export async function main(): Promise<void> {
       res
         .type('html')
         .send(renderTeamRemoved(flash.tokenLabel ?? 'token', flash.team));
+    } catch {
+      res.redirect(302, '/manage');
+    }
+  });
+
+  // ---- /manage/edit — combined edit endpoint ----
+  // Single form, single button, applies whatever changed (label,
+  // flags, default team). Drops live MCP sessions only when the
+  // change is functional (flags, default team) — pure label edits
+  // leave sessions alone.
+  app.post('/manage/edit', formBody, async (req, res) => {
+    if (!rateLimitOrFail(req, res)) return;
+    const apiKey = (req.body.apiKey as string | undefined)?.trim();
+    const baseUrl = (req.body.baseUrl as string | undefined)?.trim();
+    const token = (req.body.token as string | undefined)?.trim();
+    if (!apiKey || !baseUrl || !token) {
+      res
+        .status(400)
+        .type('html')
+        .send(renderError('Missing fields on edit form.'));
+      return;
+    }
+
+    let auth: ProbeResult;
+    try {
+      auth = await probeAndAuth(
+        apiKey,
+        baseUrl,
+        baseConfig.userAgent,
+        baseConfig.timeoutMs
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      res
+        .status(401)
+        .type('html')
+        .send(renderManageLogin(baseConfig.baseUrl, msg));
+      return;
+    }
+
+    const target = store.get(token);
+    if (
+      !target ||
+      target.userid !== auth.userid ||
+      target.baseUrl !== baseUrl.replace(/\/+$/, '')
+    ) {
+      res
+        .status(404)
+        .type('html')
+        .send(renderError('Token not found under this user / base URL.'));
+      return;
+    }
+
+    const changes: string[] = [];
+
+    // Label.
+    const newLabelRaw = (req.body.label as string | undefined)?.trim();
+    const newLabel = newLabelRaw ? newLabelRaw : undefined;
+    if (newLabel !== target.label) {
+      await store.updateLabel(auth.userid, baseUrl, token, newLabel);
+      changes.push(
+        newLabel
+          ? `label set to "${newLabel}"`
+          : target.label
+            ? `label cleared (was "${target.label}")`
+            : 'label cleared'
+      );
+    }
+
+    // Flags.
+    const newAllowWrites = parseCheckbox(req.body.allowWrites);
+    const rawDestructive = parseCheckbox(req.body.allowDestructive);
+    const newAllowDestructive = rawDestructive && newAllowWrites;
+    const newRevealIds = parseCheckbox(req.body.revealUserIdentities);
+    const flagsChanged =
+      newAllowWrites !== target.allowWrites ||
+      newAllowDestructive !== target.allowDestructive ||
+      newRevealIds !== target.revealUserIdentities;
+    if (flagsChanged) {
+      await store.updateFlags(auth.userid, baseUrl, token, {
+        allowWrites: newAllowWrites,
+        allowDestructive: newAllowDestructive,
+        revealUserIdentities: newRevealIds,
+      });
+      const flagSummary: string[] = [];
+      if (newAllowWrites !== target.allowWrites)
+        flagSummary.push(`writes ${newAllowWrites ? 'on' : 'off'}`);
+      if (newAllowDestructive !== target.allowDestructive)
+        flagSummary.push(`destructive ${newAllowDestructive ? 'on' : 'off'}`);
+      if (newRevealIds !== target.revealUserIdentities)
+        flagSummary.push(`reveal-names ${newRevealIds ? 'on' : 'off'}`);
+      changes.push(`flags: ${flagSummary.join(', ')}`);
+    }
+
+    // Default team. Only meaningful on multi-team tokens; the form
+    // only renders the input for those, but we belt-and-braces it.
+    const newDefaultRaw = (req.body.defaultTeam as string | undefined)?.trim();
+    const newDefault = newDefaultRaw
+      ? Number.parseInt(newDefaultRaw, 10)
+      : Number.NaN;
+    let defaultChanged = false;
+    if (
+      Number.isFinite(newDefault) &&
+      newDefault !== target.defaultTeam &&
+      target.keys.some((k) => k.team === newDefault)
+    ) {
+      await store.updateDefaultTeam(auth.userid, baseUrl, token, newDefault);
+      changes.push(`default team → ${newDefault}`);
+      defaultChanged = true;
+    }
+
+    if (flagsChanged || defaultChanged) {
+      // Drop live sessions so the next reconnect picks up the new
+      // ClientRegistry / tool surface.
+      pool.closeForToken(token);
+    }
+
+    setFlashCookie(res, req, FLASH_EDITED_COOKIE, {
+      tokenLabel: newLabel ?? target.label ?? `${token.slice(0, 8)}…`,
+      changes: changes.length ? changes : ['no changes'],
+    });
+    res.redirect(303, '/manage/edited');
+  });
+
+  app.get('/manage/edited', (req, res) => {
+    const cookies = parseCookies(req);
+    const raw = cookies[FLASH_EDITED_COOKIE];
+    clearFlashCookie(res, FLASH_EDITED_COOKIE);
+    if (!raw) {
+      res.redirect(302, '/manage');
+      return;
+    }
+    try {
+      const flash = JSON.parse(raw) as {
+        tokenLabel: string;
+        changes: string[];
+      };
+      res
+        .type('html')
+        .send(renderManageEdited(flash.tokenLabel ?? 'token', flash.changes));
     } catch {
       res.redirect(302, '/manage');
     }

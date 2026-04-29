@@ -110,6 +110,41 @@ export interface RegistrationStore {
     token: string
   ): Promise<boolean>;
   /**
+   * Update the human-readable token label. Pass `undefined` to clear.
+   * Returns the updated registration, or `undefined` on no-op.
+   */
+  updateLabel(
+    userid: number,
+    baseUrl: string,
+    token: string,
+    label: string | undefined
+  ): Promise<Registration | undefined>;
+  /**
+   * Update the per-token permission flags. `allowDestructive` is
+   * silently downgraded when `allowWrites` is false (caller-supplied
+   * defence, also enforced by the runtime AND with operator env).
+   */
+  updateFlags(
+    userid: number,
+    baseUrl: string,
+    token: string,
+    flags: {
+      allowWrites: boolean;
+      allowDestructive: boolean;
+      revealUserIdentities: boolean;
+    }
+  ): Promise<Registration | undefined>;
+  /**
+   * Set the default team. Caller must have validated that
+   * `team` matches one of `keys[].team`.
+   */
+  updateDefaultTeam(
+    userid: number,
+    baseUrl: string,
+    token: string,
+    team: number
+  ): Promise<Registration | undefined>;
+  /**
    * Append a `(apiKey, team, label?)` tuple to a token's `keys[]`.
    * Caller must have already validated that the new key resolves to
    * the same `userid` via `/users/me` and that the team isn't already

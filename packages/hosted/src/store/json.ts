@@ -142,6 +142,70 @@ export class JsonRegistrationStore implements RegistrationStore {
     return reg;
   }
 
+  async updateLabel(
+    userid: number,
+    baseUrl: string,
+    token: string,
+    label: string | undefined
+  ): Promise<Registration | undefined> {
+    const reg = this.assertOwned(userid, baseUrl, token);
+    if (!reg) return undefined;
+    reg.label = label;
+    await this.flush();
+    return reg;
+  }
+
+  async updateFlags(
+    userid: number,
+    baseUrl: string,
+    token: string,
+    flags: {
+      allowWrites: boolean;
+      allowDestructive: boolean;
+      revealUserIdentities: boolean;
+    }
+  ): Promise<Registration | undefined> {
+    const reg = this.assertOwned(userid, baseUrl, token);
+    if (!reg) return undefined;
+    reg.allowWrites = flags.allowWrites;
+    reg.allowDestructive = flags.allowDestructive && flags.allowWrites;
+    reg.revealUserIdentities = flags.revealUserIdentities;
+    await this.flush();
+    return reg;
+  }
+
+  async updateDefaultTeam(
+    userid: number,
+    baseUrl: string,
+    token: string,
+    team: number
+  ): Promise<Registration | undefined> {
+    const reg = this.assertOwned(userid, baseUrl, token);
+    if (!reg) return undefined;
+    if (!reg.keys.some((k) => k.team === team)) return reg;
+    reg.defaultTeam = team;
+    await this.flush();
+    return reg;
+  }
+
+  /**
+   * Look up a registration and confirm the calling user owns it.
+   * Returns the in-memory record (mutable) or `undefined` if missing
+   * / mismatched.
+   */
+  private assertOwned(
+    userid: number,
+    baseUrl: string,
+    token: string
+  ): Registration | undefined {
+    const reg = this.registrations.get(token);
+    if (!reg) return undefined;
+    if (reg.userid !== userid || reg.baseUrl !== normaliseBaseUrl(baseUrl)) {
+      return undefined;
+    }
+    return reg;
+  }
+
   async addKey(
     userid: number,
     baseUrl: string,
