@@ -1,12 +1,13 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type {
+  ElabCompoundPatch,
   ElabEntityType,
   ElabEntityUpdate,
   ElabExtraFieldType,
   ElabExtraFieldValue,
   ElabMetadata,
 } from '../../client';
-import { EXTRA_FIELD_TYPES } from '../../client';
+import { EXTRA_FIELD_TYPES, formatCompound } from '../../client';
 import { z } from 'zod';
 import type { ClientRegistry } from '../clients';
 import type { ElabMcpConfig } from '../config';
@@ -1479,6 +1480,130 @@ export function registerWriteTools(
     }
   );
 
+  // Compound CRUD field schemas. Kept as a constant so create / update
+  // tools share the same field set, and additions only need to land here.
+  // Hazard flags are booleans on the agent side; the client coerces them
+  // to 0/1 before sending.
+  const compoundIdentifierFields = {
+    molecular_formula: z.string().nullable().optional(),
+    molecular_weight: z
+      .union([z.number(), z.string()])
+      .nullable()
+      .optional()
+      .describe(
+        'Numeric weight. Accepts a number or a string (elabftw returns the field as a string on the wire).'
+      ),
+    inchi: z.string().nullable().optional(),
+    inchi_key: z.string().nullable().optional(),
+    smiles: z.string().nullable().optional(),
+    iupac_name: z.string().nullable().optional(),
+    cas_number: z.string().nullable().optional(),
+    ec_number: z.string().nullable().optional(),
+    chebi_id: z.string().nullable().optional(),
+    chembl_id: z.string().nullable().optional(),
+    dea_number: z.string().nullable().optional(),
+    drugbank_id: z.string().nullable().optional(),
+    dsstox_id: z.string().nullable().optional(),
+    hmdb_id: z.string().nullable().optional(),
+    kegg_id: z.string().nullable().optional(),
+    metabolomics_wb_id: z.string().nullable().optional(),
+    nci_code: z.string().nullable().optional(),
+    nikkaji_number: z.string().nullable().optional(),
+    pharmgkb_id: z.string().nullable().optional(),
+    pharos_ligand_id: z.string().nullable().optional(),
+    pubchem_cid: z
+      .union([z.number(), z.string()])
+      .nullable()
+      .optional(),
+    rxcui: z.string().nullable().optional(),
+    unii: z.string().nullable().optional(),
+    wikidata: z.string().nullable().optional(),
+    wikipedia: z.string().nullable().optional(),
+  } as const;
+  const compoundHazardFields = {
+    is_corrosive: z.boolean().optional(),
+    is_explosive: z.boolean().optional(),
+    is_flammable: z.boolean().optional(),
+    is_gas_under_pressure: z.boolean().optional(),
+    is_hazardous2env: z.boolean().optional(),
+    is_hazardous2health: z.boolean().optional(),
+    is_oxidising: z.boolean().optional(),
+    is_toxic: z.boolean().optional(),
+    is_radioactive: z.boolean().optional(),
+    is_serious_health_hazard: z.boolean().optional(),
+    is_antibiotic: z.boolean().optional(),
+    is_antibiotic_precursor: z.boolean().optional(),
+    is_drug: z.boolean().optional(),
+    is_drug_precursor: z.boolean().optional(),
+    is_explosive_precursor: z.boolean().optional(),
+    is_cmr: z.boolean().optional(),
+    is_nano: z.boolean().optional(),
+    is_controlled: z.boolean().optional(),
+    is_ed2health: z.boolean().optional(),
+    is_ed2env: z.boolean().optional(),
+    is_pbt: z.boolean().optional(),
+    is_pmt: z.boolean().optional(),
+    is_vpvb: z.boolean().optional(),
+    is_vpvm: z.boolean().optional(),
+  } as const;
+
+  server.tool(
+    'elab_create_compound',
+    'Create a new compound (chemical substance) in the team’s compound catalog. Only `name` is required; everything else is optional and corresponds to PubChem / CAS / ChEMBL / EC identifiers, structural descriptors (InChI / SMILES / formula / MW / IUPAC name), and GHS / regulatory hazard flags (`is_corrosive`, `is_toxic`, `is_cmr`, etc.). Hazard flags accept booleans; the client coerces to 0/1. After create, attach the compound to an entity with `elab_link_entities(..., targetKind: "compounds", targetId: <newId>)` or via `elab_set_extra_field` with `type: "compounds"`. Pass `team` to pick a configured team key; omit for the default. Gated by `ELABFTW_ALLOW_WRITES`.',
+    {
+      name: z.string().min(1),
+      ...compoundIdentifierFields,
+      ...compoundHazardFields,
+      team: teamParamSchema,
+    },
+    async (args) => {
+      const { team, ...rest } = args as {
+        name: string;
+        team?: number;
+      } & ElabCompoundPatch;
+      const t = effectiveTeam(registry, team);
+      const client = clientFor(registry, team);
+      return guard(
+        () => client.createCompound(rest as { name: string } & ElabCompoundPatch),
+        (id) =>
+          text(
+            id != null
+              ? `Created compound #${id} \`${rest.name}\` in team ${t}.`
+              : `Created compound \`${rest.name}\` in team ${t}. (elabftw did not return an id; call \`elab_search_compounds\` to resolve.)`
+          )
+      );
+    }
+  );
+
+  server.tool(
+    'elab_update_compound',
+    'Patch fields on an existing compound. Plain PATCH semantics — pass any subset of the create-time fields and only those values are written; omitted fields stay untouched. Hazard flags accept booleans (coerced to 0/1). Cannot change team membership through this tool. Pass `team` to pick which configured team key/team the compound lives in. Gated by `ELABFTW_ALLOW_WRITES`.',
+    {
+      id: z.number().int().positive(),
+      name: z.string().min(1).optional(),
+      ...compoundIdentifierFields,
+      ...compoundHazardFields,
+      team: teamParamSchema,
+    },
+    async (args) => {
+      const { id, team, ...rest } = args as {
+        id: number;
+        team?: number;
+      } & ElabCompoundPatch;
+      const client = clientFor(registry, team);
+      const patch = rest as ElabCompoundPatch;
+      if (Object.keys(patch).length === 0) {
+        return errorText(
+          'No fields provided. Pass at least one of `name` / identifier / hazard fields.'
+        );
+      }
+      return guard(
+        () => client.updateCompound(id, patch),
+        (compound) => text(`Updated compound #${id}.\n${formatCompound(compound)}`)
+      );
+    }
+  );
+
   // ------------------------------------------------------------------------
   // Destructive / audit-affecting actions. Gated by a second env flag.
   // ------------------------------------------------------------------------
@@ -1540,6 +1665,26 @@ export function registerWriteTools(
           text(
             `Deleted comment #${commentId} from ${entityType.slice(0, -1)} #${id}.`
           )
+      );
+    }
+  );
+
+  server.tool(
+    'elab_delete_compound',
+    'Soft-delete a compound (sets state=3, consistent with `elab_delete_entity`). The compound is still retrievable with `state=deleted`; permanent deletion is sysadmin-only and not exposed. Gated behind `ELABFTW_ALLOW_DESTRUCTIVE` because compound deletion can cascade through `compounds_links` references on experiments / items, removing the link end-points downstream readers depend on. Pass `team` to pick which configured team key/team the compound lives in.',
+    {
+      id: z.number().int().positive(),
+      team: teamParamSchema,
+    },
+    async (args) => {
+      const { id, team } = args as { id: number; team?: number };
+      const client = clientFor(registry, team);
+      return guard(
+        async () => {
+          await client.deleteCompound(id);
+          return null;
+        },
+        () => text(`Soft-deleted compound #${id}.`)
       );
     }
   );

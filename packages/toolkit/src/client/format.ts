@@ -1,6 +1,7 @@
 import TurndownService from 'turndown';
 import type {
   ElabComment,
+  ElabCompound,
   ElabEntity,
   ElabLink,
   ElabMetadata,
@@ -9,6 +10,7 @@ import type {
   ElabUpload,
   ElabUser,
 } from './types';
+import { COMPOUND_HAZARD_FLAGS } from './types';
 
 /**
  * Common formatter options. `revealUsers` is opt-in at the MCP config
@@ -426,5 +428,100 @@ export function formatLinks(links: ElabLink[]): string {
       (l) =>
         `#${l.entityid} ${l.title ?? '(untitled)'}${l.category_title ? ` [${l.category_title}]` : ''}`
     )
+    .join('\n');
+}
+
+/**
+ * Compact hazard summary for a compound. Drops the `is_` prefix and
+ * humanizes a few keys (`is_hazardous2health` → `health-hazard`, etc.).
+ * Returns the empty string when no flags are set.
+ */
+function formatCompoundHazards(c: ElabCompound): string {
+  const pretty: Record<string, string> = {
+    is_corrosive: 'corrosive',
+    is_explosive: 'explosive',
+    is_flammable: 'flammable',
+    is_gas_under_pressure: 'gas-under-pressure',
+    is_hazardous2env: 'env-hazard',
+    is_hazardous2health: 'health-hazard',
+    is_oxidising: 'oxidising',
+    is_toxic: 'toxic',
+    is_radioactive: 'radioactive',
+    is_serious_health_hazard: 'serious-health-hazard',
+    is_antibiotic: 'antibiotic',
+    is_antibiotic_precursor: 'antibiotic-precursor',
+    is_drug: 'drug',
+    is_drug_precursor: 'drug-precursor',
+    is_explosive_precursor: 'explosive-precursor',
+    is_cmr: 'CMR',
+    is_nano: 'nano',
+    is_controlled: 'controlled',
+    is_ed2health: 'endocrine-disruptor-health',
+    is_ed2env: 'endocrine-disruptor-env',
+    is_pbt: 'PBT',
+    is_pmt: 'PMT',
+    is_vpvb: 'vPvB',
+    is_vpvm: 'vPvM',
+  };
+  const set: string[] = [];
+  for (const flag of COMPOUND_HAZARD_FLAGS) {
+    if (c[flag]) set.push(pretty[flag] ?? flag.replace(/^is_/, ''));
+  }
+  return set.length ? `⚠ ${set.join(', ')}` : '';
+}
+
+/**
+ * Render one compound as a multi-line block. Identifying fields first
+ * (name + key IDs + structure), then hazards. Skips fields that are
+ * null / empty so the output stays compact for substances that don't
+ * have a full PubChem record attached.
+ */
+export function formatCompound(c: ElabCompound): string {
+  const lines: string[] = [];
+  lines.push(`#${c.id} ${c.name}`);
+  const ids: string[] = [];
+  if (c.cas_number) ids.push(`CAS=${c.cas_number}`);
+  if (c.pubchem_cid != null && c.pubchem_cid !== '')
+    ids.push(`PubChem=${c.pubchem_cid}`);
+  if (c.chembl_id) ids.push(`ChEMBL=${c.chembl_id}`);
+  if (c.ec_number) ids.push(`EC=${c.ec_number}`);
+  if (ids.length) lines.push(ids.join(' | '));
+  const hasFormula = !!c.molecular_formula;
+  const hasMw =
+    !!c.molecular_weight &&
+    c.molecular_weight !== '0.00' &&
+    c.molecular_weight !== '0';
+  if (hasFormula || hasMw) {
+    const mw = hasMw ? ` (MW=${c.molecular_weight})` : '';
+    lines.push(`${c.molecular_formula ?? ''}${mw}`.trim());
+  }
+  if (c.iupac_name) lines.push(`IUPAC: ${c.iupac_name}`);
+  if (c.smiles) lines.push(`SMILES: ${c.smiles}`);
+  if (c.inchi_key) lines.push(`InChIKey: ${c.inchi_key}`);
+  const hazards = formatCompoundHazards(c);
+  if (hazards) lines.push(hazards);
+  return lines.join('\n');
+}
+
+/**
+ * Render a list of compounds as one row per line. Used by
+ * `elab_search_compounds` — keeps the surface narrow so a 100-row hit
+ * doesn't blow the context window.
+ */
+export function formatCompoundList(compounds: ElabCompound[]): string {
+  if (compounds.length === 0) return 'No compounds.';
+  return compounds
+    .map((c) => {
+      const id = c.cas_number
+        ? c.cas_number
+        : c.pubchem_cid != null && c.pubchem_cid !== ''
+          ? `CID=${c.pubchem_cid}`
+          : c.inchi_key ?? '';
+      const idSegment = id ? ` | ${id}` : '';
+      const mf = c.molecular_formula ? ` | ${c.molecular_formula}` : '';
+      const hazards = formatCompoundHazards(c);
+      const hazardSegment = hazards ? ` | ${hazards}` : '';
+      return `#${c.id} ${c.name}${idSegment}${mf}${hazardSegment}`;
+    })
     .join('\n');
 }

@@ -9,6 +9,8 @@ export {
 
 export {
   formatComments,
+  formatCompound,
+  formatCompoundList,
   formatEntityFull,
   formatEntityList,
   formatEntitySummary,
@@ -30,6 +32,10 @@ export type {
 export type {
   ElabCategory,
   ElabComment,
+  ElabCompound,
+  ElabCompoundHazardFlag,
+  ElabCompoundPatch,
+  ElabCompoundQuery,
   ElabCreateEntityInput,
   ElabDuplicateOptions,
   ElabEntity,
@@ -58,4 +64,9 @@ export type {
   ElabftwConfig,
 } from './types';
 
-export { ElabScope, ElabState, EXTRA_FIELD_TYPES } from './types';
+export {
+  COMPOUND_HAZARD_FLAGS,
+  ElabScope,
+  ElabState,
+  EXTRA_FIELD_TYPES,
+} from './types';

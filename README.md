@@ -89,7 +89,7 @@ Hosted-mode env vars are documented separately in
 | `ELABFTW_DEFAULT_TEAM` | no | lowest id | In multi-team mode, which team's key is used when a tool call omits `team`. |
 | `ELABFTW_TEAM_ID` | no | auto | Single-team mode: pin the inferred team. Discovered at startup via `/users/me` when unset. |
 | `ELABFTW_ALLOW_WRITES` | no | `false` | `true` to expose create / update / delete / comment / step / link / tag tools. |
-| `ELABFTW_ALLOW_DESTRUCTIVE` | no | `false` | `true` to additionally expose lock / unlock / sign / timestamp / bloxberg / delete-entity / delete-comment / delete-tag. Irreversible or audit-affecting. Requires `ELABFTW_ALLOW_WRITES=true`. |
+| `ELABFTW_ALLOW_DESTRUCTIVE` | no | `false` | `true` to additionally expose lock / unlock / sign / timestamp / bloxberg / delete-entity / delete-comment / delete-tag / delete-compound. Irreversible or audit-affecting. Requires `ELABFTW_ALLOW_WRITES=true`. |
 | `ELABFTW_REVEAL_USER_IDENTITIES` | no | `false` | `true` to surface user names / emails / orcids in formatter output. Default-off means user tools and comment listings return `user <id>` instead of PII. `elab_me` is exempt (callers always see their own identity). |
 | `ELABFTW_TIMEOUT_MS` | no | `30000` | Per-request timeout. |
 | `ELABFTW_USER_AGENT` | no | `sura-elabftw-mcp/<version>` | Shows up in instance access logs. |
@@ -126,6 +126,8 @@ set.** Mixing the two is rejected at startup.
 | `elab_list_experiments_categories` | Templates / experiment categories on the current team (id, title, color, default marker). |
 | `elab_list_experiments_status` | Experiment statuses on the current team. |
 | `elab_list_items_status` | Item statuses on the current team. |
+| `elab_search_compounds` | Search the team’s compound catalog by name / CAS / PubChem CID / InChI / SMILES / formula. Server-side full-text via `q`. Returns one row per compound with a compact hazard summary. |
+| `elab_get_compound` | Fetch one compound by id — name, identifiers (CAS, PubChem CID, ChEMBL, EC, ChEBI, KEGG, DrugBank, …), structure (InChI / SMILES / formula / MW / IUPAC), and an aggregated GHS / regulatory hazard summary. |
 | `elab_list_revisions` | List body revisions for an entity. Surfaces edit history (who / when / size) for cohort review. Per-instance availability. |
 | `elab_get_revision` | Fetch one revision's body. Rendered through the markdown path (tables + hrefs preserved). |
 | `elab_get_user` | Fetch one user by `userid`. Identity fields gated behind `ELABFTW_REVEAL_USER_IDENTITIES=true`. |
@@ -150,6 +152,8 @@ set.** Mixing the two is rejected at startup.
 | `elab_link_entities` / `elab_unlink_entities` | Cross-entity links. Both ends must be in the same team. |
 | `elab_add_tag` / `elab_remove_tag` | Tag management on a single entity. |
 | `elab_create_tag` | Create a team-scoped tag without attaching it to any entity. Idempotent — elabftw's `INSERT ... ON DUPLICATE KEY UPDATE` returns the existing id on a duplicate string. Requires team-admin. |
+| `elab_create_compound` | Create a compound in the team’s catalog. Only `name` is required; everything else (PubChem / CAS / ChEMBL identifiers, InChI / SMILES / formula / MW / IUPAC name, GHS hazard flags) is optional. Hazard flags accept booleans, coerced to 0/1 on the wire. Pair with `elab_link_entities(targetKind: "compounds")` to attach the new compound to an entity. |
+| `elab_update_compound` | Patch any subset of a compound’s fields. Plain PATCH — omitted fields stay untouched. Hazard flags accept booleans. |
 
 ### Destructive (requires `ELABFTW_ALLOW_DESTRUCTIVE=true`)
 
@@ -160,6 +164,7 @@ intervention. Gated behind a second flag on purpose.
 |---|---|
 | `elab_delete_entity` | Soft-delete (state=3). The record is still retrievable with `state=deleted`. Permanent deletion is sysadmin-only and not exposed. Gated behind destructive because even a soft-delete hides the row from default listings and can disrupt downstream readers. |
 | `elab_delete_comment` | Permanently delete a comment. Not a soft-delete — the row is removed and the audit-trail entry shows the deletion. |
+| `elab_delete_compound` | Soft-delete a compound (state=3). Permanent deletion is sysadmin-only and not exposed. Gated behind destructive because deletion can cascade through `compounds_links` references on experiments / items, removing link end-points downstream readers depend on. |
 | `elab_lock` | Lock an entity. |
 | `elab_unlock` | Force-unlock. Admin only. |
 | `elab_timestamp` | RFC 3161 trusted timestamp. Consumes from `ts_balance`. |

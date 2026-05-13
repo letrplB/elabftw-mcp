@@ -8,6 +8,30 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- **Compound CRUD** — five new tools wrap the `/compounds` endpoint
+  surface so agents can manage chemical substances directly instead of
+  going through the elabftw UI:
+  - `elab_search_compounds` (read) — full-text search by name / CAS /
+    PubChem CID / InChI / SMILES / formula; one row per hit with a
+    compact hazard summary.
+  - `elab_get_compound` (read) — full record for one compound:
+    identifiers (CAS, PubChem CID, ChEMBL, EC, ChEBI, KEGG, DrugBank,
+    DEA, HMDB, UNII, WikiData, …), structure (InChI / InChIKey /
+    SMILES / formula / MW / IUPAC), GHS / regulatory hazard flags.
+  - `elab_create_compound` (write, gated by `ELABFTW_ALLOW_WRITES`) —
+    create a compound; only `name` is required, everything else maps to
+    the catalog fields. Hazard booleans coerced to 0/1 on the wire.
+  - `elab_update_compound` (write) — patch any subset of fields. Plain
+    PATCH semantics; omitted fields stay untouched.
+  - `elab_delete_compound` (destructive, gated by
+    `ELABFTW_ALLOW_DESTRUCTIVE`) — soft-delete (state=3) consistent
+    with `elab_delete_entity`. Behind destructive because deletion can
+    cascade through `compounds_links` on experiments / items.
+
+  Compound fields previously only reachable via `elab_set_extra_field
+  (type: "compounds")` and `elab_link_entities(targetKind: "compounds")`;
+  now the compound entities themselves are first-class. Closes plan
+  §7.2 from `dev-docs/20260512-extra-fields-and-discovery-plan.md`.
 - **`elab_update_step`** — edit a checklist step in place. Pass any
   subset of `body` / `deadline` / `deadline_notif`; omitted fields are
   left untouched. `deadline` accepts a `YYYY-MM-DD HH:MM:SS` string or

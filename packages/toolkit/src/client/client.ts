@@ -2,6 +2,9 @@ import { elabFetch, elabJson, extractLocationId } from './http';
 import type {
   ElabCategory,
   ElabComment,
+  ElabCompound,
+  ElabCompoundPatch,
+  ElabCompoundQuery,
   ElabCreateEntityInput,
   ElabDuplicateOptions,
   ElabEntity,
@@ -656,6 +659,76 @@ export class ElabftwClient {
     return elabJson(this.config, '/teams/current/items_status');
   }
 
+  /**
+   * `GET /compounds` — list/search the team's compound catalog. The `q`
+   * parameter does a server-side full-text search across name + identifiers
+   * (CAS, CID, InChI, SMILES, formula).
+   *
+   * Source of truth: `elabftw/src/Models/Compounds.php` (readAll).
+   */
+  listCompounds(query?: ElabCompoundQuery): Promise<ElabCompound[]> {
+    return elabJson(
+      this.config,
+      '/compounds',
+      query as Record<string, unknown> | undefined
+    );
+  }
+
+  /** `GET /compounds/{id}` — fetch one compound. */
+  getCompound(id: number): Promise<ElabCompound> {
+    return elabJson(this.config, `/compounds/${id}`);
+  }
+
+  /**
+   * `POST /compounds` — create a compound. elabftw requires
+   * `action: 'create'` on the POST body plus the substance fields (only
+   * `name` is strictly required). Boolean hazard flags are coerced to 0/1
+   * to match the wire shape.
+   *
+   * Returns the new compound id parsed from the `Location` header.
+   */
+  async createCompound(input: { name: string } & ElabCompoundPatch): Promise<
+    number | null
+  > {
+    const body = {
+      action: 'create',
+      ...serializeCompoundPatch(input),
+    };
+    const response = await elabFetch(
+      this.config,
+      '/compounds',
+      undefined,
+      { method: 'POST', body }
+    );
+    return extractLocationId(response);
+  }
+
+  /**
+   * `PATCH /compounds/{id}` — partial update. Plain PATCH (no `action`)
+   * matches modern elabftw v2 row-update semantics, consistent with
+   * {@link update} for entities. Hazard flag booleans are coerced to 0/1.
+   */
+  async updateCompound(
+    id: number,
+    patch: ElabCompoundPatch
+  ): Promise<ElabCompound> {
+    return elabJson(this.config, `/compounds/${id}`, undefined, {
+      method: 'PATCH',
+      body: serializeCompoundPatch(patch),
+    });
+  }
+
+  /**
+   * `DELETE /compounds/{id}` — soft-delete (sets state=3, consistent with
+   * `elab_delete_entity`). Permanent deletion is sysadmin-only and not
+   * exposed.
+   */
+  async deleteCompound(id: number): Promise<void> {
+    await elabFetch(this.config, `/compounds/${id}`, undefined, {
+      method: 'DELETE',
+    });
+  }
+
   /** `GET /users` (sysadmin) or `GET /users/search?q=...`. */
   searchUsers(q: string): Promise<ElabUser[]> {
     return elabJson(this.config, '/users', { q });
@@ -776,4 +849,25 @@ export class ElabftwClient {
       offset += pageSize;
     }
   }
+}
+
+/**
+ * Convert an {@link ElabCompoundPatch} to the wire shape. Boolean hazard
+ * flags become 0/1 integers; everything else is passed through unchanged.
+ * Undefined fields are omitted so they don't accidentally clear existing
+ * values on PATCH.
+ */
+function serializeCompoundPatch(
+  patch: ElabCompoundPatch
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(patch)) {
+    if (value === undefined) continue;
+    if (key.startsWith('is_') && typeof value === 'boolean') {
+      out[key] = value ? 1 : 0;
+    } else {
+      out[key] = value;
+    }
+  }
+  return out;
 }

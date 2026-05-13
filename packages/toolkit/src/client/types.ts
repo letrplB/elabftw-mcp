@@ -390,6 +390,205 @@ export interface ElabStatus {
   [key: string]: unknown;
 }
 
+/**
+ * Hazard / classification booleans on a compound. elabftw stores them as
+ * 0/1 integers on the wire and the UI surfaces them as the GHS pictograms
+ * plus regulatory flags. The full set is enumerated here so {@link formatCompound}
+ * can render a compact hazard summary without dynamic key probing.
+ *
+ * Source of truth: `elabftw/src/Models/Compounds.php` (the columns on the
+ * `compounds` table; GHS subset matches `elabftw/src/ts/HazardsClass.ts`).
+ */
+export const COMPOUND_HAZARD_FLAGS = [
+  // GHS pictograms
+  'is_corrosive',
+  'is_explosive',
+  'is_flammable',
+  'is_gas_under_pressure',
+  'is_hazardous2env',
+  'is_hazardous2health',
+  'is_oxidising',
+  'is_toxic',
+  'is_radioactive',
+  'is_serious_health_hazard',
+  // Regulatory / classification flags
+  'is_antibiotic',
+  'is_antibiotic_precursor',
+  'is_drug',
+  'is_drug_precursor',
+  'is_explosive_precursor',
+  'is_cmr',
+  'is_nano',
+  'is_controlled',
+  'is_ed2health',
+  'is_ed2env',
+  'is_pbt',
+  'is_pmt',
+  'is_vpvb',
+  'is_vpvm',
+] as const;
+
+export type ElabCompoundHazardFlag = (typeof COMPOUND_HAZARD_FLAGS)[number];
+
+/**
+ * Row returned by `/compounds` endpoints. Compounds are a first-class
+ * elabftw entity (separate from `items` / `experiments`) holding chemical
+ * substances with an extensive set of external-database identifiers
+ * (PubChem, ChEMBL, CAS, etc.), structural descriptors (InChI, SMILES),
+ * and GHS / regulatory hazard flags.
+ *
+ * Note: `molecular_weight` is returned as a string with two decimals on
+ * the wire (e.g. `"0.00"`), even though it's a numeric value. Callers can
+ * `parseFloat` if arithmetic is needed.
+ *
+ * Source of truth: `elabftw/src/Models/Compounds.php`.
+ */
+export interface ElabCompound {
+  id: number;
+  state?: ElabState | number;
+  team?: number;
+  team_name?: string | null;
+  userid?: number;
+  userid_human?: string | null;
+  created_by?: number;
+  created_at?: string;
+  modified_by?: number;
+  modified_at?: string;
+
+  /** Required on create; human-readable substance label. */
+  name: string;
+
+  // Structural descriptors
+  molecular_formula?: string | null;
+  molecular_weight?: string | null;
+  inchi?: string | null;
+  inchi_key?: string | null;
+  smiles?: string | null;
+  iupac_name?: string | null;
+
+  // External database identifiers
+  cas_number?: string | null;
+  ec_number?: string | null;
+  chebi_id?: string | null;
+  chembl_id?: string | null;
+  dea_number?: string | null;
+  drugbank_id?: string | null;
+  dsstox_id?: string | null;
+  hmdb_id?: string | null;
+  kegg_id?: string | null;
+  metabolomics_wb_id?: string | null;
+  nci_code?: string | null;
+  nikkaji_number?: string | null;
+  pharmgkb_id?: string | null;
+  pharos_ligand_id?: string | null;
+  pubchem_cid?: string | number | null;
+  rxcui?: string | null;
+  unii?: string | null;
+  wikidata?: string | null;
+  wikipedia?: string | null;
+
+  // Hazard / classification flags (0 | 1 on the wire). See COMPOUND_HAZARD_FLAGS.
+  is_corrosive?: 0 | 1;
+  is_explosive?: 0 | 1;
+  is_flammable?: 0 | 1;
+  is_gas_under_pressure?: 0 | 1;
+  is_hazardous2env?: 0 | 1;
+  is_hazardous2health?: 0 | 1;
+  is_oxidising?: 0 | 1;
+  is_toxic?: 0 | 1;
+  is_radioactive?: 0 | 1;
+  is_serious_health_hazard?: 0 | 1;
+  is_antibiotic?: 0 | 1;
+  is_antibiotic_precursor?: 0 | 1;
+  is_drug?: 0 | 1;
+  is_drug_precursor?: 0 | 1;
+  is_explosive_precursor?: 0 | 1;
+  is_cmr?: 0 | 1;
+  is_nano?: 0 | 1;
+  is_controlled?: 0 | 1;
+  is_ed2health?: 0 | 1;
+  is_ed2env?: 0 | 1;
+  is_pbt?: 0 | 1;
+  is_pmt?: 0 | 1;
+  is_vpvb?: 0 | 1;
+  is_vpvm?: 0 | 1;
+
+  // Internals — exposed but not generally useful to agents
+  fp2_base64?: string | null;
+  has_fingerprint?: 0 | 1;
+
+  [key: string]: unknown;
+}
+
+/**
+ * Query shape for `GET /compounds`. The `q` parameter does a full-text
+ * search across name + identifiers; `limit` and `offset` paginate.
+ */
+export interface ElabCompoundQuery {
+  q?: string;
+  limit?: number;
+  offset?: number;
+  [key: string]: unknown;
+}
+
+/**
+ * PATCH-shaped diff for `elab_update_compound`. Every field is optional
+ * (omitted means "leave alone"). Hazard flags accept `boolean` for
+ * agent convenience; the client coerces to 0/1 before sending.
+ */
+export interface ElabCompoundPatch {
+  name?: string;
+  molecular_formula?: string | null;
+  molecular_weight?: string | number | null;
+  inchi?: string | null;
+  inchi_key?: string | null;
+  smiles?: string | null;
+  iupac_name?: string | null;
+  cas_number?: string | null;
+  ec_number?: string | null;
+  chebi_id?: string | null;
+  chembl_id?: string | null;
+  dea_number?: string | null;
+  drugbank_id?: string | null;
+  dsstox_id?: string | null;
+  hmdb_id?: string | null;
+  kegg_id?: string | null;
+  metabolomics_wb_id?: string | null;
+  nci_code?: string | null;
+  nikkaji_number?: string | null;
+  pharmgkb_id?: string | null;
+  pharos_ligand_id?: string | null;
+  pubchem_cid?: string | number | null;
+  rxcui?: string | null;
+  unii?: string | null;
+  wikidata?: string | null;
+  wikipedia?: string | null;
+  is_corrosive?: boolean;
+  is_explosive?: boolean;
+  is_flammable?: boolean;
+  is_gas_under_pressure?: boolean;
+  is_hazardous2env?: boolean;
+  is_hazardous2health?: boolean;
+  is_oxidising?: boolean;
+  is_toxic?: boolean;
+  is_radioactive?: boolean;
+  is_serious_health_hazard?: boolean;
+  is_antibiotic?: boolean;
+  is_antibiotic_precursor?: boolean;
+  is_drug?: boolean;
+  is_drug_precursor?: boolean;
+  is_explosive_precursor?: boolean;
+  is_cmr?: boolean;
+  is_nano?: boolean;
+  is_controlled?: boolean;
+  is_ed2health?: boolean;
+  is_ed2env?: boolean;
+  is_pbt?: boolean;
+  is_pmt?: boolean;
+  is_vpvb?: boolean;
+  is_vpvm?: boolean;
+}
+
 export interface ElabUser {
   userid: number;
   firstname?: string;

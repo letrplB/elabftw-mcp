@@ -8,6 +8,8 @@ import {
   type ElabftwClient,
   type EntityExtras,
   formatComments,
+  formatCompound,
+  formatCompoundList,
   formatEntityFull,
   formatEntityList,
   formatLinks,
@@ -922,6 +924,52 @@ export function registerReadTools(
       return guard(
         () => client.listItemsStatus(),
         (rows) => text(formatCategoriesOrStatuses(rows, 'statuses'))
+      );
+    }
+  );
+
+  server.tool(
+    'elab_search_compounds',
+    'Search the team’s compound catalog (chemical substances with PubChem / CAS / InChI / SMILES identifiers and GHS hazard flags). Compounds are a first-class elabftw entity, separate from `items` / `experiments`. The `q` parameter does a server-side full-text search across name + identifiers; omit for an unfiltered listing. Returns one row per compound: `#<id> <name> | <CAS or PubChem CID> | <formula> | ⚠ <hazards>`. Use `elab_get_compound` to pull the full record. Pass `team` to pick a configured team key; omit for the default.',
+    {
+      q: z
+        .string()
+        .optional()
+        .describe(
+          'Full-text query across compound name, CAS, PubChem CID, InChI key, SMILES, formula.'
+        ),
+      limit: z.number().int().positive().max(100).optional(),
+      offset: z.number().int().nonnegative().optional(),
+      team: teamParamSchema,
+    },
+    async (args) => {
+      const { q, limit, offset, team } = args as {
+        q?: string;
+        limit?: number;
+        offset?: number;
+        team?: number;
+      };
+      const client = clientFor(registry, team);
+      return guard(
+        () => client.listCompounds({ q, limit, offset }),
+        (rows) => text(formatCompoundList(rows))
+      );
+    }
+  );
+
+  server.tool(
+    'elab_get_compound',
+    'Fetch a single compound by id and render its identifying fields (name, CAS, PubChem CID, ChEMBL, EC, formula, MW, IUPAC name, SMILES, InChIKey) plus a hazard summary. Compounds linked from an entity surface under `compounds_links` on `elab_get`; this tool gives the full record. Pass `team` to pick a configured team key; omit for the default.',
+    {
+      id: z.number().int().positive(),
+      team: teamParamSchema,
+    },
+    async (args) => {
+      const { id, team } = args as { id: number; team?: number };
+      const client = clientFor(registry, team);
+      return guard(
+        () => client.getCompound(id),
+        (compound) => text(formatCompound(compound))
       );
     }
   );
