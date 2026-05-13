@@ -89,7 +89,7 @@ Hosted-mode env vars are documented separately in
 | `ELABFTW_DEFAULT_TEAM` | no | lowest id | In multi-team mode, which team's key is used when a tool call omits `team`. |
 | `ELABFTW_TEAM_ID` | no | auto | Single-team mode: pin the inferred team. Discovered at startup via `/users/me` when unset. |
 | `ELABFTW_ALLOW_WRITES` | no | `false` | `true` to expose create / update / delete / comment / step / link / tag tools. |
-| `ELABFTW_ALLOW_DESTRUCTIVE` | no | `false` | `true` to additionally expose lock / unlock / sign / timestamp / bloxberg. Irreversible. Requires `ELABFTW_ALLOW_WRITES=true`. |
+| `ELABFTW_ALLOW_DESTRUCTIVE` | no | `false` | `true` to additionally expose lock / unlock / sign / timestamp / bloxberg / delete-entity / delete-comment / delete-tag. Irreversible or audit-affecting. Requires `ELABFTW_ALLOW_WRITES=true`. |
 | `ELABFTW_REVEAL_USER_IDENTITIES` | no | `false` | `true` to surface user names / emails / orcids in formatter output. Default-off means user tools and comment listings return `user <id>` instead of PII. `elab_me` is exempt (callers always see their own identity). |
 | `ELABFTW_TIMEOUT_MS` | no | `30000` | Per-request timeout. |
 | `ELABFTW_USER_AGENT` | no | `sura-elabftw-mcp/<version>` | Shows up in instance access logs. |
@@ -145,8 +145,7 @@ set.** Mixing the two is rejected at startup.
 | `elab_clone_extra_fields_schema` | Mirror the UI's "Load fields" button: copy `extra_fields` shape (plus groups) from one entity (typically an items_type / template) onto another. Target's existing per-field `value`s are preserved. `blankValues: true` strips defaults for schema-only copy. |
 | `elab_set_extra_field_groups` | Manage `metadata.elabftw.extra_fields_groups` (named clusters that organize fields in the UI). `mode: 'replace'` overwrites; `mode: 'merge'` upserts by `id`. Rejects `id=-1` (reserved for the implicit default bucket). |
 | `elab_duplicate_entity` | Duplicate with optional file copy and back-link. `targetTeam` re-targets the duplicate to a different team than the source. |
-| `elab_delete_entity` | Soft-delete (state=3). Permanent deletion is sysadmin-only and not exposed. |
-| `elab_add_comment` / `elab_update_comment` / `elab_delete_comment` | Comment CRUD. Comment delete is permanent (no soft-delete on the elabftw side). |
+| `elab_add_comment` / `elab_update_comment` | Add / edit comments. Delete is gated behind destructive — see below. |
 | `elab_add_step` / `elab_toggle_step` / `elab_delete_step` | Manage checklist steps. `elab_add_step` accepts `deadline_notif`. Step delete is permanent. |
 | `elab_link_entities` / `elab_unlink_entities` | Cross-entity links. Both ends must be in the same team. |
 | `elab_add_tag` / `elab_remove_tag` | Tag management on a single entity. |
@@ -159,6 +158,8 @@ intervention. Gated behind a second flag on purpose.
 
 | Tool | Purpose |
 |---|---|
+| `elab_delete_entity` | Soft-delete (state=3). The record is still retrievable with `state=deleted`. Permanent deletion is sysadmin-only and not exposed. Gated behind destructive because even a soft-delete hides the row from default listings and can disrupt downstream readers. |
+| `elab_delete_comment` | Permanently delete a comment. Not a soft-delete — the row is removed and the audit-trail entry shows the deletion. |
 | `elab_lock` | Lock an entity. |
 | `elab_unlock` | Force-unlock. Admin only. |
 | `elab_timestamp` | RFC 3161 trusted timestamp. Consumes from `ts_balance`. |

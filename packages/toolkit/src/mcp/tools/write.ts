@@ -1086,33 +1086,6 @@ export function registerWriteTools(
   );
 
   server.tool(
-    'elab_delete_entity',
-    'Soft-delete an experiment or item (sets state=3). The record is still retrievable with state=deleted. Permanent deletion is sysadmin-only and not exposed here.',
-    {
-      entityType: entityTypeSchema,
-      id: z.number().int().positive(),
-      team: teamParamSchema,
-    },
-    async (args) => {
-      const { entityType, id, team } = args as {
-        entityType: ElabEntityType;
-        id: number;
-        team?: number;
-      };
-      const t = effectiveTeam(registry, team);
-      const client = clientFor(registry, team);
-      return guard(
-        async () => {
-          await assertTeam(client, entityType, id, t);
-          await client.remove(entityType, id);
-          return id;
-        },
-        () => text(`Soft-deleted ${entityType.slice(0, -1)} #${id}.`)
-      );
-    }
-  );
-
-  server.tool(
     'elab_add_comment',
     'Add a comment to an entity.',
     {
@@ -1218,38 +1191,6 @@ export function registerWriteTools(
         () =>
           text(
             `Updated comment #${commentId} on ${entityType.slice(0, -1)} #${id}.`
-          )
-      );
-    }
-  );
-
-  server.tool(
-    'elab_delete_comment',
-    'Permanently delete a comment from an entity. Unlike entity deletion, this is not a soft-delete — the row is removed and the audit-trail entry shows the deletion. Use `elab_list_comments` to find the `commentId`.',
-    {
-      entityType: entityTypeSchema,
-      id: z.number().int().positive(),
-      commentId: z.number().int().positive(),
-      team: teamParamSchema,
-    },
-    async (args) => {
-      const { entityType, id, commentId, team } = args as {
-        entityType: ElabEntityType;
-        id: number;
-        commentId: number;
-        team?: number;
-      };
-      const t = effectiveTeam(registry, team);
-      const client = clientFor(registry, team);
-      return guard(
-        async () => {
-          await assertTeam(client, entityType, id, t);
-          await client.deleteComment(entityType, id, commentId);
-          return null;
-        },
-        () =>
-          text(
-            `Deleted comment #${commentId} from ${entityType.slice(0, -1)} #${id}.`
           )
       );
     }
@@ -1479,6 +1420,65 @@ export function registerWriteTools(
   // ------------------------------------------------------------------------
 
   if (!config.allowDestructive) return;
+
+  server.tool(
+    'elab_delete_entity',
+    'Soft-delete an experiment or item (sets state=3). The record is still retrievable with state=deleted. Permanent deletion is sysadmin-only and not exposed here. Gated behind `ELABFTW_ALLOW_DESTRUCTIVE` — even a soft-delete hides the row from default listings and can disrupt downstream readers.',
+    {
+      entityType: entityTypeSchema,
+      id: z.number().int().positive(),
+      team: teamParamSchema,
+    },
+    async (args) => {
+      const { entityType, id, team } = args as {
+        entityType: ElabEntityType;
+        id: number;
+        team?: number;
+      };
+      const t = effectiveTeam(registry, team);
+      const client = clientFor(registry, team);
+      return guard(
+        async () => {
+          await assertTeam(client, entityType, id, t);
+          await client.remove(entityType, id);
+          return id;
+        },
+        () => text(`Soft-deleted ${entityType.slice(0, -1)} #${id}.`)
+      );
+    }
+  );
+
+  server.tool(
+    'elab_delete_comment',
+    'Permanently delete a comment from an entity. Unlike entity deletion, this is not a soft-delete — the row is removed and the audit-trail entry shows the deletion. Use `elab_list_comments` to find the `commentId`. Gated behind `ELABFTW_ALLOW_DESTRUCTIVE`.',
+    {
+      entityType: entityTypeSchema,
+      id: z.number().int().positive(),
+      commentId: z.number().int().positive(),
+      team: teamParamSchema,
+    },
+    async (args) => {
+      const { entityType, id, commentId, team } = args as {
+        entityType: ElabEntityType;
+        id: number;
+        commentId: number;
+        team?: number;
+      };
+      const t = effectiveTeam(registry, team);
+      const client = clientFor(registry, team);
+      return guard(
+        async () => {
+          await assertTeam(client, entityType, id, t);
+          await client.deleteComment(entityType, id, commentId);
+          return null;
+        },
+        () =>
+          text(
+            `Deleted comment #${commentId} from ${entityType.slice(0, -1)} #${id}.`
+          )
+      );
+    }
+  );
 
   server.tool(
     'elab_lock',

@@ -56,6 +56,15 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Changed
 
+- **`elab_delete_entity` and `elab_delete_comment` are now gated
+  behind `ELABFTW_ALLOW_DESTRUCTIVE`** (previously available with
+  just `ELABFTW_ALLOW_WRITES`). `elab_delete_entity` is still a
+  soft-delete (sets `state=3`), but even a soft-delete hides the row
+  from default listings and can disrupt downstream readers;
+  `elab_delete_comment` is a true hard-delete. Both now sit with
+  `elab_lock` / `elab_sign` / `elab_delete_tag` under the destructive
+  flag. Add / update on comments and entities remain on
+  `ELABFTW_ALLOW_WRITES`.
 - **`elab_create_entity` auto-loads the items_type / template
   schema** for `items` / `experiments` when `category_id` is set
   (new `loadFieldsFromCategory` flag, default `true`). The source
