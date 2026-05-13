@@ -420,37 +420,76 @@ export class ElabftwClient {
   }
 
   /**
-   * `PATCH /{entityType}/{id}/steps/{stepId}` with field updates. Modern
-   * elabftw v2 treats a plain PATCH (no `action`) as a direct row update,
-   * so this is the path for editing a step's prose, deadline, or
-   * deadline-notification flag without churning the audit trail by
-   * delete + re-add. The `action`-shaped path is reserved for
-   * `finish` / `notif` (see {@link toggleStep}).
+   * Edit a step's `body` and/or `deadline` and/or `deadline_notif`. The
+   * elabftw v2 step PATCH dispatcher routes by `Action::*` enum, with
+   * three idiosyncrasies the toolkit smooths over:
    *
-   * `deadline_notif` is stored as 0/1 on the wire; the boolean arg here is
-   * coerced to match {@link addStep}.
+   * - **No `action` key on field updates.** The controller defaults to
+   *   `Action::Update` when no `action` is in the body
+   *   (`Apiv2Controller::handlePatch:262-264`). The `Action::Update`
+   *   branch in `Steps::patch` then iterates `$params` and calls
+   *   `StepParams($key, $value)` for each entry — including any `action`
+   *   key the caller sent, which fails the whitelist (`body`,
+   *   `deadline`, `finished_time`, `is_immutable` only) with
+   *   `"Incorrect parameter for steps"`. Sending `action: 'update'`
+   *   explicitly breaks the field-update path; sending no action at all
+   *   is the supported shape.
+   * - **`deadline_notif` is not writable directly.** It lives behind
+   *   two separate actions — `Action::Notif` (toggle, requires the row
+   *   to already carry a deadline) and `Action::NotifDestroy` (clear).
+   *   For idempotent set-to-true semantics we GET the current state and
+   *   only fire the toggle when needed; set-to-false always uses
+   *   `NotifDestroy` (which is idempotent).
+   * - **Order matters when combining.** Body/deadline must land first so
+   *   a deadline change is visible to the subsequent notif toggle (the
+   *   server reads the current `deadline` to populate the notification
+   *   record).
+   *
+   * Source of truth: `elabftw/src/Models/Steps.php:171-200` (patch
+   * dispatcher), `elabftw/src/Params/StepParams.php` (writable columns),
+   * `elabftw/src/Controllers/Apiv2Controller.php:262-264` (default
+   * action for PATCH).
    */
-  updateStep(
+  async updateStep(
     entityType: ElabEntityType,
     id: number,
     stepId: number,
     patch: { body?: string; deadline?: string | null; deadline_notif?: boolean }
   ): Promise<ElabStep> {
-    return elabJson(
-      this.config,
-      `/${entityType}/${id}/steps/${stepId}`,
-      undefined,
-      {
+    const stepUrl = `/${entityType}/${id}/steps/${stepId}`;
+
+    // Field-update path. No `action` key — controller defaults to
+    // Action::Update and the iterator only sees the whitelisted columns.
+    const updateBody: Record<string, unknown> = {};
+    if (patch.body !== undefined) updateBody.body = patch.body;
+    if (patch.deadline !== undefined) updateBody.deadline = patch.deadline;
+    if (Object.keys(updateBody).length > 0) {
+      await elabFetch(this.config, stepUrl, undefined, {
         method: 'PATCH',
-        body: {
-          ...(patch.body !== undefined ? { body: patch.body } : {}),
-          ...(patch.deadline !== undefined ? { deadline: patch.deadline } : {}),
-          ...(patch.deadline_notif !== undefined
-            ? { deadline_notif: patch.deadline_notif ? 1 : 0 }
-            : {}),
-        },
+        body: updateBody,
+      });
+    }
+
+    // deadline_notif lives behind separate actions. `Notif` toggles
+    // (not idempotent) and depends on the row already carrying a
+    // deadline; `NotifDestroy` always clears. Read-modify-write avoids
+    // an accidental toggle-back when the state is already correct.
+    if (patch.deadline_notif === true) {
+      const current = (await elabJson(this.config, stepUrl)) as ElabStep;
+      if (current.deadline_notif !== 1) {
+        await elabFetch(this.config, stepUrl, undefined, {
+          method: 'PATCH',
+          body: { action: 'notif' },
+        });
       }
-    );
+    } else if (patch.deadline_notif === false) {
+      await elabFetch(this.config, stepUrl, undefined, {
+        method: 'PATCH',
+        body: { action: 'notifdestroy' },
+      });
+    }
+
+    return elabJson(this.config, stepUrl);
   }
 
   /**
@@ -683,25 +722,56 @@ export class ElabftwClient {
   /**
    * `POST /compounds` — create a compound. elabftw requires
    * `action: 'create'` on the POST body plus the substance fields (only
-   * `name` is strictly required). Boolean hazard flags are coerced to 0/1
-   * to match the wire shape.
+   * `name` is strictly required).
+   *
+   * **POST signature limitation.** elabftw's `Compounds::postAction`
+   * destructures `$reqBody` for a fixed subset of fields and silently
+   * drops everything else. Specifically: `molecular_weight`, all long-tail
+   * identifiers (`ec_number`, `chebi_id`, `chembl_id`, `dea_number`,
+   * `drugbank_id`, `dsstox_id`, `hmdb_id`, `kegg_id`, `metabolomics_wb_id`,
+   * `nci_code`, `nikkaji_number`, `pharmgkb_id`, `pharos_ligand_id`,
+   * `rxcui`, `unii`, `wikidata`, `wikipedia`), and 16 of the 24 hazard
+   * flags (`is_radioactive`, `is_antibiotic*`, `is_drug*`,
+   * `is_explosive_precursor`, `is_cmr`, `is_nano`, `is_controlled`,
+   * `is_ed2*`, `is_pbt`, `is_pmt`, `is_vpvb`, `is_vpvm`) never make it to
+   * the row on create. This method works around the gap with a
+   * reconcile-on-POST PATCH that lands every non-POST-accepted field
+   * the caller provided.
    *
    * Returns the new compound id parsed from the `Location` header.
+   *
+   * Source of truth: `elabftw/src/Models/Compounds.php:192-216`
+   * (`postAction`), `elabftw/src/Models/Compounds.php:create()` signature.
    */
   async createCompound(input: { name: string } & ElabCompoundPatch): Promise<
     number | null
   > {
-    const body = {
-      action: 'create',
-      ...serializeCompoundPatch(input),
-    };
+    const serialized = serializeCompoundPatch(input);
     const response = await elabFetch(
       this.config,
       '/compounds',
       undefined,
-      { method: 'POST', body }
+      { method: 'POST', body: { action: 'create', ...serialized } }
     );
-    return extractLocationId(response);
+    const id = extractLocationId(response);
+    if (id == null) return null;
+
+    // The reconcile patch covers everything that didn't make it onto the
+    // POST signature. We don't bother diffing against a fresh GET — the
+    // PATCH endpoint is idempotent for re-asserting fields that already
+    // landed via POST, and the cost is one extra round-trip on creates
+    // that need it.
+    const reconcilePatch: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(serialized)) {
+      if (!COMPOUND_POST_ACCEPTED_FIELDS.has(k)) reconcilePatch[k] = v;
+    }
+    if (Object.keys(reconcilePatch).length > 0) {
+      await elabFetch(this.config, `/compounds/${id}`, undefined, {
+        method: 'PATCH',
+        body: reconcilePatch,
+      });
+    }
+    return id;
   }
 
   /**
@@ -925,10 +995,51 @@ export class ElabftwClient {
 }
 
 /**
+ * Fields that elabftw's `POST /compounds` actually persists. Everything
+ * else in the request body is silently dropped (see the elabftw
+ * `Compounds::postAction` create signature). The toolkit's
+ * `createCompound` PATCHes the remaining fields after POST so callers
+ * don't have to track the limitation themselves.
+ *
+ * Source of truth: `elabftw/src/Models/Compounds.php` —
+ * `postAction(... default => $this->create(name, inchi, inchi_key, smiles,
+ * molecular_formula, cas_number, iupac_name, pubchem_cid, isCorrosive,
+ * isSeriousHealthHazard, isExplosive, isFlammable, isGasUnderPressure,
+ * isHazardous2env, isHazardous2health, isOxidising, isToxic))`.
+ */
+const COMPOUND_POST_ACCEPTED_FIELDS = new Set<string>([
+  'name',
+  'inchi',
+  'inchi_key',
+  'smiles',
+  'molecular_formula',
+  'cas_number',
+  'iupac_name',
+  'pubchem_cid',
+  'is_corrosive',
+  'is_serious_health_hazard',
+  'is_explosive',
+  'is_flammable',
+  'is_gas_under_pressure',
+  'is_hazardous2env',
+  'is_hazardous2health',
+  'is_oxidising',
+  'is_toxic',
+]);
+
+/**
  * Convert an {@link ElabCompoundPatch} to the wire shape. Boolean hazard
- * flags become 0/1 integers; everything else is passed through unchanged.
- * Undefined fields are omitted so they don't accidentally clear existing
- * values on PATCH.
+ * flags become elabftw's checkbox-style `"on"` / `""` strings — the PATCH
+ * dispatcher routes hazard columns through `Filter::onToBinary`, which
+ * returns 1 *only* when the value is the literal string `"on"`, otherwise
+ * 0. Sending `1` / `0` silently writes 0 to the column. POST accepts the
+ * same encoding (the `Compounds::postAction` create path uses PHP's
+ * `(bool)` cast, and `(bool) "on"` is true), so one helper works for both
+ * verbs. Undefined fields are omitted so they don't accidentally clear
+ * existing values on PATCH.
+ *
+ * Source of truth: `elabftw/src/Params/CompoundParams.php:33-55`
+ * (`is_*` columns) and `elabftw/src/Services/Filter.php:onToBinary`.
  */
 function serializeCompoundPatch(
   patch: ElabCompoundPatch
@@ -937,7 +1048,7 @@ function serializeCompoundPatch(
   for (const [key, value] of Object.entries(patch)) {
     if (value === undefined) continue;
     if (key.startsWith('is_') && typeof value === 'boolean') {
-      out[key] = value ? 1 : 0;
+      out[key] = value ? 'on' : '';
     } else {
       out[key] = value;
     }

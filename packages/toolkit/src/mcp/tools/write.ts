@@ -1258,7 +1258,7 @@ export function registerWriteTools(
 
   server.tool(
     'elab_update_step',
-    'Edit a checklist step in place — change the prose, set / clear the deadline, or flip the deadline-notification flag without churning the audit trail by delete + re-add. Pass any subset of `body` / `deadline` / `deadline_notif`; omitted fields are left untouched. `deadline` is a `YYYY-MM-DD HH:MM:SS` string (UTC); pass `null` to clear an existing deadline. Use `elab_list_steps` to resolve `stepId`. For finished/unfinished, use `elab_toggle_step`.',
+    'Edit a checklist step in place — change the prose, set / clear the deadline, or flip the deadline-notification flag without churning the audit trail by delete + re-add. Pass any subset of `body` / `deadline` / `deadline_notif`; omitted fields are left untouched. `deadline` is a `YYYY-MM-DD HH:MM:SS` string (UTC); pass `null` to clear an existing deadline. `deadline_notif: true` requires the step to have a deadline (set one in the same call if needed). The toolkit translates these into elabftw’s three step-PATCH actions under the hood (`action: \"update\"` for body/deadline, `action: \"notif\"` / `\"notifdestroy\"` for deadline_notif). Use `elab_list_steps` to resolve `stepId`. For finished/unfinished, use `elab_toggle_step`.',
     {
       entityType: entityTypeSchema,
       id: z.number().int().positive(),

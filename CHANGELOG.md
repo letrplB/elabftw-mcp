@@ -6,6 +6,57 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`elab_update_compound` hazard flag PATCH was silently writing 0** for
+  every hazard column. elabftw's `CompoundParams::getContent()` routes
+  `is_*` keys through `Filter::onToBinary($content)`, which returns 1
+  only when the input is the literal string `"on"` — the toolkit was
+  sending integer `1` / `0`, which fell through to the 0 branch. Fixed
+  by emitting `"on"` / `""` for hazard booleans in
+  `serializeCompoundPatch`; POST tolerates the same encoding so a
+  single helper covers both verbs.
+- **`elab_create_compound` silently dropped most fields** —
+  elabftw's `Compounds::postAction` create signature destructures
+  `$reqBody` for a fixed subset (17 keys) and ignores everything else.
+  `molecular_weight`, all long-tail identifiers (`ec_number`,
+  `chebi_id`, `chembl_id`, `dea_number`, `drugbank_id`, `dsstox_id`,
+  `hmdb_id`, `kegg_id`, `metabolomics_wb_id`, `nci_code`,
+  `nikkaji_number`, `pharmgkb_id`, `pharos_ligand_id`, `rxcui`, `unii`,
+  `wikidata`, `wikipedia`), and 16 of the 24 hazard flags (`is_cmr`,
+  `is_nano`, `is_controlled`, `is_radioactive`, `is_pbt`, `is_pmt`,
+  `is_vpvb`, `is_vpvm`, `is_ed2health`, `is_ed2env`, `is_antibiotic`,
+  `is_antibiotic_precursor`, `is_drug`, `is_drug_precursor`,
+  `is_explosive_precursor`) all bypass create. Added a reconcile-on-POST
+  PATCH: after the create returns the new id, the toolkit issues a
+  follow-up PATCH for every caller-supplied field outside the POST
+  signature. Same approach as the elab_create_entity reconcile loop.
+- **`elab_update_step` body / deadline PATCH was rejected** with
+  `400 "Incorrect parameter for steps"`. elabftw's
+  `Apiv2Controller::handlePatch` defaults to `Action::Update` only when
+  no `action` key is present in the body; if `action: 'update'` IS
+  present, it survives into `$params` and `Steps::patch`'s
+  `Action::Update` branch iterates the dict and feeds *every* key
+  (including `action` itself) to `StepParams`, which whitelists only
+  `body` / `deadline` / `finished_time` / `is_immutable` and throws on
+  anything else. Fixed by sending the bare field-update body (no
+  `action` key) for body/deadline edits. `deadline_notif` continues to
+  go through the dedicated `Action::Notif` (toggle, requires deadline)
+  and `Action::NotifDestroy` (clear) actions — wrapped in a
+  read-modify-write to give the agent idempotent boolean semantics
+  (`true` only toggles when currently `0`; `false` always uses
+  `NotifDestroy`). Combined updates apply body/deadline first so the
+  notif toggle sees the new deadline.
+
+Live-verified against AC2 (`elabftw-lin.uni-ulm.de`, team=2): 14-field
+create with `molecular_weight: 88.15`, `ec_number: '200-752-1'`,
+`chembl_id`, `kegg_id`, plus 5 hazard flags spanning POST-accepted and
+POST-dropped sets — every field lands on the read-back. Subsequent
+PATCH toggling 6 hazard flags (3 on, 3 off, 1 untouched) — all six
+land, the untouched flag stays. Step update on experiment #1297 —
+body edit, deadline set, deadline_notif on (idempotent), off,
+combined update, deadline clear — 9/9 pass.
+
 ### Added
 
 - **Native view — round-trippable JSON shape for entities.**
