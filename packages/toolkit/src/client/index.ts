@@ -7,6 +7,9 @@ export {
   extractLocationId,
 } from './http';
 
+export { nativeToUpdate, toNativeEntity } from './native';
+export type { NativePatchResult } from './native';
+
 export {
   formatComments,
   formatCompound,
@@ -41,6 +44,7 @@ export type {
   ElabDuplicateOptions,
   ElabEntity,
   ElabEntityAction,
+  ElabEntityNative,
   ElabEntityType,
   ElabEntityUpdate,
   ElabEvent,
@@ -54,6 +58,7 @@ export type {
   ElabListQuery,
   ElabMetadata,
   ElabOrderKey,
+  ElabPermissions,
   ElabPubchemHit,
   ElabRevision,
   ElabSortDirection,

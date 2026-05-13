@@ -8,6 +8,39 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- **Native view — round-trippable JSON shape for entities.**
+  `elab_get` and `elab_get_bulk` gain a `view: 'prose' | 'native'` arg
+  (default `'prose'`, unchanged behaviour). With `view: 'native'` the
+  tool returns the wire shape as a JSON object with the stringified
+  payloads pre-parsed:
+  - `canread` / `canwrite` → `{teams, users, teamgroups}` objects, with
+    companion `canread_base` / `canread_is_immutable` (and `canwrite`
+    versions) preserved as siblings.
+  - `metadata` → the parsed extra_fields tree (extra_fields +
+    `elabftw.extra_fields_groups`), not a stringified blob.
+  - `tags` → `string[]`, `tags_id` → `number[]` (elabftw stores these
+    as `|`-delimited and `,`-delimited strings — yes, different
+    delimiters).
+  - `experiments_links` / `items_links` / `compounds_links` →
+    `ElabLink[]` (the single-entity GET response already inlines them).
+
+  `elab_update_entity` gains an optional `native` arg that accepts the
+  same shape. The toolkit re-stringifies `canread` / `canwrite` /
+  `metadata` before PATCH. Only fields *present* in the supplied
+  object are written. Explicit individual args layer on top of `native`
+  (explicit wins) so agents can patch a whole record while overriding
+  a single field.
+
+  Scope boundary: tag and link sub-arrays inside `native` are *not*
+  applied on update — use `elab_add_tag` / `elab_remove_tag` and
+  `elab_link_entities` / `elab_unlink_entities`. Per-extra-field edits
+  should still go through `elab_set_extra_field` /
+  `elab_update_extra_field` (they own per-type validation, auto-link
+  side-effects, and merge semantics).
+
+  Types exported: `ElabEntityNative`, `ElabPermissions`,
+  `NativePatchResult`. Helpers exported: `toNativeEntity`,
+  `nativeToUpdate`.
 - **PubChem integration** — two new tools wrap elabftw's PubChem
   importer (CSP-allowed on this instance at
   `pubchem.ncbi.nlm.nih.gov`):

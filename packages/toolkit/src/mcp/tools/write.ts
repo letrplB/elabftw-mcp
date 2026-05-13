@@ -1,13 +1,18 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type {
   ElabCompoundPatch,
+  ElabEntityNative,
   ElabEntityType,
   ElabEntityUpdate,
   ElabExtraFieldType,
   ElabExtraFieldValue,
   ElabMetadata,
 } from '../../client';
-import { EXTRA_FIELD_TYPES, formatCompound } from '../../client';
+import {
+  EXTRA_FIELD_TYPES,
+  formatCompound,
+  nativeToUpdate,
+} from '../../client';
 import { z } from 'zod';
 import type { ClientRegistry } from '../clients';
 import type { ElabMcpConfig } from '../config';
@@ -485,7 +490,8 @@ export function registerWriteTools(
 
   server.tool(
     'elab_update_entity',
-    'Update fields on any entity (experiments, items, templates, items_types). Any field not provided is left unchanged. Passing `metadata` replaces the whole blob; for single-field edits use `elab_update_extra_field` instead. To soft-delete an entity use `elab_delete_entity`.',
+    'Update fields on any entity (experiments, items, templates, items_types). Any field not provided is left unchanged. Passing `metadata` replaces the whole blob; for single-field edits use `elab_update_extra_field` instead. To soft-delete an entity use `elab_delete_entity`. ' +
+      'Round-trip path: pass `native` (the shape returned by `elab_get(view: "native")`) to apply a whole-entity patch in one shot. The toolkit re-stringifies `canread` / `canwrite` / `metadata` before PATCH. Only fields *present* in the supplied native object are written; omitted fields stay untouched. Explicit individual args (`title`, `body`, …) win over `native` when both are provided. Tags and entity links inside `native` are NOT applied here — manage them via `elab_add_tag` / `elab_remove_tag` and `elab_link_entities` / `elab_unlink_entities`.',
     {
       entityType: entityTypeSchema,
       id: z.number().int().positive(),
@@ -513,6 +519,12 @@ export function registerWriteTools(
         .describe(
           'Archive (`archived`) or un-archive (`normal`) the entity. To soft-delete use `elab_delete_entity` — this tool deliberately does not accept `deleted` to keep the audit-trail entry point unambiguous.'
         ),
+      native: z
+        .record(z.string(), z.any())
+        .optional()
+        .describe(
+          'Native entity shape (as returned by `elab_get(view: "native")`). Object form — canread / canwrite as `{teams,users,teamgroups}`, metadata as the parsed extra_fields tree. The toolkit re-stringifies on the way to elabftw. Only fields *present* in this object are written. Tag and link sub-arrays are ignored — use the dedicated tools for those.'
+        ),
     },
     async (args) => {
       const input = args as Record<string, unknown> & {
@@ -521,6 +533,7 @@ export function registerWriteTools(
         team?: number;
         content_type?: 'html' | 'markdown';
         state?: StateName;
+        native?: Partial<ElabEntityNative>;
       };
       const ct =
         input.content_type === 'markdown'
@@ -535,18 +548,32 @@ export function registerWriteTools(
         content_type: _ct,
         state: _st,
         team,
+        native,
         ...rest
       } = input;
       const t = effectiveTeam(registry, team);
       const client = clientFor(registry, team);
+      // Base patch from the native shape (if any); explicit individual
+      // args layered on top take precedence — gives the agent a "patch
+      // the whole record, but override field X" idiom.
+      const nativePatch = native
+        ? nativeToUpdate(native).patch
+        : ({} as ElabEntityUpdate);
+      const patch: ElabEntityUpdate = {
+        ...nativePatch,
+        ...rest,
+        ...(ct ? { content_type: ct as 1 | 2 } : {}),
+        ...(stateNum !== undefined ? { state: stateNum } : {}),
+      };
+      if (Object.keys(patch).length === 0) {
+        return errorText(
+          'No fields provided. Pass at least one updatable field or a `native` patch.'
+        );
+      }
       return guard(
         async () => {
           await assertTeam(client, entityType, id, t);
-          return client.update(entityType, id, {
-            ...rest,
-            ...(ct ? { content_type: ct as 1 | 2 } : {}),
-            ...(stateNum !== undefined ? { state: stateNum } : {}),
-          });
+          return client.update(entityType, id, patch);
         },
         () => text(`Updated ${entityType.slice(0, -1)} #${id}.`)
       );

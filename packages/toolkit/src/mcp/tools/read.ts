@@ -11,6 +11,7 @@ import {
   formatCompound,
   formatCompoundList,
   formatPubchemHits,
+  toNativeEntity,
   formatEntityFull,
   formatEntityList,
   formatLinks,
@@ -228,6 +229,7 @@ export function registerReadTools(
     'Fetch a single entity with full body, category, status, tags, and parsed extra_fields. ' +
       'For reviewing a cohort, set `include=["attachments","steps","comments","links"]` to get everything in one round-trip instead of 4 tool calls per entity. ' +
       'Body rendering: `format="markdown"` (default) preserves tables (as GFM pipes) and link hrefs — use this for quantitative review. `format="text"` is the legacy stripped-plain-text behaviour. `format="html"` returns the raw HTML body. ' +
+      'Output view: `view="prose"` (default) renders a markdown summary suited for human / agent reading. `view="native"` returns the wire shape as a JSON object with the stringified payloads pre-parsed (`canread` / `canwrite` as objects, `metadata` as the parsed extra_fields tree, `tags` as `string[]`, `experiments_links` / `items_links` / `compounds_links` as arrays). Use `view="native"` for round-trip workflows — the same shape is accepted back by `elab_update_entity({native: ...})`. ' +
       'Pass `team` to scope the lookup.',
     {
       entityType: entityTypeSchema,
@@ -237,22 +239,29 @@ export function registerReadTools(
         .array(z.enum(['steps', 'comments', 'attachments', 'links']))
         .optional()
         .describe(
-          'Sub-resources to fetch in parallel and render under H2 sections. Omit to skip all (default). `links` fetches both `experiments`- and `items`-kinded links.'
+          'Sub-resources to fetch in parallel. In prose view they render under H2 sections; in native view they nest under matching top-level keys (`steps`, `comments`, `attachments`, `links`).'
         ),
       format: z
         .enum(['text', 'markdown', 'html'])
         .optional()
         .describe(
-          'Body rendering: `markdown` (default) lossless HTML→markdown with tables+links. `text` legacy stripped plaintext. `html` raw body.'
+          'Body rendering: `markdown` (default) lossless HTML→markdown with tables+links. `text` legacy stripped plaintext. `html` raw body. Applies in prose view; in native view the body is returned in its stored form (controlled by `content_type`).'
+        ),
+      view: z
+        .enum(['prose', 'native'])
+        .optional()
+        .describe(
+          'Output shape: `prose` (default) markdown summary. `native` parsed JSON object — round-tripable through `elab_update_entity({native})`.'
         ),
     },
     async (args) => {
-      const { entityType, id, team, include, format } = args as {
+      const { entityType, id, team, include, format, view } = args as {
         entityType: ElabEntityType;
         id: number;
         team?: number;
         include?: Array<'steps' | 'comments' | 'attachments' | 'links'>;
         format?: 'text' | 'markdown' | 'html';
+        view?: 'prose' | 'native';
       };
       const t = effectiveTeam(registry, team);
       const client = clientFor(registry, team);
@@ -261,15 +270,23 @@ export function registerReadTools(
           await assertTeam(client, entityType, id, t);
           return fetchEntityWithExtras(client, entityType, id, include);
         },
-        ({ entity, extras }) =>
-          text(
-            formatEntityFull(
-              entity,
-              client.parseMetadata(entity),
-              extras,
-              { ...formatOpts, format: format ?? 'markdown' }
-            )
-          )
+        ({ entity, extras }) => {
+          if (view === 'native') {
+            const native = toNativeEntity(entity);
+            const out: Record<string, unknown> = { ...native };
+            if (extras.steps) out.steps = extras.steps;
+            if (extras.comments) out.comments = extras.comments;
+            if (extras.attachments) out.attachments = extras.attachments;
+            if (extras.links) out.links = extras.links;
+            return text(JSON.stringify(out, null, 2));
+          }
+          return text(
+            formatEntityFull(entity, client.parseMetadata(entity), extras, {
+              ...formatOpts,
+              format: format ?? 'markdown',
+            })
+          );
+        }
       );
     }
   );
@@ -297,14 +314,21 @@ export function registerReadTools(
         .enum(['text', 'markdown', 'html'])
         .optional()
         .describe('Body rendering. Same options as `elab_get`.'),
+      view: z
+        .enum(['prose', 'native'])
+        .optional()
+        .describe(
+          'Output shape: `prose` (default) markdown summary, one per id separated by `---`. `native` JSON array of parsed entity objects (same shape as `elab_get(view: "native")`).'
+        ),
     },
     async (args) => {
-      const { entityType, ids, team, include, format } = args as {
+      const { entityType, ids, team, include, format, view } = args as {
         entityType: ElabEntityType;
         ids: number[];
         team?: number;
         include?: Array<'steps' | 'comments' | 'attachments' | 'links'>;
         format?: 'text' | 'markdown' | 'html';
+        view?: 'prose' | 'native';
       };
       const t = effectiveTeam(registry, team);
       const client = clientFor(registry, team);
@@ -318,6 +342,18 @@ export function registerReadTools(
         },
         (results) => {
           if (results.length === 0) return text('No entities requested.');
+          if (view === 'native') {
+            const arr = results.map(({ entity, extras }) => {
+              const native = toNativeEntity(entity);
+              const out: Record<string, unknown> = { ...native };
+              if (extras.steps) out.steps = extras.steps;
+              if (extras.comments) out.comments = extras.comments;
+              if (extras.attachments) out.attachments = extras.attachments;
+              if (extras.links) out.links = extras.links;
+              return out;
+            });
+            return text(JSON.stringify(arr, null, 2));
+          }
           const blocks = results.map(({ entity, extras }, i) => {
             const body = formatEntityFull(
               entity,

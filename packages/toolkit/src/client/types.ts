@@ -279,6 +279,88 @@ export interface ElabCreateEntityInput {
   state?: ElabState | number;
 }
 
+/**
+ * Parsed `canread` / `canwrite` payload. elabftw stores these as JSON
+ * strings on the wire (`'{"teams":[2],"users":[],"teamgroups":[]}'`); the
+ * native view parses them into objects so the agent can read and edit
+ * permissions without JSON round-tripping in its head.
+ *
+ * The sibling `<field>_base` (number) and `<field>_is_immutable` (0|1)
+ * fields live on the parent entity, not inside this object — see
+ * {@link ElabEntityNative}.
+ */
+export interface ElabPermissions {
+  teams: number[];
+  users: number[];
+  teamgroups: number[];
+}
+
+/**
+ * Native shape of an entity — what the wire response looks like with the
+ * stringified payloads pre-parsed for the agent. Returned by
+ * `elab_get(view: 'native')`; also accepted as the `native` arg on
+ * `elab_update_entity` (the toolkit re-stringifies on the way back to
+ * elabftw).
+ *
+ * This is a *curated projection*, not the raw wire row — we drop audit
+ * timestamps, the bookable-item knobs, fingerprints, etc. that the agent
+ * almost never needs. The index signature is preserved so unrecognized
+ * keys round-trip unchanged.
+ *
+ * Edit semantics: when handed back to `elab_update_entity({native})`, the
+ * toolkit applies a PATCH-style diff — only fields *present* in the
+ * supplied object are written. Omitting a field leaves it untouched.
+ *
+ * Source of truth: matched against live wire shape on elabftw v5.5 (AC2
+ * team=2, 2026-05-13).
+ */
+export interface ElabEntityNative {
+  // Identity / audit
+  id: number;
+  team: number;
+  userid: number;
+  elabid?: string | null;
+
+  // Display
+  title: string;
+  body: string;
+  content_type: 1 | 2;
+  date?: string | null;
+
+  // Categorization
+  category?: number | null;
+  category_title?: string | null;
+  category_color?: string | null;
+  status?: number | null;
+  status_title?: string | null;
+  rating?: number | null;
+  custom_id?: number | string | null;
+
+  // Permissions (parsed)
+  canread: ElabPermissions;
+  canread_base?: number;
+  canread_is_immutable?: 0 | 1;
+  canwrite: ElabPermissions;
+  canwrite_base?: number;
+  canwrite_is_immutable?: 0 | 1;
+
+  // Structured payload (parsed)
+  metadata: ElabMetadata | null;
+  tags: string[];
+  tags_id: number[];
+
+  // Inline links (already arrays on the single-entity GET wire response)
+  experiments_links: ElabLink[];
+  items_links: ElabLink[];
+  compounds_links: ElabLink[];
+
+  // State
+  state?: ElabState | number;
+  locked?: 0 | 1;
+
+  [key: string]: unknown;
+}
+
 export interface ElabUpload {
   id: number;
   real_name?: string;

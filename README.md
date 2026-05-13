@@ -106,8 +106,8 @@ set.** Mixing the two is rejected at startup.
 | `elab_me` | Show the user the API key is authenticated as. Accepts `team`. |
 | `elab_info` | Instance version, PHP version, aggregate counts. |
 | `elab_search` | List experiments / items / templates / items_types within one team. Supports the elabftw `extended` DSL (`rating:5 and tag:"buffer"`). |
-| `elab_get` | Fetch a single entity with body and parsed `extra_fields`. Pass `include=["attachments","steps","comments","links"]` to fan out sub-resources in one call (cohort-review shortcut). Body rendering: `format="markdown"` (default) preserves tables + link hrefs; `format="text"` = legacy stripped plaintext; `format="html"` = raw. |
-| `elab_get_bulk` | Fetch up to 50 entities of the same kind with shared `include` / `format`. Chunks requests into groups of 8. Each id is team-validated before fetch. |
+| `elab_get` | Fetch a single entity with body and parsed `extra_fields`. Pass `include=["attachments","steps","comments","links"]` to fan out sub-resources in one call (cohort-review shortcut). Body rendering: `format="markdown"` (default) preserves tables + link hrefs; `format="text"` = legacy stripped plaintext; `format="html"` = raw. `view="prose"` (default) returns a markdown summary; `view="native"` returns the wire shape as JSON with `canread` / `canwrite` parsed, `metadata` as the parsed extra_fields tree, `tags` as `string[]`, and `experiments_links` / `items_links` / `compounds_links` as arrays — round-tripable through `elab_update_entity({native: ...})`. |
+| `elab_get_bulk` | Fetch up to 50 entities of the same kind with shared `include` / `format` / `view`. Chunks requests into groups of 8. Each id is team-validated before fetch. `view="native"` returns a JSON array. |
 | `elab_list_attachments` | File attachment metadata on an entity. |
 | `elab_download_attachment` | Raw bytes. Text files returned as text; binary as base64. Files >2 MB are truncated with a note. |
 | `elab_list_comments` | Comments on an entity. |
@@ -141,7 +141,7 @@ set.** Mixing the two is rejected at startup.
 | Tool | Purpose |
 |---|---|
 | `elab_create_entity` | Create any of the four kinds (experiments, items, templates, items_types). Accepts `title` / `body` / `content_type` / `tags` / `metadata` / `category_id` plus all PATCH-symmetric fields: `date` / `rating` / `status` / `custom_id` / `canread` / `canwrite` / `state`. For `items` / `experiments` with `category_id` set, auto-loads the items_type / template's `extra_fields` schema (caller-provided `metadata` wins per-field); pass `loadFieldsFromCategory: false` to opt out. Reconcile loop re-PATCHes `metadata` / `body` / `tags` and any other field elabftw drops or normalizes on POST. |
-| `elab_update_entity` | Patch any of the four kinds. Title / body / content_type / category / status / rating / date / custom_id / metadata / permissions / `state` (`"normal"` / `"archived"` — soft-delete goes through `elab_delete_entity`). |
+| `elab_update_entity` | Patch any of the four kinds. Title / body / content_type / category / status / rating / date / custom_id / metadata / permissions / `state` (`"normal"` / `"archived"` — soft-delete goes through `elab_delete_entity`). Accepts an optional `native` arg (the shape returned by `elab_get(view: "native")`) for whole-record round-trip; toolkit re-stringifies `canread` / `canwrite` / `metadata` before PATCH. Tag and link sub-arrays inside `native` are ignored — use the dedicated tag / link tools. |
 | `elab_set_extra_field` | Create-or-update one `extra_fields` entry via read-merge-PATCH. Typed: `text`, `number`, `checkbox`, `date`, `datetime-local`, `email`, `time`, `url`, `select`, `radio`, `experiments`, `items`, `users`, `compounds`, `uploads`. Validates per type (e.g. `select`/`radio` require `options`). For `experiments` / `items` / `compounds` types, also creates the entity-link unless `autoLink: false`. `mode: 'replace'` (default) writes the whole entry; `mode: 'merge'` updates only-provided properties. |
 | `elab_update_extra_field` | Value-only fast path on an existing field — bypasses the read-merge-PATCH cycle. Cannot create fields or change type / options / unit; pre-flights with a GET and returns a friendly error pointing at `elab_set_extra_field` when the field is missing. |
 | `elab_remove_extra_field` | Delete one `extra_fields` entry, prune empty groups + namespace, send `metadata: null` when the blob is empty after cleanup. `alsoUnlink: true` (default) also removes the entity-link for typed pointer fields (`experiments` / `items` / `compounds`). |
@@ -307,6 +307,48 @@ this was a silent SQL no-op.
 targetEntityType, targetId, blankValues: true})` is the agent
 equivalent of the UI's "Load fields" button. Pass `blankValues: true`
 when you want the schema shape only, not the example values.
+
+## Native view — round-trippable JSON
+
+For workflows that need to read an entity, edit it in code, and write it
+back as a whole, every read tool that produces an entity supports
+`view="native"`:
+
+```
+elab_get({ entityType: "items", id: 475, view: "native" })
+```
+
+returns a single JSON object with the wire shape's stringified payloads
+already parsed:
+
+- `canread` / `canwrite` are objects (`{teams, users, teamgroups}`); the
+  companion `canread_base` / `canread_is_immutable` (and `canwrite`
+  versions) are preserved on the parent.
+- `metadata` is the parsed extra-fields tree (extra_fields map +
+  `elabftw.extra_fields_groups`), not a stringified blob.
+- `tags` is `string[]`, with `tags_id` as `number[]` alongside.
+- `experiments_links` / `items_links` / `compounds_links` are arrays
+  (the wire already returns them inline on single-entity GET).
+
+The same shape goes back through `elab_update_entity({native: ...})` —
+the toolkit re-stringifies `canread` / `canwrite` / `metadata` before
+PATCH. Only fields present in the supplied object are written; omitted
+fields stay untouched. Explicit individual args (`title`, `body`, …)
+win over `native` when both are passed.
+
+Tag and link sub-arrays inside `native` are **not** applied on update.
+Use `elab_add_tag` / `elab_remove_tag` and
+`elab_link_entities` / `elab_unlink_entities` for those. The native
+shape is round-trippable for the entity's *own* fields; relationships
+sit on separate endpoints and stay there to keep PATCH semantics
+predictable.
+
+For typed single-field edits (`extra_fields[<name>].value`), keep using
+`elab_set_extra_field` / `elab_update_extra_field` — those handle
+per-type validation, auto-link side-effects, and the merge semantics
+the read-modify-write loop doesn't.
+
+`elab_get_bulk({ ..., view: "native" })` returns a JSON array.
 
 ## How team scoping works
 
