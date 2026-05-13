@@ -8,6 +8,13 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- **`elab_update_step`** — edit a checklist step in place. Pass any
+  subset of `body` / `deadline` / `deadline_notif`; omitted fields are
+  left untouched. `deadline` accepts a `YYYY-MM-DD HH:MM:SS` string or
+  `null` to clear. Closes the long-standing gap where the only way to
+  fix a step's prose was delete + re-add (which lost the step's
+  audit-trail history and reordered the checklist). Gated by
+  `ELABFTW_ALLOW_WRITES`; not a destructive operation.
 - **`elab_set_extra_field`** — create-or-update one `extra_fields`
   entry on any entity. Typed against the full 15-type elabftw 5.5
   vocabulary (`text`, `number`, `checkbox`, `date`, `datetime-local`,

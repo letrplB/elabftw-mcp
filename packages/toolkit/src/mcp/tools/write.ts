@@ -1229,6 +1229,70 @@ export function registerWriteTools(
   );
 
   server.tool(
+    'elab_update_step',
+    'Edit a checklist step in place — change the prose, set / clear the deadline, or flip the deadline-notification flag without churning the audit trail by delete + re-add. Pass any subset of `body` / `deadline` / `deadline_notif`; omitted fields are left untouched. `deadline` is a `YYYY-MM-DD HH:MM:SS` string (UTC); pass `null` to clear an existing deadline. Use `elab_list_steps` to resolve `stepId`. For finished/unfinished, use `elab_toggle_step`.',
+    {
+      entityType: entityTypeSchema,
+      id: z.number().int().positive(),
+      stepId: z.number().int().positive(),
+      body: z.string().min(1).optional(),
+      deadline: z
+        .string()
+        .nullable()
+        .optional()
+        .describe(
+          '`YYYY-MM-DD HH:MM:SS` to set; `null` to clear. Omit to leave untouched.'
+        ),
+      deadline_notif: z
+        .boolean()
+        .optional()
+        .describe('Toggle the deadline-notification flag.'),
+      team: teamParamSchema,
+    },
+    async (args) => {
+      const { entityType, id, stepId, body, deadline, deadline_notif, team } =
+        args as {
+          entityType: ElabEntityType;
+          id: number;
+          stepId: number;
+          body?: string;
+          deadline?: string | null;
+          deadline_notif?: boolean;
+          team?: number;
+        };
+      const t = effectiveTeam(registry, team);
+      const client = clientFor(registry, team);
+      const patch = {
+        ...(body !== undefined ? { body } : {}),
+        ...(deadline !== undefined ? { deadline } : {}),
+        ...(deadline_notif !== undefined ? { deadline_notif } : {}),
+      };
+      if (Object.keys(patch).length === 0) {
+        return errorText(
+          'No fields provided. Pass at least one of `body`, `deadline`, `deadline_notif`.'
+        );
+      }
+      return guard(
+        async () => {
+          await assertTeam(client, entityType, id, t);
+          return client.updateStep(entityType, id, stepId, patch);
+        },
+        () => {
+          const changes: string[] = [];
+          if (body !== undefined) changes.push('body');
+          if (deadline !== undefined)
+            changes.push(deadline === null ? 'deadline cleared' : 'deadline');
+          if (deadline_notif !== undefined)
+            changes.push(`deadline_notif=${deadline_notif}`);
+          return text(
+            `Updated step #${stepId} on ${entityType.slice(0, -1)} #${id} (${changes.join(', ')}).`
+          );
+        }
+      );
+    }
+  );
+
+  server.tool(
     'elab_toggle_step',
     'Toggle a checklist step as finished or unfinished.',
     {

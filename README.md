@@ -146,7 +146,7 @@ set.** Mixing the two is rejected at startup.
 | `elab_set_extra_field_groups` | Manage `metadata.elabftw.extra_fields_groups` (named clusters that organize fields in the UI). `mode: 'replace'` overwrites; `mode: 'merge'` upserts by `id`. Rejects `id=-1` (reserved for the implicit default bucket). |
 | `elab_duplicate_entity` | Duplicate with optional file copy and back-link. `targetTeam` re-targets the duplicate to a different team than the source. |
 | `elab_add_comment` / `elab_update_comment` | Add / edit comments. Delete is gated behind destructive — see below. |
-| `elab_add_step` / `elab_toggle_step` / `elab_delete_step` | Manage checklist steps. `elab_add_step` accepts `deadline_notif`. Step delete is permanent. |
+| `elab_add_step` / `elab_update_step` / `elab_toggle_step` / `elab_delete_step` | Manage checklist steps. `elab_add_step` accepts `deadline_notif`. `elab_update_step` edits `body` / `deadline` / `deadline_notif` in place (omitted fields untouched; pass `deadline: null` to clear). Step delete is permanent. |
 | `elab_link_entities` / `elab_unlink_entities` | Cross-entity links. Both ends must be in the same team. |
 | `elab_add_tag` / `elab_remove_tag` | Tag management on a single entity. |
 | `elab_create_tag` | Create a team-scoped tag without attaching it to any entity. Idempotent — elabftw's `INSERT ... ON DUPLICATE KEY UPDATE` returns the existing id on a duplicate string. Requires team-admin. |

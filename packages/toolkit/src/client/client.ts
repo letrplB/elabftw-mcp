@@ -416,6 +416,40 @@ export class ElabftwClient {
   }
 
   /**
+   * `PATCH /{entityType}/{id}/steps/{stepId}` with field updates. Modern
+   * elabftw v2 treats a plain PATCH (no `action`) as a direct row update,
+   * so this is the path for editing a step's prose, deadline, or
+   * deadline-notification flag without churning the audit trail by
+   * delete + re-add. The `action`-shaped path is reserved for
+   * `finish` / `notif` (see {@link toggleStep}).
+   *
+   * `deadline_notif` is stored as 0/1 on the wire; the boolean arg here is
+   * coerced to match {@link addStep}.
+   */
+  updateStep(
+    entityType: ElabEntityType,
+    id: number,
+    stepId: number,
+    patch: { body?: string; deadline?: string | null; deadline_notif?: boolean }
+  ): Promise<ElabStep> {
+    return elabJson(
+      this.config,
+      `/${entityType}/${id}/steps/${stepId}`,
+      undefined,
+      {
+        method: 'PATCH',
+        body: {
+          ...(patch.body !== undefined ? { body: patch.body } : {}),
+          ...(patch.deadline !== undefined ? { deadline: patch.deadline } : {}),
+          ...(patch.deadline_notif !== undefined
+            ? { deadline_notif: patch.deadline_notif ? 1 : 0 }
+            : {}),
+        },
+      }
+    );
+  }
+
+  /**
    * Links between entities. elabftw splits these by target kind:
    *   - `/experiments_links` when the target is an experiment
    *   - `/items_links` when the target is an item
