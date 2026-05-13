@@ -128,6 +128,7 @@ set.** Mixing the two is rejected at startup.
 | `elab_list_items_status` | Item statuses on the current team. |
 | `elab_search_compounds` | Search the team’s compound catalog by name / CAS / PubChem CID / InChI / SMILES / formula. Server-side full-text via `q`. Returns one row per compound with a compact hazard summary. |
 | `elab_get_compound` | Fetch one compound by id — name, identifiers (CAS, PubChem CID, ChEMBL, EC, ChEBI, KEGG, DrugBank, …), structure (InChI / SMILES / formula / MW / IUPAC), and an aggregated GHS / regulatory hazard summary. |
+| `elab_search_pubchem` | Preview a compound from PubChem WITHOUT storing it. Provide exactly one of `cid` / `cas` / `name`. CID returns one hit; CAS / name return arrays (and include hazard flags). Use to confirm what the importer will pull in before committing. |
 | `elab_list_revisions` | List body revisions for an entity. Surfaces edit history (who / when / size) for cohort review. Per-instance availability. |
 | `elab_get_revision` | Fetch one revision's body. Rendered through the markdown path (tables + hrefs preserved). |
 | `elab_get_user` | Fetch one user by `userid`. Identity fields gated behind `ELABFTW_REVEAL_USER_IDENTITIES=true`. |
@@ -153,6 +154,7 @@ set.** Mixing the two is rejected at startup.
 | `elab_add_tag` / `elab_remove_tag` | Tag management on a single entity. |
 | `elab_create_tag` | Create a team-scoped tag without attaching it to any entity. Idempotent — elabftw's `INSERT ... ON DUPLICATE KEY UPDATE` returns the existing id on a duplicate string. Requires team-admin. |
 | `elab_create_compound` | Create a compound in the team’s catalog. Only `name` is required; everything else (PubChem / CAS / ChEMBL identifiers, InChI / SMILES / formula / MW / IUPAC name, GHS hazard flags) is optional. Hazard flags accept booleans, coerced to 0/1 on the wire. Pair with `elab_link_entities(targetKind: "compounds")` to attach the new compound to an entity. |
+| `elab_create_compound_from_pubchem` | Create a compound by fetching its full record from PubChem. Provide `cid` (preferred) or `cas`; elabftw resolves the identifier and pulls name / structure / IUPAC / hazard flags into the new row. Preview with `elab_search_pubchem` first. |
 | `elab_update_compound` | Patch any subset of a compound’s fields. Plain PATCH — omitted fields stay untouched. Hazard flags accept booleans. |
 
 ### Destructive (requires `ELABFTW_ALLOW_DESTRUCTIVE=true`)

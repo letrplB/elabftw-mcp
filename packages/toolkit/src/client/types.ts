@@ -532,6 +532,45 @@ export interface ElabCompoundQuery {
 }
 
 /**
+ * Hit returned by the PubChem-preview endpoints
+ * (`GET /compounds?search_pubchem_{cid,cas,name}=...`). Field names follow
+ * elabftw's PubChem importer convention (camelCase, distinct from the
+ * snake_case `ElabCompound` shape used for stored compounds): `inChI`,
+ * `inChIKey`, `iupacName`, `molecularFormula`, `molecularWeight`,
+ * `isCorrosive`, `isExplosive`, etc.
+ *
+ * The CID-search path returns a single hit (no hazard flags); the
+ * CAS / name paths return an array and *do* include hazard flags. We
+ * model the union so both call paths are typed correctly.
+ *
+ * Source of truth: `elabftw/src/Services/PubChemImporter.php` +
+ * `elabftw/src/Elabftw/Compound.php` (`toArray`).
+ */
+export interface ElabPubchemHit {
+  name: string;
+  cid: number;
+  cas?: string | null;
+  inChI?: string | null;
+  inChIKey?: string | null;
+  iupacName?: string | null;
+  smiles?: string | null;
+  molecularFormula?: string | null;
+  molecularWeight?: number | null;
+  isPublic?: 0 | 1 | boolean;
+  // Hazard flags only present on CAS / name search results
+  isCorrosive?: boolean;
+  isExplosive?: boolean;
+  isFlammable?: boolean;
+  isGasUnderPressure?: boolean;
+  isHazardous2env?: boolean;
+  isHazardous2health?: boolean;
+  isOxidising?: boolean;
+  isToxic?: boolean;
+  isSeriousHealthHazard?: boolean;
+  [key: string]: unknown;
+}
+
+/**
  * PATCH-shaped diff for `elab_update_compound`. Every field is optional
  * (omitted means "leave alone"). Hazard flags accept `boolean` for
  * agent convenience; the client coerces to 0/1 before sending.

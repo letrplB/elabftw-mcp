@@ -5,6 +5,7 @@ import type {
   ElabCompound,
   ElabCompoundPatch,
   ElabCompoundQuery,
+  ElabPubchemHit,
   ElabCreateEntityInput,
   ElabDuplicateOptions,
   ElabEntity,
@@ -727,6 +728,78 @@ export class ElabftwClient {
     await elabFetch(this.config, `/compounds/${id}`, undefined, {
       method: 'DELETE',
     });
+  }
+
+  /**
+   * `GET /compounds?search_pubchem_cid=<cid>` — preview a compound from
+   * PubChem by CID without writing anything to elabftw. Returns the parsed
+   * Compound shape (camelCase fields per the elabftw importer convention;
+   * no hazard flags on this path — PubChem hazard data is only resolved on
+   * the CAS / name paths). Useful for showing the agent what a record will
+   * look like before committing to a create.
+   *
+   * Source of truth: `elabftw/src/Models/Compounds.php:94-101`,
+   * `elabftw/src/Services/PubChemImporter.php`.
+   */
+  searchPubchemCid(cid: number): Promise<ElabPubchemHit> {
+    return elabJson(this.config, '/compounds', {
+      search_pubchem_cid: cid,
+    });
+  }
+
+  /**
+   * `GET /compounds?search_pubchem_cas=<cas>` — PubChem search by CAS
+   * number. Returns 0..N hits as an array; includes hazard flags resolved
+   * from PubChem.
+   */
+  searchPubchemCas(cas: string): Promise<ElabPubchemHit[]> {
+    return elabJson(this.config, '/compounds', {
+      search_pubchem_cas: cas,
+    });
+  }
+
+  /**
+   * `GET /compounds?search_pubchem_name=<name>` — PubChem search by
+   * substance name (free-text). Returns 0..N hits as an array; includes
+   * hazard flags. Use sparingly — names are ambiguous; prefer CAS or CID.
+   */
+  searchPubchemName(name: string): Promise<ElabPubchemHit[]> {
+    return elabJson(this.config, '/compounds', {
+      search_pubchem_name: name,
+    });
+  }
+
+  /**
+   * `POST /compounds` with `action: 'duplicate'` and `{cid}` — fetch the
+   * compound from PubChem and create a new row in the team's compound
+   * catalog with all fields pre-filled (name, identifiers, structure,
+   * hazard flags). Returns the new compound id from the `Location`
+   * header.
+   *
+   * Source of truth: `elabftw/src/Models/Compounds.php:192-216` —
+   * `postAction` dispatches `Action::Duplicate` to
+   * `createCompoundFromIdentifier` which routes by `cid` (preferred) or
+   * `cas` (fallback).
+   */
+  async createCompoundFromPubchemCid(cid: number): Promise<number | null> {
+    const response = await elabFetch(this.config, '/compounds', undefined, {
+      method: 'POST',
+      body: { action: 'duplicate', cid },
+    });
+    return extractLocationId(response);
+  }
+
+  /**
+   * `POST /compounds` with `action: 'duplicate'` and `{cas}` — same as
+   * {@link createCompoundFromPubchemCid} but routes through PubChem's
+   * CAS → CID lookup before fetching. Use when only the CAS is known.
+   */
+  async createCompoundFromPubchemCas(cas: string): Promise<number | null> {
+    const response = await elabFetch(this.config, '/compounds', undefined, {
+      method: 'POST',
+      body: { action: 'duplicate', cas },
+    });
+    return extractLocationId(response);
   }
 
   /** `GET /users` (sysadmin) or `GET /users/search?q=...`. */

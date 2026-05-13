@@ -8,6 +8,28 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- **PubChem integration** — two new tools wrap elabftw's PubChem
+  importer (CSP-allowed on this instance at
+  `pubchem.ncbi.nlm.nih.gov`):
+  - `elab_search_pubchem` (read) — preview a substance from PubChem
+    without storing it. Provide exactly one of `cid` / `cas` / `name`.
+    CID returns a single hit (no hazard flags); CAS / name return
+    arrays and *do* include hazard flags (resolved by PubChem's GHS
+    classification). Camel-case field shape (`molecularFormula`,
+    `iupacName`, `isCorrosive`, …) per elabftw's importer convention,
+    typed as `ElabPubchemHit`.
+  - `elab_create_compound_from_pubchem` (write, gated by
+    `ELABFTW_ALLOW_WRITES`) — `POST /compounds` with
+    `action: 'duplicate'` and `{cid}` / `{cas}`. elabftw resolves the
+    identifier (CID preferred; CAS falls back through PubChem's CAS
+    → CID lookup) and creates the new compound with name + structure +
+    hazard flags pre-filled.
+
+  Preview-then-commit flow: agents typically `elab_search_pubchem({cid})`
+  to confirm what the importer will pull, then
+  `elab_create_compound_from_pubchem({cid})` to commit. Existing
+  `elab_create_compound` remains the manual-create path for substances
+  not in PubChem.
 - **Compound CRUD** — five new tools wrap the `/compounds` endpoint
   surface so agents can manage chemical substances directly instead of
   going through the elabftw UI:

@@ -10,6 +10,7 @@ import {
   formatComments,
   formatCompound,
   formatCompoundList,
+  formatPubchemHits,
   formatEntityFull,
   formatEntityList,
   formatLinks,
@@ -953,6 +954,54 @@ export function registerReadTools(
       return guard(
         () => client.listCompounds({ q, limit, offset }),
         (rows) => text(formatCompoundList(rows))
+      );
+    }
+  );
+
+  server.tool(
+    'elab_search_pubchem',
+    'Preview a compound from PubChem WITHOUT storing it. Useful before calling `elab_create_compound_from_pubchem` — confirms what the importer will pull in (name, CID, CAS, structure, IUPAC, and on the CAS / name paths, hazard flags). Exactly one of `cid` / `cas` / `name` must be provided. `cid` returns a single hit (no hazard flags); `cas` / `name` return arrays (with hazard flags). Prefer `cid` or `cas` over `name` (names are ambiguous).',
+    {
+      cid: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe('PubChem CID. Returns a single record.'),
+      cas: z
+        .string()
+        .optional()
+        .describe('CAS registry number (e.g. `58-08-2`). Returns 0..N hits.'),
+      name: z
+        .string()
+        .optional()
+        .describe('Substance name (free-text). Returns 0..N hits. Ambiguous — prefer cid/cas.'),
+      team: teamParamSchema,
+    },
+    async (args) => {
+      const { cid, cas, name, team } = args as {
+        cid?: number;
+        cas?: string;
+        name?: string;
+        team?: number;
+      };
+      const provided = [cid, cas, name].filter((v) => v !== undefined).length;
+      if (provided !== 1) {
+        return text(
+          'Provide exactly one of `cid` / `cas` / `name`. Use `cid` when you know the PubChem id, `cas` for a registry number, `name` only as a last resort.'
+        );
+      }
+      const client = clientFor(registry, team);
+      return guard(
+        async () => {
+          if (cid !== undefined) {
+            const hit = await client.searchPubchemCid(cid);
+            return [hit];
+          }
+          if (cas !== undefined) return client.searchPubchemCas(cas);
+          return client.searchPubchemName(name!);
+        },
+        (hits) => text(formatPubchemHits(hits))
       );
     }
   );

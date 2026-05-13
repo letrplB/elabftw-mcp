@@ -1576,6 +1576,56 @@ export function registerWriteTools(
   );
 
   server.tool(
+    'elab_create_compound_from_pubchem',
+    'Create a compound by fetching its full record from PubChem. elabftw resolves the identifier (CID preferred, CAS fallback) against PubChem, pulls name / InChI / SMILES / formula / IUPAC / hazard flags, and stores the result in the team catalog. Provide exactly one of `cid` / `cas`. After create, attach to an entity with `elab_link_entities(targetKind: "compounds", targetId: <newId>)` or `elab_set_extra_field(type: "compounds")`. Preview before committing with `elab_search_pubchem`. Pass `team` to pick a configured team key. Gated by `ELABFTW_ALLOW_WRITES`.',
+    {
+      cid: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe('PubChem CID. Preferred — unambiguous.'),
+      cas: z
+        .string()
+        .optional()
+        .describe(
+          'CAS registry number (e.g. `58-08-2`). Server resolves CAS → CID via PubChem first.'
+        ),
+      team: teamParamSchema,
+    },
+    async (args) => {
+      const { cid, cas, team } = args as {
+        cid?: number;
+        cas?: string;
+        team?: number;
+      };
+      const provided = [cid, cas].filter((v) => v !== undefined).length;
+      if (provided !== 1) {
+        return errorText(
+          'Provide exactly one of `cid` / `cas`. Use `cid` when known; `cas` is the fallback.'
+        );
+      }
+      const t = effectiveTeam(registry, team);
+      const client = clientFor(registry, team);
+      return guard(
+        () =>
+          cid !== undefined
+            ? client.createCompoundFromPubchemCid(cid)
+            : client.createCompoundFromPubchemCas(cas!),
+        (id) => {
+          const label =
+            cid !== undefined ? `CID=${cid}` : `CAS=${cas}`;
+          return text(
+            id != null
+              ? `Created compound #${id} from PubChem ${label} in team ${t}.`
+              : `Created compound from PubChem ${label} in team ${t}. (elabftw did not return an id; call \`elab_search_compounds\` to resolve.)`
+          );
+        }
+      );
+    }
+  );
+
+  server.tool(
     'elab_update_compound',
     'Patch fields on an existing compound. Plain PATCH semantics — pass any subset of the create-time fields and only those values are written; omitted fields stay untouched. Hazard flags accept booleans (coerced to 0/1). Cannot change team membership through this tool. Pass `team` to pick which configured team key/team the compound lives in. Gated by `ELABFTW_ALLOW_WRITES`.',
     {

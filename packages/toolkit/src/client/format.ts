@@ -5,6 +5,7 @@ import type {
   ElabEntity,
   ElabLink,
   ElabMetadata,
+  ElabPubchemHit,
   ElabRevision,
   ElabStep,
   ElabUpload,
@@ -501,6 +502,54 @@ export function formatCompound(c: ElabCompound): string {
   const hazards = formatCompoundHazards(c);
   if (hazards) lines.push(hazards);
   return lines.join('\n');
+}
+
+/**
+ * Compact hazard summary for a PubChem preview hit. Same shape as
+ * {@link formatCompoundHazards} but reads camelCase keys
+ * (`isCorrosive`, `isHazardous2health`, …) per the PubChem-importer
+ * convention. The CID search path returns no hazard flags; CAS / name
+ * paths do.
+ */
+function formatPubchemHazards(h: ElabPubchemHit): string {
+  const pretty: Record<string, string> = {
+    isCorrosive: 'corrosive',
+    isExplosive: 'explosive',
+    isFlammable: 'flammable',
+    isGasUnderPressure: 'gas-under-pressure',
+    isHazardous2env: 'env-hazard',
+    isHazardous2health: 'health-hazard',
+    isOxidising: 'oxidising',
+    isToxic: 'toxic',
+    isSeriousHealthHazard: 'serious-health-hazard',
+  };
+  const set: string[] = [];
+  for (const key of Object.keys(pretty)) {
+    if (h[key as keyof ElabPubchemHit]) set.push(pretty[key]!);
+  }
+  return set.length ? `⚠ ${set.join(', ')}` : '';
+}
+
+/**
+ * Render a list of PubChem-preview hits — the read-only response from
+ * `elab_search_pubchem`. These are NOT compounds in the team catalog
+ * (they have no elabftw id); the CID is the PubChem CID. Hand the CID
+ * (or CAS) to `elab_create_compound_from_pubchem` to actually store
+ * the substance.
+ */
+export function formatPubchemHits(hits: ElabPubchemHit[]): string {
+  if (hits.length === 0) return 'No PubChem hits.';
+  return hits
+    .map((h) => {
+      const ids: string[] = [`CID=${h.cid}`];
+      if (h.cas) ids.push(`CAS=${h.cas}`);
+      const mf = h.molecularFormula ? ` | ${h.molecularFormula}` : '';
+      const mw = h.molecularWeight ? ` (MW=${h.molecularWeight})` : '';
+      const hazards = formatPubchemHazards(h);
+      const hazardSegment = hazards ? ` | ${hazards}` : '';
+      return `${h.name} | ${ids.join(' ')}${mf}${mw}${hazardSegment}`;
+    })
+    .join('\n');
 }
 
 /**
