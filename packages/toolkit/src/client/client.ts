@@ -386,24 +386,36 @@ export class ElabftwClient {
   }
 
   /**
-   * Toggle a step's `finished` flag. elabftw sets `finished_time`
-   * server-side when finished=1.
+   * Set a step's `finished` state idempotently. elabftw's
+   * `Action::Finish` is a *toggle*, not a setter — it flips the column
+   * unconditionally, ignores any `finished` value in the body, AND has
+   * a side effect: it clears `deadline` and `deadline_notif` every
+   * time it fires. Passing a `finished: boolean` arg to a toggle is a
+   * UX trap (flipping an already-finished step to unfinished while
+   * losing the deadline) so the toolkit wraps it with a read-modify-
+   * write: GET the current state, only PATCH when it doesn't match
+   * the requested state.
+   *
+   * Returns the (possibly unchanged) step row.
+   *
+   * Source of truth: `elabftw/src/Models/Steps.php:281-304`
+   * (`toggleFinished` — note the `deadline = null, deadline_notif = 0`
+   * in the UPDATE).
    */
-  toggleStep(
+  async toggleStep(
     entityType: ElabEntityType,
     id: number,
     stepId: number,
     finished: boolean
   ): Promise<ElabStep> {
-    return elabJson(
-      this.config,
-      `/${entityType}/${id}/steps/${stepId}`,
-      undefined,
-      {
-        method: 'PATCH',
-        body: { action: 'finish', finished: finished ? 1 : 0 },
-      }
-    );
+    const stepUrl = `/${entityType}/${id}/steps/${stepId}`;
+    const current = (await elabJson(this.config, stepUrl)) as ElabStep;
+    const desired = finished ? 1 : 0;
+    if (current.finished === desired) return current;
+    return elabJson(this.config, stepUrl, undefined, {
+      method: 'PATCH',
+      body: { action: 'finish' },
+    });
   }
 
   async deleteStep(

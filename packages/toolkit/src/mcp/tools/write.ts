@@ -1322,7 +1322,7 @@ export function registerWriteTools(
 
   server.tool(
     'elab_toggle_step',
-    'Toggle a checklist step as finished or unfinished.',
+    'Set a checklist step’s finished state. Idempotent — pass `finished: true` to mark finished, `finished: false` to mark unfinished; if the step is already in the requested state, the call is a no-op. (elabftw’s underlying API is a toggle that flips state AND clears the step’s `deadline` / `deadline_notif` on every fire; the toolkit wraps it with a read-modify-write so accidental double-toggles can’t blow away a deadline.)',
     {
       entityType: entityTypeSchema,
       id: z.number().int().positive(),
