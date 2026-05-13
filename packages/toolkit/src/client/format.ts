@@ -91,6 +91,16 @@ function createMarkdownConverter(): TurndownService {
     filter: ['thead', 'tbody', 'tfoot', 'tr', 'th', 'td'],
     replacement: () => '',
   });
+  // Turndown's default `escape` aggressively backslash-escapes underscores,
+  // brackets, parens, dots, hashes, etc. to prevent every conceivable markdown
+  // ambiguity. The converter is configured with `emDelimiter: '*'`, so
+  // underscores in source content can never be confused for emphasis — yet the
+  // default escape still mangles `d_H_DLS_nm` → `d\_H\_DLS\_nm`, breaking
+  // downstream tools that grep on field names. Override to escape only the
+  // characters that genuinely break markdown rendering: backslash, asterisk,
+  // backtick.
+  td.escape = (s: string): string =>
+    s.replace(/\\/g, '\\\\').replace(/\*/g, '\\*').replace(/`/g, '\\`');
   _converter = td;
   return td;
 }
@@ -200,7 +210,9 @@ export function formatEntityFull(
   if (entity.body) {
     lines.push('');
     lines.push('## Body');
-    lines.push(renderBody(entity.body, options.format ?? 'text'));
+    lines.push(
+      renderBody(entity.body, options.format ?? 'text', entity.content_type)
+    );
   }
 
   if (metadata?.extra_fields) {
@@ -245,9 +257,22 @@ export function formatEntityFull(
   return lines.join('\n');
 }
 
-function renderBody(body: string, format: 'text' | 'markdown' | 'html'): string {
+function renderBody(
+  body: string,
+  format: 'text' | 'markdown' | 'html',
+  contentType?: number
+): string {
   if (format === 'html') return body;
   if (format === 'markdown') {
+    // elabftw stores bodies natively as markdown when content_type=2.
+    // Round-tripping through Turndown (HTML → MD) introduces lossy
+    // artifacts (list-marker reflow, table-cell whitespace normalization,
+    // residual escapes). When the body is already markdown, return it
+    // untouched — just enforce the same upper-bound truncation as the
+    // Turndown path so the response stays bounded.
+    if (contentType === 2) {
+      return truncate(body, MAX_MARKDOWN_BODY);
+    }
     return truncate(htmlToMarkdown(body), MAX_MARKDOWN_BODY);
   }
   return truncate(stripHtml(body), MAX_TEXT_BODY);
@@ -362,7 +387,13 @@ export function formatRevisionBody(
   if (revision.body) {
     lines.push('');
     lines.push('## Body');
-    lines.push(renderBody(revision.body, options.format ?? 'markdown'));
+    lines.push(
+      renderBody(
+        revision.body,
+        options.format ?? 'markdown',
+        revision.content_type
+      )
+    );
   }
   return lines.join('\n');
 }

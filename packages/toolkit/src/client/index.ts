@@ -28,6 +28,7 @@ export type {
 } from './format';
 
 export type {
+  ElabCategory,
   ElabComment,
   ElabCreateEntityInput,
   ElabDuplicateOptions,
@@ -37,7 +38,8 @@ export type {
   ElabEntityUpdate,
   ElabEvent,
   ElabExperimentsTemplate,
-  ElabExtraFieldDescriptor,
+  ElabExtraFieldKey,
+  ElabExtraFieldType,
   ElabExtraFieldValue,
   ElabInfo,
   ElabItemsType,
@@ -47,6 +49,7 @@ export type {
   ElabOrderKey,
   ElabRevision,
   ElabSortDirection,
+  ElabStatus,
   ElabStep,
   ElabTag,
   ElabTeam,
@@ -55,4 +58,4 @@ export type {
   ElabftwConfig,
 } from './types';
 
-export { ElabScope, ElabState } from './types';
+export { ElabScope, ElabState, EXTRA_FIELD_TYPES } from './types';

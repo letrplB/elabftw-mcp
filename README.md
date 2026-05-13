@@ -121,7 +121,11 @@ set.** Mixing the two is rejected at startup.
 | `elab_list_teams` | All teams on the instance (for id → name mapping). Marks which teams have keys configured. |
 | `elab_configured_teams` | List teams this MCP has keys for. |
 | `elab_search_users` | Search users by name/email (empty `q` lists visible). Resolves opaque `userid` to identity. Requires team-admin key. Identity fields gated behind `ELABFTW_REVEAL_USER_IDENTITIES=true`. |
-| `elab_list_extra_field_names` | Instance-wide list of every `extra_fields` key with data. Use to discover which structured fields templates define before reviewing student submissions. |
+| `elab_list_extra_field_names` | Instance-wide list of every `extra_fields` key with usage counts. Returns `key (used N×)` rows for discovery; per-field type / options live in the owning template's metadata (see `elab_list_extra_fields`). |
+| `elab_list_extra_fields` | Structured per-entity view of `extra_fields` — group, name, type, value, unit, required, options, position, description. Complements the prose `## Extra fields` block in `elab_get`. |
+| `elab_list_experiments_categories` | Templates / experiment categories on the current team (id, title, color, default marker). |
+| `elab_list_experiments_status` | Experiment statuses on the current team. |
+| `elab_list_items_status` | Item statuses on the current team. |
 | `elab_list_revisions` | List body revisions for an entity. Surfaces edit history (who / when / size) for cohort review. Per-instance availability. |
 | `elab_get_revision` | Fetch one revision's body. Rendered through the markdown path (tables + hrefs preserved). |
 | `elab_get_user` | Fetch one user by `userid`. Identity fields gated behind `ELABFTW_REVEAL_USER_IDENTITIES=true`. |
@@ -133,15 +137,20 @@ set.** Mixing the two is rejected at startup.
 
 | Tool | Purpose |
 |---|---|
-| `elab_create_entity` | Create any of the four kinds (experiments, items, templates, items_types). Accepts `title` / `body` / `content_type` / `tags` / `metadata` / `category_id` plus all PATCH-symmetric fields: `date` / `rating` / `status` / `custom_id` / `canread` / `canwrite` / `state`. Re-PATCHes any field elabftw drops or normalizes on POST so the values land. Verifies the new entry lands in the requested team. |
+| `elab_create_entity` | Create any of the four kinds (experiments, items, templates, items_types). Accepts `title` / `body` / `content_type` / `tags` / `metadata` / `category_id` plus all PATCH-symmetric fields: `date` / `rating` / `status` / `custom_id` / `canread` / `canwrite` / `state`. For `items` / `experiments` with `category_id` set, auto-loads the items_type / template's `extra_fields` schema (caller-provided `metadata` wins per-field); pass `loadFieldsFromCategory: false` to opt out. Reconcile loop re-PATCHes `metadata` / `body` / `tags` and any other field elabftw drops or normalizes on POST. |
 | `elab_update_entity` | Patch any of the four kinds. Title / body / content_type / category / status / rating / date / custom_id / metadata / permissions / `state` (`"normal"` / `"archived"` — soft-delete goes through `elab_delete_entity`). |
-| `elab_update_extra_field` | Patch a single `extra_fields` value without rewriting the whole metadata blob. |
+| `elab_set_extra_field` | Create-or-update one `extra_fields` entry via read-merge-PATCH. Typed: `text`, `number`, `checkbox`, `date`, `datetime-local`, `email`, `time`, `url`, `select`, `radio`, `experiments`, `items`, `users`, `compounds`, `uploads`. Validates per type (e.g. `select`/`radio` require `options`). For `experiments` / `items` / `compounds` types, also creates the entity-link unless `autoLink: false`. `mode: 'replace'` (default) writes the whole entry; `mode: 'merge'` updates only-provided properties. |
+| `elab_update_extra_field` | Value-only fast path on an existing field — bypasses the read-merge-PATCH cycle. Cannot create fields or change type / options / unit; pre-flights with a GET and returns a friendly error pointing at `elab_set_extra_field` when the field is missing. |
+| `elab_remove_extra_field` | Delete one `extra_fields` entry, prune empty groups + namespace, send `metadata: null` when the blob is empty after cleanup. `alsoUnlink: true` (default) also removes the entity-link for typed pointer fields (`experiments` / `items` / `compounds`). |
+| `elab_clone_extra_fields_schema` | Mirror the UI's "Load fields" button: copy `extra_fields` shape (plus groups) from one entity (typically an items_type / template) onto another. Target's existing per-field `value`s are preserved. `blankValues: true` strips defaults for schema-only copy. |
+| `elab_set_extra_field_groups` | Manage `metadata.elabftw.extra_fields_groups` (named clusters that organize fields in the UI). `mode: 'replace'` overwrites; `mode: 'merge'` upserts by `id`. Rejects `id=-1` (reserved for the implicit default bucket). |
 | `elab_duplicate_entity` | Duplicate with optional file copy and back-link. `targetTeam` re-targets the duplicate to a different team than the source. |
 | `elab_delete_entity` | Soft-delete (state=3). Permanent deletion is sysadmin-only and not exposed. |
 | `elab_add_comment` / `elab_update_comment` / `elab_delete_comment` | Comment CRUD. Comment delete is permanent (no soft-delete on the elabftw side). |
 | `elab_add_step` / `elab_toggle_step` / `elab_delete_step` | Manage checklist steps. `elab_add_step` accepts `deadline_notif`. Step delete is permanent. |
 | `elab_link_entities` / `elab_unlink_entities` | Cross-entity links. Both ends must be in the same team. |
-| `elab_add_tag` / `elab_remove_tag` | Tag management. |
+| `elab_add_tag` / `elab_remove_tag` | Tag management on a single entity. |
+| `elab_create_tag` | Create a team-scoped tag without attaching it to any entity. Idempotent — elabftw's `INSERT ... ON DUPLICATE KEY UPDATE` returns the existing id on a duplicate string. Requires team-admin. |
 
 ### Destructive (requires `ELABFTW_ALLOW_DESTRUCTIVE=true`)
 
@@ -155,6 +164,7 @@ intervention. Gated behind a second flag on purpose.
 | `elab_timestamp` | RFC 3161 trusted timestamp. Consumes from `ts_balance`. |
 | `elab_bloxberg` | Anchor on the Bloxberg blockchain. |
 | `elab_sign` | Cryptographic signature with a configured signature key. |
+| `elab_delete_tag` | Permanently delete a team-scoped tag. Cascades — elabftw's `TeamTags::destroy` detaches the tag from every entity that referenced it before deleting the row. Gated behind destructive flag because some teams use tags as permission gates. Requires team-admin. |
 
 ### Rich body rendering
 
@@ -178,6 +188,117 @@ transparently re-PATCHes after creation so the value lands and the body
 is re-served through elabftw's markdown → HTML pipeline. If the
 fallback PATCH itself fails, the tool surfaces a note in its response
 pointing you at `elab_update_entity` to retry.
+
+## Working with extra fields
+
+`extra_fields` are typed key / value pairs (`type=number` with a unit,
+`type=select` with an options list, `type=experiments` as a typed
+pointer to another entity, …) that live on every entity's `metadata`
+blob and render as a structured form in the elabftw UI. Three patterns
+cover the workflows that actually show up:
+
+### Pattern 1 — Inherit a schema from an items_type / template
+
+When you create an `items` or `experiments` with `category_id` set,
+the tool auto-loads the source schema:
+
+```
+elab_create_entity({ entityType: "items", category_id: 32, title: "DMSN_028" })
+```
+
+The new item comes back already wearing the items_type's `extra_fields`
+schema. The response message tells you how many fields were inherited.
+
+Pass `loadFieldsFromCategory: false` for a blank entity, or pass your
+own `metadata` to override per-field — caller's metadata wins per
+field, the inherited schema fills in the rest.
+
+### Pattern 2 — Add or update a single field
+
+`elab_set_extra_field` is the agent-native equivalent of the UI's
+field-builder modal. One call replaces the read-parse-merge-stringify-
+PATCH dance.
+
+Scalar with a unit:
+
+```json
+{
+  "entityType": "items",
+  "id": 475,
+  "name": "d_H_DLS_nm",
+  "type": "number",
+  "value": 71,
+  "units": ["nm"],
+  "unit": "nm"
+}
+```
+
+Choice field:
+
+```json
+{
+  "entityType": "items",
+  "id": 475,
+  "name": "is_canonical",
+  "type": "select",
+  "options": ["yes", "no", "partial"],
+  "value": "yes"
+}
+```
+
+Typed pointer with auto-link (`type` is one of `experiments` / `items` /
+`compounds`; setting the field also creates the corresponding
+entity-link unless `autoLink: false`):
+
+```json
+{
+  "entityType": "items",
+  "id": 475,
+  "name": "canonical_bet_analysis",
+  "type": "experiments",
+  "value": 1345
+}
+```
+
+The full type vocabulary is the 15 elabftw 5.5 types: `text`,
+`number`, `checkbox`, `date`, `datetime-local`, `email`, `time`, `url`,
+`select`, `radio`, `experiments`, `items`, `users`, `compounds`,
+`uploads`. Note that `select` is the internal type name for what the
+UI labels "Dropdown menu" — there is no separate `dropdown` type.
+`mode: 'merge'` updates only-provided properties (preserves existing
+`description`, `position`, etc.); the default `mode: 'replace'` writes
+the whole entry.
+
+### Pattern 3 — Update a value only
+
+Once the field exists, `elab_update_extra_field` is the fast path —
+it bypasses the read-merge-PATCH cycle and uses elabftw's JSON_SET
+endpoint:
+
+```
+elab_update_extra_field({ entityType: "items", id: 475, fieldName: "d_H_DLS_nm", value: 84 })
+```
+
+The tool pre-flights with a GET and returns a friendly error pointing
+at `elab_set_extra_field` if the field doesn't exist yet — previously
+this was a silent SQL no-op.
+
+### Discovery — listing what exists
+
+- `elab_list_extra_fields({entityType, id})` — structured per-entity
+  schema (groups, types, values, units, options, required, position).
+- `elab_list_extra_field_names()` — instance-wide name + frequency
+  index, useful for "which structured fields does this instance use at
+  all?"
+- `elab_get({entityType, id})` — prose-rendered `## Extra fields` block,
+  human-readable inside a fuller entity view.
+
+### Clone a schema
+
+`elab_clone_extra_fields_schema({sourceEntityType, sourceId,
+targetEntityType, targetId, blankValues: true})` is the agent
+equivalent of the UI's "Load fields" button. Pass `blankValues: true`
+when you want the schema shape only, not the example values.
 
 ## How team scoping works
 

@@ -1,7 +1,9 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import {
+  type ElabCategory,
   type ElabEntity,
   type ElabEntityType,
+  type ElabStatus,
   type ElabUser,
   type ElabftwClient,
   type EntityExtras,
@@ -93,6 +95,30 @@ function userInTeam(user: ElabUser, team: number): boolean {
   if (Array.isArray(user.teams) && user.teams.some((t) => t.id === team))
     return true;
   return false;
+}
+
+/**
+ * Render an `ElabCategory[]` or `ElabStatus[]` as one row per line:
+ *   `#<id> <title> (color=#<hex>) [default]`
+ * The `(color=...)` segment is omitted when no color is defined. The
+ * `[default]` marker only appears when `is_default` is truthy. elabftw
+ * stores hex colors without a leading `#` on the wire; we prepend it.
+ */
+function formatCategoriesOrStatuses(
+  rows: Array<ElabCategory | ElabStatus>,
+  noun: 'categories' | 'statuses'
+): string {
+  if (!rows || rows.length === 0) return `No ${noun} defined for this team.`;
+  return rows
+    .map((r) => {
+      const colorRaw = typeof r.color === 'string' ? r.color.trim() : '';
+      const colorSegment = colorRaw
+        ? ` (color=#${colorRaw.replace(/^#/, '')})`
+        : '';
+      const defaultMarker = r.is_default ? ' [default]' : '';
+      return `#${r.id} ${r.title}${colorSegment}${defaultMarker}`;
+    })
+    .join('\n');
 }
 
 type IncludeKey = 'steps' | 'comments' | 'attachments' | 'links';
@@ -750,8 +776,159 @@ export function registerReadTools(
   );
 
   server.tool(
+    'elab_list_extra_fields',
+    'List the structured `extra_fields` schema on a single entity, including group bindings, position, required/readonly flags, options, and units. ' +
+      'Complements `elab_get`’s prose `## Extra fields` block: that one is flat for human readability; this one exposes the full per-field shape an agent needs to re-create or modify a field. ' +
+      'Fields are grouped by `metadata.elabftw.extra_fields_groups`; fields without a `group_id` (or with one not in the groups list) are rendered under `(no group)`. ' +
+      'For the instance-wide index of every field key in use across all entities, use `elab_list_extra_field_names`.',
+    {
+      entityType: entityTypeSchema,
+      id: z.number().int().positive(),
+      team: teamParamSchema,
+    },
+    async (args) => {
+      const { entityType, id, team } = args as {
+        entityType: ElabEntityType;
+        id: number;
+        team?: number;
+      };
+      const t = effectiveTeam(registry, team);
+      const client = clientFor(registry, team);
+      return guard(
+        async () => {
+          const entity = await assertTeam(client, entityType, id, t);
+          return client.parseMetadata(entity);
+        },
+        (metadata) => {
+          if (!metadata || !metadata.extra_fields || Object.keys(metadata.extra_fields).length === 0) {
+            return text(
+              `No extra fields on ${entityType.slice(0, -1)} #${id}. ` +
+                'Use `elab_set_extra_field` to add one, or `elab_clone_extra_fields_schema` to copy a schema from a template / items_type.'
+            );
+          }
+          const groups = metadata.elabftw?.extra_fields_groups ?? [];
+          const groupNameById = new Map<number, string>();
+          for (const g of groups) groupNameById.set(g.id, g.name);
+
+          // Bucket fields by group_id. Fields without a `group_id` (or one not
+          // in the groups list) go to the default `-1` bucket.
+          const buckets = new Map<number, Array<[string, typeof metadata.extra_fields[string]]>>();
+          for (const [name, field] of Object.entries(metadata.extra_fields)) {
+            const rawGid = typeof field.group_id === 'number' ? field.group_id : -1;
+            const gid = groupNameById.has(rawGid) ? rawGid : -1;
+            if (!buckets.has(gid)) buckets.set(gid, []);
+            buckets.get(gid)!.push([name, field]);
+          }
+          // Sort buckets: declared groups (in their declared order), then -1.
+          const sortedGids: number[] = [];
+          for (const g of groups) {
+            if (buckets.has(g.id)) sortedGids.push(g.id);
+          }
+          if (buckets.has(-1)) sortedGids.push(-1);
+
+          const lines: string[] = [];
+          for (const gid of sortedGids) {
+            const header =
+              gid === -1
+                ? '(no group / id=-1)'
+                : `group=${groupNameById.get(gid) ?? '?'} (id=${gid})`;
+            lines.push(header);
+            const entries = buckets.get(gid)!;
+            entries.sort(
+              ([a, fa], [b, fb]) =>
+                (typeof fa.position === 'number' ? fa.position : 999) -
+                  (typeof fb.position === 'number' ? fb.position : 999) ||
+                a.localeCompare(b)
+            );
+            for (const [name, field] of entries) {
+              const valueRaw = field.value;
+              let valueStr: string;
+              if (valueRaw === undefined || valueRaw === null || valueRaw === '') {
+                valueStr = '(empty)';
+              } else if (Array.isArray(valueRaw)) {
+                valueStr = valueRaw.length === 0 ? '(empty)' : valueRaw.join(', ');
+              } else if (typeof valueRaw === 'object') {
+                valueStr = JSON.stringify(valueRaw);
+              } else {
+                valueStr = String(valueRaw);
+              }
+              const unitStr = field.unit ? `${field.unit}` : '';
+              const valueWithUnit =
+                unitStr && valueStr !== '(empty)' ? `${valueStr} ${unitStr}` : valueStr;
+              const cells: string[] = [
+                `type=${field.type ?? '?'}`,
+                `value=${valueWithUnit}`,
+              ];
+              if (typeof field.position === 'number')
+                cells.push(`position=${field.position}`);
+              if (field.required) cells.push('required=true');
+              if (field.readonly) cells.push('readonly=true');
+              if (field.allow_multi_values) cells.push('allow_multi_values=true');
+              if (field.blank_value_on_duplicate)
+                cells.push('blank_value_on_duplicate=true');
+              if (Array.isArray(field.options) && field.options.length > 0)
+                cells.push(`options=[${field.options.join(', ')}]`);
+              if (Array.isArray(field.units) && field.units.length > 0)
+                cells.push(`units=[${field.units.join(', ')}]`);
+              if (field.description)
+                cells.push(`description=${field.description}`);
+              lines.push(`  - ${name} | ${cells.join(' | ')}`);
+            }
+            lines.push('');
+          }
+          // Strip trailing blank line.
+          while (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
+          return text(lines.join('\n'));
+        }
+      );
+    }
+  );
+
+  server.tool(
+    'elab_list_experiments_categories',
+    'List experiment categories defined in the team. Categories drive template selection on experiment create (`elab_create_entity(experiments, category_id=<id>)`) and color-code the experiment list. Returns `#<id> <title>` rows with the color hex if defined, and a `[default]` marker on the team default. Pass `team` to pick a configured team key; omit for the default.',
+    { team: teamParamSchema },
+    async (args) => {
+      const { team } = args as { team?: number };
+      const client = clientFor(registry, team);
+      return guard(
+        () => client.listExperimentsCategories(),
+        (rows) => text(formatCategoriesOrStatuses(rows, 'categories'))
+      );
+    }
+  );
+
+  server.tool(
+    'elab_list_experiments_status',
+    'List experiment statuses (workflow tags like "Running", "Success", "Need to be redone", "Fail"). The `status` arg on `elab_create_entity` / `elab_update_entity` takes an id from here. Returns `#<id> <title>` rows with the color hex if defined, and a `[default]` marker on the team default. Pass `team` to pick a configured team key; omit for the default.',
+    { team: teamParamSchema },
+    async (args) => {
+      const { team } = args as { team?: number };
+      const client = clientFor(registry, team);
+      return guard(
+        () => client.listExperimentsStatus(),
+        (rows) => text(formatCategoriesOrStatuses(rows, 'statuses'))
+      );
+    }
+  );
+
+  server.tool(
+    'elab_list_items_status',
+    'List item (resource) statuses defined in the team — workflow tags like "In stock", "Depleted", "Ordered". The `status` arg on `elab_create_entity(items, ...)` / `elab_update_entity` takes an id from here. Returns `#<id> <title>` rows with the color hex if defined, and a `[default]` marker on the team default. Pass `team` to pick a configured team key; omit for the default.',
+    { team: teamParamSchema },
+    async (args) => {
+      const { team } = args as { team?: number };
+      const client = clientFor(registry, team);
+      return guard(
+        () => client.listItemsStatus(),
+        (rows) => text(formatCategoriesOrStatuses(rows, 'statuses'))
+      );
+    }
+  );
+
+  server.tool(
     'elab_list_extra_field_names',
-    'List every `extra_fields` key the instance has any data for (instance-wide). Useful for cohort review: discovers which structured fields (yield, mass, observation) students are expected to fill across templates. Rows render as `name | type | options=[...]`. Pair with `elab_get` on an `experiments_templates` id to see the schema of a specific template.',
+    'List every `extra_fields` key the instance has data for, instance-wide, with usage frequency. Useful for cohort review: discovers which structured fields students are filling across templates. Rows render as `name (used N×)`, sorted by frequency desc. Note: this index does not carry field type or options — call `elab_get` on an `experiments_templates` or `items_types` id to see the per-template/per-type schema (types, options, units, groups).',
     {},
     async () =>
       guard(
@@ -760,15 +937,11 @@ export function registerReadTools(
           text(
             descriptors.length
               ? descriptors
-                  .map((d) => {
-                    const opts =
-                      Array.isArray(d.options) && d.options.length
-                        ? ` | options=[${d.options.join(', ')}]`
-                        : '';
-                    return `${d.name} | ${d.type}${opts}`;
-                  })
+                  .map(
+                    (d) => `${d.extra_fields_key} (used ${d.frequency}×)`
+                  )
                   .join('\n')
-              : 'No extra_fields keys on this instance.'
+              : 'No extra_fields keys on this instance. Call `elab_get` on an `experiments_templates` or `items_types` id to inspect a schema directly.'
           )
       )
   );

@@ -341,6 +341,55 @@ export interface ElabTag {
   [key: string]: unknown;
 }
 
+/**
+ * Row returned by `GET /teams/current/experiments_categories` — the team's
+ * experiment categories. Categories double as template selectors on
+ * experiment create and color-code the experiment list.
+ *
+ * Source of truth: `elabftw/src/Models/AbstractStatus.php:96-123` (the
+ * `readAll` query that backs both categories and statuses for the team
+ * sub-resource). `color` is stored as a hex string WITHOUT the leading `#`
+ * on the wire (e.g. `"29AEB9"`); callers should prepend `#` when rendering.
+ */
+export interface ElabCategory {
+  id: number;
+  title: string;
+  color?: string;
+  ordering?: number;
+  is_default?: number | boolean;
+  state?: ElabState | number;
+  team?: number;
+  is_private?: 0 | 1;
+  team_name?: string | null;
+  is_current_team?: 0 | 1;
+  [key: string]: unknown;
+}
+
+/**
+ * Row returned by `GET /teams/current/experiments_status` and
+ * `GET /teams/current/items_status` — workflow tags (e.g. "Running",
+ * "Success", "Fail") assignable to entities via the `status` field on
+ * `elab_create_entity` / `elab_update_entity`.
+ *
+ * Shape matches {@link ElabCategory} (same `AbstractStatus` query); kept as
+ * a separate interface so tool descriptions can talk about "statuses" vs
+ * "categories" without aliasing.
+ *
+ * Source of truth: `elabftw/src/Models/AbstractStatus.php:96-123`.
+ */
+export interface ElabStatus {
+  id: number;
+  title: string;
+  color?: string;
+  is_default?: number | boolean;
+  state?: ElabState | number;
+  team?: number;
+  is_private?: 0 | 1;
+  team_name?: string | null;
+  is_current_team?: 0 | 1;
+  [key: string]: unknown;
+}
+
 export interface ElabUser {
   userid: number;
   firstname?: string;
@@ -404,12 +453,18 @@ export interface ElabRevision {
   [key: string]: unknown;
 }
 
-export interface ElabExtraFieldDescriptor {
-  name: string;
-  type: string;
-  /** Options for select-type fields. */
-  options?: string[];
-  [key: string]: unknown;
+/**
+ * Row returned by `GET /extra_fields_keys` — an instance-wide index of every
+ * `extra_fields` key that has any data attached, with usage frequency. This
+ * endpoint does NOT carry the field type, options, or units; those live
+ * inside per-entity `metadata`. Call `elab_get` on an `experiments_templates`
+ * or `items_types` to introspect a schema.
+ *
+ * Source of truth: `elabftw/src/Models/ExtraFieldsKeys.php:48-99`.
+ */
+export interface ElabExtraFieldKey {
+  extra_fields_key: string;
+  frequency: number;
 }
 
 export interface ElabInfo {
@@ -426,6 +481,40 @@ export interface ElabInfo {
 }
 
 /**
+ * The 15 elabftw 5.5 extra-field types. Source of truth:
+ * `elabftw/src/ts/metadataInterfaces.ts:18-34` (the `ExtraFieldInputType` enum).
+ *
+ * Note that the UI sometimes uses friendlier labels (e.g. "Dropdown menu"
+ * for `select`) but the wire-level / metadata-blob value is always one of
+ * these literal strings.
+ *
+ * - Scalar: `text`, `number`, `date`, `datetime-local`, `email`, `time`, `url`
+ * - Boolean: `checkbox`
+ * - Choice: `select`, `radio`
+ * - Entity links: `experiments`, `items`, `users`, `compounds`
+ * - File handle: `uploads`
+ */
+export const EXTRA_FIELD_TYPES = [
+  'text',
+  'number',
+  'checkbox',
+  'date',
+  'datetime-local',
+  'email',
+  'time',
+  'url',
+  'select',
+  'radio',
+  'experiments',
+  'items',
+  'users',
+  'compounds',
+  'uploads',
+] as const;
+
+export type ElabExtraFieldType = (typeof EXTRA_FIELD_TYPES)[number];
+
+/**
  * Structured view of an entity's `metadata` blob, as used by the extra-fields
  * editor in the UI. All fields are optional — instances using no extra
  * fields will return `null` or an empty object.
@@ -439,8 +528,14 @@ export interface ElabMetadata {
   [key: string]: unknown;
 }
 
+/**
+ * Shape of one entry inside `metadata.extra_fields`. The `type` field is
+ * narrowed to {@link ElabExtraFieldType} so callers get autocomplete on the
+ * 15 supported types; the index signature still permits unknown extensions
+ * (a future elabftw version may add new keys without breaking parsing).
+ */
 export interface ElabExtraFieldValue {
-  type: string;
+  type?: ElabExtraFieldType;
   value?: unknown;
   description?: string;
   required?: boolean;
@@ -450,5 +545,7 @@ export interface ElabExtraFieldValue {
   options?: string[];
   unit?: string;
   units?: string[];
+  blank_value_on_duplicate?: boolean;
+  allow_multi_values?: boolean;
   [key: string]: unknown;
 }

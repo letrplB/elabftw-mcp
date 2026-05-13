@@ -1,5 +1,6 @@
 import { elabFetch, elabJson, extractLocationId } from './http';
 import type {
+  ElabCategory,
   ElabComment,
   ElabCreateEntityInput,
   ElabDuplicateOptions,
@@ -9,13 +10,14 @@ import type {
   ElabEntityUpdate,
   ElabEvent,
   ElabExperimentsTemplate,
-  ElabExtraFieldDescriptor,
+  ElabExtraFieldKey,
   ElabInfo,
   ElabItemsType,
   ElabLink,
   ElabListQuery,
   ElabMetadata,
   ElabRevision,
+  ElabStatus,
   ElabStep,
   ElabTag,
   ElabTeam,
@@ -417,6 +419,9 @@ export class ElabftwClient {
    * Links between entities. elabftw splits these by target kind:
    *   - `/experiments_links` when the target is an experiment
    *   - `/items_links` when the target is an item
+   *   - `/compounds_links` when the target is a compound (add/delete only;
+   *     this method does not list compound links — they're surfaced on the
+   *     parent entity via the GET handler's `compounds_links` block)
    */
   listLinks(
     fromType: ElabEntityType,
@@ -430,10 +435,15 @@ export class ElabftwClient {
   async addLink(
     fromType: ElabEntityType,
     fromId: number,
-    targetKind: 'experiments' | 'items',
+    targetKind: 'experiments' | 'items' | 'compounds',
     targetId: number
   ): Promise<void> {
-    const sub = targetKind === 'experiments' ? 'experiments_links' : 'items_links';
+    const sub =
+      targetKind === 'experiments'
+        ? 'experiments_links'
+        : targetKind === 'items'
+          ? 'items_links'
+          : 'compounds_links';
     await elabFetch(
       this.config,
       `/${fromType}/${fromId}/${sub}/${targetId}`,
@@ -445,10 +455,15 @@ export class ElabftwClient {
   async deleteLink(
     fromType: ElabEntityType,
     fromId: number,
-    targetKind: 'experiments' | 'items',
+    targetKind: 'experiments' | 'items' | 'compounds',
     targetId: number
   ): Promise<void> {
-    const sub = targetKind === 'experiments' ? 'experiments_links' : 'items_links';
+    const sub =
+      targetKind === 'experiments'
+        ? 'experiments_links'
+        : targetKind === 'items'
+          ? 'items_links'
+          : 'compounds_links';
     await elabFetch(
       this.config,
       `/${fromType}/${fromId}/${sub}/${targetId}`,
@@ -529,6 +544,84 @@ export class ElabftwClient {
     return elabJson(this.config, '/teams/current/tags', query);
   }
 
+  /**
+   * `POST /teams/current/tags` with `{tag}` — create (or no-op upsert) a
+   * tag in the caller's team without attaching it to any entity. elabftw's
+   * `TeamTags::create` uses `INSERT ... ON DUPLICATE KEY UPDATE`, so calling
+   * this with an existing tag string is idempotent and yields the existing
+   * tag id via the `Location` header.
+   *
+   * Returns the new (or existing) tag id, or `null` if elabftw did not
+   * surface it via the Location header.
+   *
+   * Source of truth: `elabftw/src/Models/TeamTags.php:57-78`.
+   */
+  async createTag(tag: string): Promise<number | null> {
+    const response = await elabFetch(
+      this.config,
+      '/teams/current/tags',
+      undefined,
+      { method: 'POST', body: { tag } }
+    );
+    return extractLocationId(response);
+  }
+
+  /**
+   * `DELETE /teams/current/tags/{tagId}` — permanently delete a team tag.
+   * elabftw first unreferences the tag from every entity that carried it,
+   * then deletes the row. Resolve the id via {@link listTags} first.
+   *
+   * Source of truth: `elabftw/src/Models/TeamTags.php:133-...` (destroy).
+   */
+  async deleteTag(tagId: number): Promise<void> {
+    await elabFetch(
+      this.config,
+      `/teams/current/tags/${tagId}`,
+      undefined,
+      { method: 'DELETE' }
+    );
+  }
+
+  /**
+   * `GET /teams/current/experiments_categories` — the team's experiment
+   * categories. Categories also act as template selectors on experiment
+   * create (`elab_create_entity(experiments, category_id=<id>)`) and
+   * color-code the experiment list.
+   *
+   * Source of truth: `elabftw/src/Enums/ApiSubModels.php:25`
+   * (`ExperimentsCategories = 'experiments_categories'`) +
+   * `elabftw/src/Models/AbstractStatus.php:96-123` (readAll query).
+   */
+  listExperimentsCategories(): Promise<ElabCategory[]> {
+    return elabJson(this.config, '/teams/current/experiments_categories');
+  }
+
+  /**
+   * `GET /teams/current/experiments_status` — workflow statuses for
+   * experiments (e.g. "Running", "Success", "Fail"). The `status` arg
+   * on `elab_create_entity` / `elab_update_entity` takes an id from this
+   * list.
+   *
+   * Source of truth: `elabftw/src/Models/ExperimentsStatus.php` extends
+   * AbstractStatus; see `elabftw/src/Models/AbstractStatus.php:96-123`.
+   */
+  listExperimentsStatus(): Promise<ElabStatus[]> {
+    return elabJson(this.config, '/teams/current/experiments_status');
+  }
+
+  /**
+   * `GET /teams/current/items_status` — workflow statuses for items
+   * (resources). Same shape as experiment statuses; lives in a separate
+   * table because items can declare their own state vocabulary
+   * (e.g. "In stock", "Depleted").
+   *
+   * Source of truth: `elabftw/src/Models/ItemsStatus.php` extends
+   * AbstractStatus.
+   */
+  listItemsStatus(): Promise<ElabStatus[]> {
+    return elabJson(this.config, '/teams/current/items_status');
+  }
+
   /** `GET /users` (sysadmin) or `GET /users/search?q=...`. */
   searchUsers(q: string): Promise<ElabUser[]> {
     return elabJson(this.config, '/users', { q });
@@ -543,10 +636,15 @@ export class ElabftwClient {
   }
 
   /**
-   * `GET /extra_fields_keys` — instance-wide field name autocomplete.
+   * `GET /extra_fields_keys` — instance-wide index of every `extra_fields`
+   * key that has any data attached, with usage frequency. Useful for
+   * autocomplete / cohort discovery. Returns `[{extra_fields_key, frequency}]`
+   * sorted by frequency desc. Does NOT carry per-field type/options — those
+   * live inside each entity's `metadata.extra_fields[<name>]`.
+   *
    * (Endpoint was `/extra_fields` in older versions.)
    */
-  listExtraFieldNames(): Promise<ElabExtraFieldDescriptor[]> {
+  listExtraFieldNames(): Promise<ElabExtraFieldKey[]> {
     return elabJson(this.config, '/extra_fields_keys');
   }
 

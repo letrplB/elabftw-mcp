@@ -6,6 +6,122 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Added
+
+- **`elab_set_extra_field`** — create-or-update one `extra_fields`
+  entry on any entity. Typed against the full 15-type elabftw 5.5
+  vocabulary (`text`, `number`, `checkbox`, `date`, `datetime-local`,
+  `email`, `time`, `url`, `select`, `radio`, `experiments`, `items`,
+  `users`, `compounds`, `uploads`), with per-type validation
+  (`select` / `radio` require `options`; numeric values must parse;
+  entity-link types take a positive integer id). For `experiments` /
+  `items` / `compounds` typed fields, also creates the corresponding
+  entity-link unless `autoLink: false`. `mode: 'replace'` (default)
+  writes the whole entry; `mode: 'merge'` updates only-provided
+  properties. Replaces the agent's manual read-merge-PATCH dance.
+- **`elab_remove_extra_field`** — delete one `extra_fields` entry,
+  prune empty groups + `elabftw` namespace, and (with
+  `alsoUnlink: true`, the default) drop the entity-link for typed
+  pointer fields. Mirrors the UI's cleanup at
+  `Metadata.class.ts:138-168`.
+- **`elab_list_extra_fields`** — structured per-entity view of
+  `extra_fields` (group, name, type, value, unit, required, options,
+  position, description). Complements the prose `## Extra fields`
+  block in `elab_get` with a copy-paste-ready shape for "build me a
+  clone of #475 with these tweaks" workflows.
+- **`elab_clone_extra_fields_schema`** — agent-native parity with the
+  UI's "Load fields" button. Deep-merges `extra_fields` (plus groups)
+  from a source entity onto a target, preserving the target's
+  existing per-field `value`s. `blankValues: true` strips defaults
+  for schema-only copy.
+- **`elab_set_extra_field_groups`** — manage
+  `metadata.elabftw.extra_fields_groups` (named clusters that
+  organize fields in the UI). `mode: 'replace'` overwrites;
+  `mode: 'merge'` upserts by `id`.
+- **`elab_list_experiments_categories`** — list templates /
+  experiment categories on the current team (id, title, color,
+  default marker).
+- **`elab_list_experiments_status`** — list experiment statuses on
+  the current team.
+- **`elab_list_items_status`** — list item statuses on the current
+  team.
+- **`elab_create_tag`** — team-scoped tag creation without entity
+  attachment. Idempotent (`INSERT ... ON DUPLICATE KEY UPDATE`
+  returns the existing id on duplicate strings). Requires
+  team-admin; gated by `ELABFTW_ALLOW_WRITES`.
+- **`elab_delete_tag`** — permanent team-scoped tag deletion, with
+  cascade detach via elabftw's `TeamTags::destroy`. Gated behind
+  `ELABFTW_ALLOW_DESTRUCTIVE` because some teams use tags as
+  permission gates.
+
+### Changed
+
+- **`elab_create_entity` auto-loads the items_type / template
+  schema** for `items` / `experiments` when `category_id` is set
+  (new `loadFieldsFromCategory` flag, default `true`). The source
+  schema is merged into the caller's `metadata` before POST —
+  caller's per-field values win, the schema fills in the rest. The
+  response message reports the inherited field count or surfaces a
+  fallthrough note when the source-schema fetch failed. Closes the
+  AC2 demo failure mode where `category_id` set the relation but the
+  item came up without the items_type's structured fields.
+- **`elab_create_entity` reconcile loop now covers `metadata`,
+  `body`, and `tags`** in addition to the previously-reconciled
+  scalar fields. elabftw 5.5 silently drops `metadata` on `POST
+  /items` for regular kinds; the reconcile loop now re-PATCHes
+  after fetch so the values land on the first tool call. `body` is
+  compared exact-string with an empty-input guard (so we don't
+  clobber elabftw's HTML pipeline output with `""`); `tags` are
+  compared as a set and reconciled via per-tag
+  `client.addEntityTag(...)` since the entity PATCH endpoint does
+  not accept a `tags` field. Closes the deferred §5.1 / §5.2 items
+  from the 2026-04-28 plan.
+- **`elab_update_extra_field` pre-flight guard.** The tool now GETs
+  the entity, checks `metadata.extra_fields[<name>]` exists, and
+  returns a friendly error pointing at `elab_set_extra_field` when
+  it doesn't. Previously the JSON_SET endpoint accepted the call
+  and silently no-op'd on a non-existent field — the AC2 session
+  spent a debug round on this. Tool description also rewritten to
+  lead with the value-only limitation.
+- **`elab_list_extra_field_names` returns real rows.** The endpoint
+  shape is `[{extra_fields_key, frequency}]` — our typings claimed
+  `[{name, type, options}]`, so every row rendered as
+  `undefined | undefined`. Fixed: rows now render as
+  `key (used N×)` sorted by frequency desc. Empty-state message
+  points at `elab_get` on a template / items_type for per-field
+  type / options (which this endpoint does not carry).
+
+### Fixed
+
+- **F1 — `elab_list_extra_field_names` undefined rows.** See
+  *Changed* above; called out separately because it was a real bug
+  reproduced live on AC2 team=2.
+- **F2 — `metadata` dropped on `POST /items` (elabftw 5.5).** The
+  reconcile loop in `elab_create_entity` now also covers `metadata`,
+  `body`, and `tags`, so the values land on the first tool call.
+- **F4 — Turndown was escaping underscores in body markdown** —
+  `d_H_DLS_nm` rendered as `d\_H\_DLS\_nm`. The converter's `escape`
+  now drops underscore + bracket escapes (it already uses
+  `emDelimiter: '*'` so underscore-emphasis ambiguity isn't a
+  concern); only `\`, `*`, and `` ` `` remain escaped. Body
+  markdown round-trips cleanly.
+- **`elab_set_extra_field` merge mode no longer clobbers `value`.**
+  Initial implementation built a fully-typed default entry then
+  merged the caller's args on top, so a `mode: 'merge'` call that
+  only touched `description` would reset the field's `value` to
+  empty. Surfaced during live AC2 verification on item #476. Fixed
+  by threading a `partial` flag through `buildExtraFieldEntry` so
+  merge mode only includes explicitly-provided properties (per-type
+  validation still runs).
+- **Raw markdown bodies round-trip byte-identical** when
+  `entity.content_type === 2` (elabftw's "body is native markdown"
+  flag) and `format='markdown'`. Previously the default markdown
+  format ran the body through Turndown's HTML → MD pipeline even
+  when the body was already markdown, introducing list-marker reflow
+  (`-` → `*`), table-cell whitespace, and residual punctuation
+  escapes. HTML bodies (`content_type=1`) still go through Turndown
+  unchanged.
+
 ## [0.4.2] — 2026-04-29
 
 ### Added
