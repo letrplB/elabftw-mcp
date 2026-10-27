@@ -1,33 +1,53 @@
 /**
  * JSON-file backend for the registration store.
  *
- * One file, atomic write (tmp + rename), in-memory map for reads. Fine
- * to ~hundreds of tokens; every mutation rewrites the whole file, so
- * heavier deployments should pick the SQLite backend.
+ * One file, in-memory map for reads. Every mutation builds the next
+ * state off to the side, persists it (write tmp → fsync → rename), and
+ * only then swaps it into memory — a failed write never leaves memory
+ * ahead of disk. Fine to ~hundreds of tokens; every mutation rewrites
+ * the whole file, so heavier deployments should pick the SQLite backend.
  *
- * Schema is versioned. v1 (pre-userid) and v2 (single-key, no per-token
- * flags) entries are dropped on load with a startup warning — there are
- * no production deployments to migrate, and silently re-using older
- * rows would leave the new fields empty. Operators who hit this can
- * re-register in a few seconds.
+ * Single-instance only: the file is read once at startup and the
+ * in-memory map is authoritative afterwards. Two processes pointed at
+ * the same file will silently overwrite each other's writes.
+ *
+ * Schema is versioned:
+ *   - v1 (pre-userid) / v2 (single-key, no per-token flags) are dropped
+ *     on load with a startup warning, as before.
+ *   - v3 (plaintext `token` + plaintext `apiKey`) is migrated in place
+ *     to v4: token → `tokenHash`, API keys → AES-256-GCM envelopes.
+ *     Existing bearer tokens keep working.
+ *   - v4 is the current shape. Any plaintext key that sneaks in (hand
+ *     edits) is encrypted on the next load.
  */
 
 import { existsSync } from 'node:fs';
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, open, readFile, rename, rm } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
+import { hashToken, isEncrypted, type SecretBox } from './crypto';
 import {
   type AddTeamInput,
   type CreateInput,
+  type CreateResult,
   type Registration,
   type RegistrationStore,
-  mintToken,
+  TokenLimitError,
+  type UpdatePatch,
+  applyPatch,
+  applyRemoveKey,
+  buildRegistration,
+  cloneRegistration,
   normaliseBaseUrl,
 } from './index';
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 
-interface PersistedShapeV3 {
-  version: 3;
+/** Don't rewrite the whole file for `lastUsedAt` more than once a minute per token. */
+const TOUCH_THROTTLE_MS = 60_000;
+
+/** On-disk shape: identical to `Registration`, but `apiKey` is an envelope. */
+interface PersistedShapeV4 {
+  version: 4;
   registrations: Registration[];
 }
 
@@ -36,30 +56,44 @@ interface PersistedShapeAny {
   registrations?: unknown;
 }
 
+/** Outcome of a mutation callback: the value to return, and whether to persist. */
+interface MutationResult<T> {
+  value: T;
+  changed: boolean;
+}
+
 export class JsonRegistrationStore implements RegistrationStore {
   private readonly path: string;
-  private readonly registrations: Map<string, Registration>;
+  private readonly secrets: SecretBox;
+  private registrations: Map<string, Registration>;
   private writeChain: Promise<void>;
 
-  private constructor(path: string, initial: Registration[]) {
+  private constructor(
+    path: string,
+    secrets: SecretBox,
+    initial: Registration[]
+  ) {
     this.path = path;
-    this.registrations = new Map(initial.map((r) => [r.token, r]));
+    this.secrets = secrets;
+    this.registrations = new Map(initial.map((r) => [r.tokenHash, r]));
     this.writeChain = Promise.resolve();
   }
 
-  static async open(path: string): Promise<JsonRegistrationStore> {
+  static async open(
+    path: string,
+    secrets: SecretBox
+  ): Promise<JsonRegistrationStore> {
     const absPath = resolve(path);
+    // A crashed write can leave a stale tmp file behind; it's never read.
+    await rm(`${absPath}.tmp`, { force: true }).catch(() => {});
+
     if (!existsSync(absPath)) {
-      await mkdir(dirname(absPath), { recursive: true });
-      const empty: PersistedShapeV3 = {
-        version: SCHEMA_VERSION,
-        registrations: [],
-      };
-      await writeFile(absPath, JSON.stringify(empty, null, 2), {
-        mode: 0o600,
-      });
-      return new JsonRegistrationStore(absPath, []);
+      await mkdir(dirname(absPath), { recursive: true, mode: 0o700 });
+      const store = new JsonRegistrationStore(absPath, secrets, []);
+      await store.persist(store.registrations);
+      return store;
     }
+    await chmod(absPath, 0o600).catch(() => {});
 
     const raw = await readFile(absPath, 'utf8');
     let parsed: PersistedShapeAny;
@@ -81,18 +115,13 @@ export class JsonRegistrationStore implements RegistrationStore {
           `All entries dropped — re-register tokens via /register. ` +
           `Writing a fresh v${SCHEMA_VERSION} file.`
       );
-      const empty: PersistedShapeV3 = {
-        version: SCHEMA_VERSION,
-        registrations: [],
-      };
-      await writeFile(absPath, JSON.stringify(empty, null, 2), {
-        mode: 0o600,
-      });
-      return new JsonRegistrationStore(absPath, []);
+      const store = new JsonRegistrationStore(absPath, secrets, []);
+      await store.persist(store.registrations);
+      return store;
     }
 
     if (
-      parsed.version !== SCHEMA_VERSION ||
+      (parsed.version !== 3 && parsed.version !== SCHEMA_VERSION) ||
       !Array.isArray(parsed.registrations)
     ) {
       throw new Error(
@@ -100,202 +129,182 @@ export class JsonRegistrationStore implements RegistrationStore {
       );
     }
 
-    return new JsonRegistrationStore(absPath, parsed.registrations as Registration[]);
+    let migrated = 0;
+    const loaded: Registration[] = [];
+    for (const entry of parsed.registrations) {
+      const { reg, dirty } = JsonRegistrationStore.loadEntry(entry, secrets, absPath);
+      if (dirty) migrated++;
+      loaded.push(reg);
+    }
+
+    const store = new JsonRegistrationStore(absPath, secrets, loaded);
+    if (migrated > 0 || parsed.version !== SCHEMA_VERSION) {
+      // Rewrite immediately so plaintext tokens / keys don't linger on
+      // disk any longer than this startup.
+      await store.persist(store.registrations);
+      // biome-ignore lint/suspicious/noConsole: startup migration notice
+      console.error(
+        `[elabftw-mcp] Migrated ${migrated} registration(s) in ${absPath} to ` +
+          `schema v${SCHEMA_VERSION} (hashed tokens, encrypted API keys). ` +
+          'Existing tokens keep working. Older backups of this file still ' +
+          'contain plaintext secrets — rotate or destroy them.'
+      );
+    }
+    return store;
   }
 
-  get(token: string): Registration | undefined {
-    return this.registrations.get(token);
+  /**
+   * Turn one persisted row (v3 or v4) into an in-memory registration
+   * with decrypted keys. `dirty` means the on-disk form needs rewriting.
+   */
+  private static loadEntry(
+    entry: unknown,
+    secrets: SecretBox,
+    absPath: string
+  ): { reg: Registration; dirty: boolean } {
+    if (!entry || typeof entry !== 'object') {
+      throw new Error(`${absPath}: registration entry is not an object.`);
+    }
+    const row = { ...(entry as Record<string, unknown>) };
+    let dirty = false;
+
+    if (typeof row.token === 'string' && typeof row.tokenHash !== 'string') {
+      row.tokenHash = hashToken(row.token);
+      dirty = true;
+    }
+    delete row.token;
+    if (typeof row.tokenHash !== 'string' || !/^[0-9a-f]{64}$/.test(row.tokenHash)) {
+      throw new Error(`${absPath}: registration entry has no valid tokenHash.`);
+    }
+    if (!Array.isArray(row.keys)) {
+      throw new Error(`${absPath}: registration ${row.tokenHash.slice(0, 12)} has no keys[].`);
+    }
+    if (typeof row.baseUrl === 'string') {
+      const canonical = normaliseBaseUrl(row.baseUrl);
+      if (canonical !== row.baseUrl) {
+        row.baseUrl = canonical;
+        dirty = true;
+      }
+    }
+    row.keys = (row.keys as Array<Record<string, unknown>>).map((k) => {
+      const apiKey = String(k.apiKey ?? '');
+      if (!isEncrypted(apiKey)) dirty = true;
+      return {
+        ...k,
+        apiKey: isEncrypted(apiKey) ? secrets.decrypt(apiKey) : apiKey,
+      };
+    });
+    return { reg: row as unknown as Registration, dirty };
+  }
+
+  get(tokenHash: string): Registration | undefined {
+    const reg = this.registrations.get(tokenHash);
+    return reg ? cloneRegistration(reg) : undefined;
   }
 
   list(): Registration[] {
-    return [...this.registrations.values()];
+    return [...this.registrations.values()].map(cloneRegistration);
   }
 
   listForUser(userid: number, baseUrl: string): Registration[] {
     const normalised = normaliseBaseUrl(baseUrl);
-    return this.list().filter(
-      (r) => r.userid === userid && r.baseUrl === normalised
+    return [...this.registrations.values()]
+      .filter((r) => r.userid === userid && r.baseUrl === normalised)
+      .map(cloneRegistration);
+  }
+
+  create(input: CreateInput): Promise<CreateResult> {
+    return this.mutate((next) => {
+      const created = buildRegistration(input);
+      const { registration } = created;
+      if (input.maxTokensPerUser !== undefined) {
+        let owned = 0;
+        for (const r of next.values()) {
+          if (r.userid === registration.userid && r.baseUrl === registration.baseUrl) {
+            owned++;
+          }
+        }
+        if (owned >= input.maxTokensPerUser) {
+          throw new TokenLimitError(input.maxTokensPerUser);
+        }
+      }
+      next.set(registration.tokenHash, registration);
+      return {
+        value: { token: created.token, registration: cloneRegistration(registration) },
+        changed: true,
+      };
+    });
+  }
+
+  update(
+    userid: number,
+    baseUrl: string,
+    tokenHash: string,
+    patch: UpdatePatch
+  ): Promise<Registration | undefined> {
+    return this.mutateOwned(userid, baseUrl, tokenHash, (reg) =>
+      applyPatch(reg, patch)
     );
   }
 
-  async create(input: CreateInput): Promise<Registration> {
-    const reg: Registration = {
-      token: mintToken(),
-      baseUrl: normaliseBaseUrl(input.baseUrl),
-      userid: input.userid,
-      keys: [
-        {
-          apiKey: input.apiKey,
-          team: input.team,
-          label: input.keyLabel,
-        },
-      ],
-      defaultTeam: input.team,
-      allowWrites: input.allowWrites ?? false,
-      allowDestructive: input.allowDestructive ?? false,
-      revealUserIdentities: input.revealUserIdentities ?? false,
-      label: input.label,
-      createdAt: new Date().toISOString(),
-    };
-    this.registrations.set(reg.token, reg);
-    await this.flush();
-    return reg;
-  }
-
-  async updateLabel(
-    userid: number,
-    baseUrl: string,
-    token: string,
-    label: string | undefined
-  ): Promise<Registration | undefined> {
-    const reg = this.assertOwned(userid, baseUrl, token);
-    if (!reg) return undefined;
-    reg.label = label;
-    await this.flush();
-    return reg;
-  }
-
-  async updateFlags(
-    userid: number,
-    baseUrl: string,
-    token: string,
-    flags: {
-      allowWrites: boolean;
-      allowDestructive: boolean;
-      revealUserIdentities: boolean;
-    }
-  ): Promise<Registration | undefined> {
-    const reg = this.assertOwned(userid, baseUrl, token);
-    if (!reg) return undefined;
-    reg.allowWrites = flags.allowWrites;
-    reg.allowDestructive = flags.allowDestructive && flags.allowWrites;
-    reg.revealUserIdentities = flags.revealUserIdentities;
-    await this.flush();
-    return reg;
-  }
-
-  async updateDefaultTeam(
-    userid: number,
-    baseUrl: string,
-    token: string,
-    team: number
-  ): Promise<Registration | undefined> {
-    const reg = this.assertOwned(userid, baseUrl, token);
-    if (!reg) return undefined;
-    if (!reg.keys.some((k) => k.team === team)) return reg;
-    reg.defaultTeam = team;
-    await this.flush();
-    return reg;
-  }
-
-  /**
-   * Look up a registration and confirm the calling user owns it.
-   * Returns the in-memory record (mutable) or `undefined` if missing
-   * / mismatched.
-   */
-  private assertOwned(
-    userid: number,
-    baseUrl: string,
-    token: string
-  ): Registration | undefined {
-    const reg = this.registrations.get(token);
-    if (!reg) return undefined;
-    if (reg.userid !== userid || reg.baseUrl !== normaliseBaseUrl(baseUrl)) {
-      return undefined;
-    }
-    return reg;
-  }
-
-  async addKey(
+  addKey(
     userid: number,
     baseUrl: string,
     input: AddTeamInput
   ): Promise<Registration | undefined> {
-    const reg = this.registrations.get(input.token);
-    if (!reg) return undefined;
-    if (reg.userid !== userid || reg.baseUrl !== normaliseBaseUrl(baseUrl)) {
-      return undefined;
-    }
-    if (reg.keys.some((k) => k.team === input.team)) {
-      // Caller should have caught this; if it slips through we keep
-      // the registration unchanged rather than create a duplicate row.
-      return reg;
-    }
-    reg.keys.push({
-      apiKey: input.apiKey,
-      team: input.team,
-      label: input.label,
+    return this.mutateOwned(userid, baseUrl, input.tokenHash, (reg) => {
+      // Caller should have caught a duplicate team; if it slips through
+      // we keep the registration unchanged rather than add a second row.
+      if (reg.keys.some((k) => k.team === input.team)) return false;
+      reg.keys.push({ apiKey: input.apiKey, team: input.team, label: input.label });
+      return true;
     });
-    await this.flush();
-    return reg;
   }
 
-  async removeKey(
+  removeKey(
     userid: number,
     baseUrl: string,
-    token: string,
+    tokenHash: string,
     team: number
   ): Promise<Registration | undefined> {
-    const reg = this.registrations.get(token);
-    if (!reg) return undefined;
-    if (reg.userid !== userid || reg.baseUrl !== normaliseBaseUrl(baseUrl)) {
-      return undefined;
-    }
-    if (reg.keys.length <= 1) {
-      // Last team: caller should have used revoke. No-op for safety.
-      return reg;
-    }
-    const next = reg.keys.filter((k) => k.team !== team);
-    if (next.length === reg.keys.length) {
-      // Team not found on this token — no-op.
-      return reg;
-    }
-    reg.keys = next;
-    if (reg.defaultTeam === team) {
-      // Smallest remaining team becomes the new default.
-      reg.defaultTeam = next.reduce(
-        (lo, k) => (k.team < lo ? k.team : lo),
-        next[0]!.team
-      );
-    }
-    await this.flush();
-    return reg;
+    return this.mutateOwned(userid, baseUrl, tokenHash, (reg) =>
+      applyRemoveKey(reg, team)
+    );
   }
 
-  async revoke(token: string): Promise<boolean> {
-    const existed = this.registrations.delete(token);
-    if (existed) await this.flush();
-    return existed;
-  }
-
-  async revokeForUser(
+  revokeForUser(
     userid: number,
     baseUrl: string,
-    token: string
+    tokenHash: string
   ): Promise<boolean> {
-    const reg = this.registrations.get(token);
-    if (!reg) return false;
-    if (reg.userid !== userid || reg.baseUrl !== normaliseBaseUrl(baseUrl)) {
-      // Don't reveal that the token exists under a different identity —
-      // treat as a not-found from this user's perspective.
-      return false;
-    }
-    this.registrations.delete(token);
-    await this.flush();
-    return true;
+    return this.mutate((next) => {
+      const reg = next.get(tokenHash);
+      if (!reg || !isOwnedBy(reg, userid, baseUrl)) {
+        // Don't reveal that the token exists under a different identity.
+        return { value: false, changed: false };
+      }
+      next.delete(tokenHash);
+      return { value: true, changed: true };
+    });
   }
 
   /**
-   * Mark a registration as used. Touches `lastUsedAt` and best-effort
-   * persists. Persistence failures are logged but not fatal — losing the
-   * timestamp is harmless.
+   * Mark a registration as used. Throttled per token, and persistence
+   * failures are logged but not fatal — losing the timestamp is
+   * harmless.
    */
-  async touch(token: string): Promise<void> {
-    const reg = this.registrations.get(token);
-    if (!reg) return;
-    reg.lastUsedAt = new Date().toISOString();
+  async touch(tokenHash: string): Promise<void> {
+    const current = this.registrations.get(tokenHash);
+    if (!current) return;
+    const last = current.lastUsedAt ? Date.parse(current.lastUsedAt) : 0;
+    if (Date.now() - last < TOUCH_THROTTLE_MS) return;
     try {
-      await this.flush();
+      await this.mutate((next) => {
+        const reg = next.get(tokenHash);
+        if (!reg) return { value: undefined, changed: false };
+        reg.lastUsedAt = new Date().toISOString();
+        return { value: undefined, changed: true };
+      });
     } catch (err) {
       // biome-ignore lint/suspicious/noConsole: non-fatal diagnostic
       console.error(
@@ -311,28 +320,88 @@ export class JsonRegistrationStore implements RegistrationStore {
     await this.writeChain;
   }
 
-  /**
-   * Serialize the in-memory map and atomically rename onto the live
-   * file. Concurrent writes are queued via a promise chain so we never
-   * interleave two writers.
-   */
-  private flush(): Promise<void> {
-    const next = this.writeChain.then(() => this.flushNow());
-    this.writeChain = next.catch(() => {
-      // Swallow errors from the chain so one failure doesn't poison
-      // every subsequent flush; the original promise still rejects to
-      // its caller.
+  /** `mutate` scoped to one registration the caller must own. */
+  private mutateOwned(
+    userid: number,
+    baseUrl: string,
+    tokenHash: string,
+    apply: (reg: Registration) => boolean
+  ): Promise<Registration | undefined> {
+    return this.mutate((next) => {
+      const reg = next.get(tokenHash);
+      if (!reg || !isOwnedBy(reg, userid, baseUrl)) {
+        return { value: undefined, changed: false };
+      }
+      const changed = apply(reg);
+      return { value: cloneRegistration(reg), changed };
     });
-    return next;
   }
 
-  private async flushNow(): Promise<void> {
-    const payload: PersistedShapeV3 = {
+  /**
+   * Serialised read-modify-write. `apply` gets a deep copy of the
+   * current state; if it reports a change, the copy is persisted and
+   * then becomes the live state. Writes are queued via a promise chain
+   * so two mutations never interleave.
+   */
+  private mutate<T>(
+    apply: (next: Map<string, Registration>) => MutationResult<T>
+  ): Promise<T> {
+    const run = async (): Promise<T> => {
+      const next = new Map(
+        [...this.registrations].map(([k, v]) => [k, cloneRegistration(v)])
+      );
+      const { value, changed } = apply(next);
+      if (!changed) return value;
+      await this.persist(next);
+      this.registrations = next;
+      return value;
+    };
+    const result = this.writeChain.then(run);
+    // Swallow errors on the chain so one failure doesn't poison every
+    // subsequent write; the original promise still rejects to its caller.
+    this.writeChain = result.then(
+      () => {},
+      () => {}
+    );
+    return result;
+  }
+
+  /**
+   * Encrypt + serialise `state` and atomically replace the live file:
+   * write tmp (0600) → fsync → rename → fsync the directory.
+   */
+  private async persist(state: Map<string, Registration>): Promise<void> {
+    const payload: PersistedShapeV4 = {
       version: SCHEMA_VERSION,
-      registrations: this.list(),
+      registrations: [...state.values()].map((r) => ({
+        ...r,
+        keys: r.keys.map((k) => ({ ...k, apiKey: this.secrets.encrypt(k.apiKey) })),
+      })),
     };
     const tmp = `${this.path}.tmp`;
-    await writeFile(tmp, JSON.stringify(payload, null, 2), { mode: 0o600 });
+    const fh = await open(tmp, 'w', 0o600);
+    try {
+      await fh.writeFile(JSON.stringify(payload, null, 2));
+      await fh.sync();
+    } finally {
+      await fh.close();
+    }
     await rename(tmp, this.path);
+    // Directory fsync makes the rename itself durable. Not supported on
+    // every platform / filesystem — best-effort.
+    try {
+      const dir = await open(dirname(this.path), 'r');
+      try {
+        await dir.sync();
+      } finally {
+        await dir.close();
+      }
+    } catch {
+      // ignore
+    }
   }
+}
+
+function isOwnedBy(reg: Registration, userid: number, baseUrl: string): boolean {
+  return reg.userid === userid && reg.baseUrl === normaliseBaseUrl(baseUrl);
 }
