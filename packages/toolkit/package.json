@@ -27,6 +27,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.25.1",
+    "marked": "^15.0.12",
     "turndown": "^7.2.4",
     "zod": "^4.2.1"
   },
