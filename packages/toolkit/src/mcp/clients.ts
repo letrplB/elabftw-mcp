@@ -26,7 +26,8 @@ function describeFailure(error: unknown): string {
   if (error instanceof ElabftwApiError && error.body) {
     return `${error.message}: ${error.body.slice(0, 300)}`;
   }
-  return error instanceof Error ? error.message : String(error);
+  // Callers append their own sentence; drop a trailing period here.
+  return (error instanceof Error ? error.message : String(error)).replace(/\.$/, '');
 }
 
 /**
