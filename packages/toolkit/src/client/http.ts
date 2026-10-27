@@ -1,9 +1,23 @@
 import type { ElabftwConfig } from './types';
 
+/** Injected by tsup from package.json; absent when the sources run unbundled. */
+declare const __PKG_VERSION__: string | undefined;
+
+export const PACKAGE_VERSION: string =
+  typeof __PKG_VERSION__ === 'string' ? __PKG_VERSION__ : '0.0.0-dev';
+
+export const DEFAULT_USER_AGENT = `sura-elabftw-mcp/${PACKAGE_VERSION}`;
+
+const DEFAULT_TIMEOUT_MS = 30_000;
+
+/** Upper bound for the eLabFTW response text carried by an error. */
+const MAX_ERROR_BODY_CHARS = 1024;
+
 /**
  * Thrown for any non-2xx response from the elabftw instance.
- * `statusCode` is the HTTP status; `body` is the raw response text (often
- * JSON with a `description` field from elabftw's error middleware).
+ * `statusCode` is the HTTP status; `body` is an excerpt of the response
+ * text (often JSON with a `description` field from elabftw's error
+ * middleware), capped at about 1 KB with the API key redacted.
  */
 export class ElabftwApiError extends Error {
   readonly url: string;
@@ -16,14 +30,37 @@ export class ElabftwApiError extends Error {
     url: string,
     method: string,
     statusCode: number,
-    body: string
+    body: string,
+    options?: { cause?: unknown }
   ) {
-    super(`elabftw API error: ${message} (${method} ${url})`);
+    super(`elabftw API error: ${message} (${method} ${url})`, options);
     this.name = 'ElabftwApiError';
     this.url = url;
     this.method = method;
     this.statusCode = statusCode;
     this.body = body;
+  }
+}
+
+/**
+ * Thrown when no usable HTTP response arrived: the request (including
+ * reading the body) exceeded the timeout, the instance answered with a
+ * redirect, or the connection failed. `statusCode` is 0.
+ */
+export class ElabftwTransportError extends ElabftwApiError {
+  readonly kind: 'timeout' | 'redirect' | 'network';
+
+  constructor(
+    kind: 'timeout' | 'redirect' | 'network',
+    message: string,
+    url: string,
+    method: string,
+    options?: { cause?: unknown }
+  ) {
+    super(message, url, method, 0, '', options);
+    this.name = 'ElabftwTransportError';
+    this.kind = kind;
+    this.message = message;
   }
 }
 
@@ -62,10 +99,7 @@ export function buildUrl(
   return url.toString();
 }
 
-/**
- * `BodyInit` is not ambient in the bun-types-only build. Widen to the
- * subset we actually accept (json-serialized string is handled via `body`).
- */
+/** Body shapes the client sends as-is (JSON payloads go through `body`). */
 type RawBody = FormData | Blob | ArrayBuffer | Uint8Array | string;
 
 interface RequestOptions {
@@ -82,13 +116,122 @@ interface RequestOptions {
   accept?: string;
 }
 
+function redact(text: string, apiKey: string): string {
+  return apiKey ? text.split(apiKey).join('[redacted]') : text;
+}
+
+/**
+ * Shorten an eLabFTW response body for inclusion in an error. HTML pages
+ * (typically a reverse proxy's 502/504) are reduced to their text.
+ */
+function errorExcerpt(text: string, apiKey: string): string {
+  let out = redact(text, apiKey).trim();
+  if (/^<(!doctype|html)/i.test(out)) {
+    out = out
+      .replace(/<(script|style)[\s\S]*?<\/\1>/gi, ' ')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+  if (out.length <= MAX_ERROR_BODY_CHARS) return out;
+  return `${out.slice(0, MAX_ERROR_BODY_CHARS)}… [truncated, ${out.length} chars total]`;
+}
+
+function formatSeconds(ms: number): string {
+  return `${Number((ms / 1000).toFixed(3))}s`;
+}
+
+/**
+ * Map a fetch / body-read failure onto an {@link ElabftwTransportError}.
+ * The abort signal is the authoritative timeout indicator: once it fired,
+ * whatever the runtime threw is a consequence of it.
+ */
+function transportError(
+  error: unknown,
+  signal: AbortSignal,
+  ctx: { url: string; method: string; timeoutMs: number; apiKey: string }
+): ElabftwApiError {
+  if (error instanceof ElabftwApiError) return error;
+  const { url, method } = ctx;
+  if (signal.aborted) {
+    return new ElabftwTransportError(
+      'timeout',
+      `Timed out after ${formatSeconds(ctx.timeoutMs)}: ${method} ${url}. ` +
+        'Raise ELABFTW_TIMEOUT_MS if the instance is slow.',
+      url,
+      method,
+      { cause: error }
+    );
+  }
+  const cause = (error as { cause?: unknown } | null)?.cause;
+  const detail = [error, cause]
+    .map((e) => (e instanceof Error ? e.message : e ? String(e) : ''))
+    .filter(Boolean)
+    .join(': ');
+  if (/redirect/i.test(detail)) {
+    return new ElabftwTransportError(
+      'redirect',
+      `eLabFTW answered ${method} ${url} with a redirect, which is not followed ` +
+        '(it would turn POST into GET and could send the API key to another host). ' +
+        'Set ELABFTW_BASE_URL to the final URL the instance is served from ' +
+        '(usually https://, exact host name, no trailing path).',
+      url,
+      method,
+      { cause: error }
+    );
+  }
+  return new ElabftwTransportError(
+    'network',
+    `Could not reach eLabFTW: ${method} ${url} failed (${redact(detail, ctx.apiKey) || 'unknown error'}).`,
+    url,
+    method,
+    { cause: error }
+  );
+}
+
+/**
+ * Re-wrap a response so failures while the caller reads the body (the
+ * timeout firing mid-download, a dropped connection) surface as
+ * {@link ElabftwTransportError} instead of a bare `AbortError`.
+ */
+function withBodyErrorTranslation(
+  response: Response,
+  translate: (error: unknown) => unknown
+): Response {
+  const source = response.body;
+  if (!source) return response;
+  const reader = source.getReader();
+  const body = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const { done, value } = await reader.read();
+        if (done) controller.close();
+        else controller.enqueue(value);
+      } catch (error) {
+        controller.error(translate(error));
+      }
+    },
+    cancel(reason) {
+      return reader.cancel(reason);
+    },
+  });
+  return new Response(body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
+}
+
 /**
  * Low-level fetch with auth, timeout, and consistent error shape.
- * Handles two elabftw quirks:
  *
- *   1. Auth header is the bare API key — no `Bearer` prefix.
- *   2. Some POST/PATCH endpoints return `Location:` with an id but no body;
- *      callers that need the new id should use {@link extractLocationId}.
+ *   - Auth header is the bare API key — no `Bearer` prefix.
+ *   - The timeout covers the whole exchange, including reading the body
+ *     of the returned `Response`; it is never cleared.
+ *   - Redirects are refused (`redirect: 'error'`): following one turns
+ *     POST into GET and can forward the API key to another origin.
+ *   - Some POST/PATCH endpoints return `Location:` with an id but no body;
+ *     callers that need the new id should use {@link extractLocationId}.
  */
 export async function elabFetch(
   config: ElabftwConfig,
@@ -98,11 +241,12 @@ export async function elabFetch(
 ): Promise<Response> {
   const url = buildUrl(config, path, query);
   const method = options.method ?? 'GET';
+  const timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
   const headers: Record<string, string> = {
     Authorization: config.apiKey,
     Accept: options.accept ?? 'application/json',
-    'User-Agent': config.userAgent ?? 'sura-elabftw/1.0',
+    'User-Agent': config.userAgent ?? DEFAULT_USER_AGENT,
     ...options.headers,
   };
 
@@ -120,37 +264,43 @@ export async function elabFetch(
     headers['Content-Type'] = headers['Content-Type'] ?? 'application/json';
   }
 
-  const controller = new AbortController();
-  const timeout = setTimeout(
-    () => controller.abort(),
-    config.timeoutMs ?? 30_000
-  );
-
+  const signal = AbortSignal.timeout(timeoutMs);
+  const ctx = { url, method, timeoutMs, apiKey: config.apiKey };
   const fetchImpl = config.fetchImpl ?? fetch;
 
+  let response: Response;
   try {
-    const response = await fetchImpl(url, {
+    response = await fetchImpl(url, {
       method,
       headers,
       body,
-      signal: controller.signal,
+      redirect: 'error',
+      signal,
     });
-
-    if (!response.ok) {
-      const errBody = await response.text().catch(() => '');
-      throw new ElabftwApiError(
-        `${response.status} ${response.statusText}`,
-        url,
-        method,
-        response.status,
-        errBody
-      );
-    }
-
-    return response;
-  } finally {
-    clearTimeout(timeout);
+  } catch (error) {
+    throw transportError(error, signal, ctx);
   }
+
+  if (!response.ok) {
+    let errBody: string;
+    try {
+      errBody = await response.text();
+    } catch (error) {
+      if (signal.aborted) throw transportError(error, signal, ctx);
+      errBody = '';
+    }
+    throw new ElabftwApiError(
+      `${response.status} ${response.statusText}`,
+      url,
+      method,
+      response.status,
+      errorExcerpt(errBody, config.apiKey)
+    );
+  }
+
+  return withBodyErrorTranslation(response, (error) =>
+    transportError(error, signal, ctx)
+  );
 }
 
 /**
@@ -169,7 +319,20 @@ export async function elabJson<T = unknown>(
   }
   const text = await response.text();
   if (!text) return undefined as T;
-  return JSON.parse(text) as T;
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    const method = options.method ?? 'GET';
+    const url = buildUrl(config, path, query);
+    const type = response.headers.get('content-type') ?? 'no content-type';
+    throw new ElabftwApiError(
+      `expected JSON, got ${type}`,
+      url,
+      method,
+      response.status,
+      errorExcerpt(text, config.apiKey)
+    );
+  }
 }
 
 /**

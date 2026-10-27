@@ -1,4 +1,5 @@
 import TurndownService from 'turndown';
+import { decodeStoredMarkdown } from './markdown';
 import type {
   ElabComment,
   ElabCompound,
@@ -29,38 +30,141 @@ export interface FormatOptions {
  * These are deliberately terse — they exist to keep context-window cost
  * low in agent tools. Callers that need structured data should hand back
  * the raw JSON instead.
+ *
+ * Bodies rendered as `markdown` or `html` are never truncated: agents read
+ * a body, edit it and write it back, so a cut body would destroy data on
+ * the round-trip. Only the lossy `text` view is capped, and its truncation
+ * notice is emitted outside the body text.
  */
 
-const MAX_BODY_PREVIEW = 600;
 const MAX_TEXT_BODY = 2000;
-const MAX_MARKDOWN_BODY = 4000;
+
+const NAMED_ENTITIES: Record<string, string> = {
+  amp: '&',
+  lt: '<',
+  gt: '>',
+  quot: '"',
+  apos: "'",
+  nbsp: ' ',
+  ensp: ' ',
+  emsp: ' ',
+  thinsp: ' ',
+  shy: '',
+  deg: '°',
+  micro: 'µ',
+  plusmn: '±',
+  times: '×',
+  divide: '÷',
+  minus: '−',
+  middot: '·',
+  bull: '•',
+  ndash: '–',
+  mdash: '—',
+  hellip: '…',
+  lsquo: '‘',
+  rsquo: '’',
+  ldquo: '“',
+  rdquo: '”',
+  laquo: '«',
+  raquo: '»',
+  le: '≤',
+  ge: '≥',
+  ne: '≠',
+  asymp: '≈',
+  infin: '∞',
+  rarr: '→',
+  larr: '←',
+  harr: '↔',
+  uarr: '↑',
+  darr: '↓',
+  sup1: '¹',
+  sup2: '²',
+  sup3: '³',
+  frac12: '½',
+  frac14: '¼',
+  frac34: '¾',
+  permil: '‰',
+  percnt: '%',
+  copy: '©',
+  reg: '®',
+  trade: '™',
+  euro: '€',
+  pound: '£',
+  sect: '§',
+  para: '¶',
+  Aring: 'Å',
+  aring: 'å',
+  auml: 'ä',
+  ouml: 'ö',
+  uuml: 'ü',
+  Auml: 'Ä',
+  Ouml: 'Ö',
+  Uuml: 'Ü',
+  szlig: 'ß',
+  eacute: 'é',
+  egrave: 'è',
+};
+
+// Greek letters (`&alpha;` … `&omega;`, `&Alpha;` … `&Omega;`) — common in
+// lab notes (α-helix, Δ, µ, λ_max).
+const GREEK = [
+  'alpha', 'beta', 'gamma', 'delta', 'epsilon', 'zeta', 'eta', 'theta',
+  'iota', 'kappa', 'lambda', 'mu', 'nu', 'xi', 'omicron', 'pi', 'rho',
+  'sigmaf', 'sigma', 'tau', 'upsilon', 'phi', 'chi', 'psi', 'omega',
+];
+GREEK.forEach((name, i) => {
+  NAMED_ENTITIES[name] = String.fromCodePoint(0x3b1 + i);
+  if (name !== 'sigmaf') {
+    const upper = name.charAt(0).toUpperCase() + name.slice(1);
+    NAMED_ENTITIES[upper] = String.fromCodePoint(0x391 + i);
+  }
+});
+
+/**
+ * Decode HTML character references in one left-to-right pass. A single
+ * pass is what makes `&amp;lt;` come out as the literal text `&lt;`
+ * (sequential `.replace()` calls would decode it twice). Numeric
+ * references (`&#8451;`, `&#x2103;`) are decoded; unknown named
+ * references are left as-is.
+ */
+function decodeHtmlEntities(text: string): string {
+  return text.replace(
+    /&(#[0-9]+|#[xX][0-9a-fA-F]+|[A-Za-z][A-Za-z0-9]*);/g,
+    (match, ref: string) => {
+      if (ref.startsWith('#')) {
+        const code =
+          ref[1] === 'x' || ref[1] === 'X'
+            ? Number.parseInt(ref.slice(2), 16)
+            : Number.parseInt(ref.slice(1), 10);
+        if (!Number.isFinite(code) || code <= 0 || code > 0x10ffff)
+          return match;
+        if (code >= 0xd800 && code <= 0xdfff) return match;
+        return String.fromCodePoint(code);
+      }
+      return NAMED_ENTITIES[ref] ?? match;
+    }
+  );
+}
 
 function stripHtml(html: string): string {
-  return html
+  const withoutTags = html
     .replace(/<style[\s\S]*?<\/style>/gi, '')
     .replace(/<script[\s\S]*?<\/script>/gi, '')
     .replace(/<br\s*\/?>/gi, '\n')
     .replace(/<\/p>/gi, '\n\n')
-    .replace(/<[^>]+>/g, '')
-    .replace(/&nbsp;/g, ' ')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
+    .replace(/<\/(div|h[1-6]|li|tr|ul|ol|table|blockquote|pre)>/gi, '\n')
+    .replace(/<\/t[dh]>/gi, '\t')
+    .replace(/<[^>]+>/g, '');
+  return decodeHtmlEntities(withoutTags)
+    .replace(/[ \t]+\n/g, '\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
 }
 
 /**
- * Lossless HTML → markdown.
- *
- * The previous `stripHtml` dropped tables (columns → flat list of
- * numbers) and link hrefs. Lab bodies routinely embed Ansatz-tables
- * and literature links, so reviewers lost quantitative structure and
- * citations. Turndown preserves both. A custom GFM-style table rule
- * handles `<table>`/`<thead>`/`<tbody>` because the stock turndown
- * ruleset does not.
+ * HTML → markdown via Turndown, with a custom table rule (Turndown's stock
+ * ruleset has none). Tables that GFM can express become pipe tables; the
+ * rest are emitted as raw HTML so no cell is lost.
  *
  * Turndown ships a pure-JS DOM (via `@mixmark-io/domino`), so this
  * works in Node 18+ with no jsdom dependency.
@@ -88,20 +192,23 @@ function createMarkdownConverter(): TurndownService {
   });
   td.addRule('table', {
     filter: ['table'],
-    replacement: (_content, node) => renderTable(node as TableLikeNode),
+    replacement: (_content, node) => renderTable(node as unknown as TableNode),
   });
+  // Sub/superscripts carry meaning in lab notes (H<sub>2</sub>O, cm<sup>-1</sup>)
+  // and markdown has no syntax for them; keep them as inline HTML.
+  td.keep(['sub', 'sup']);
   td.addRule('table-rows', {
-    filter: ['thead', 'tbody', 'tfoot', 'tr', 'th', 'td'],
+    filter: ['caption', 'colgroup', 'col', 'thead', 'tbody', 'tfoot', 'tr', 'th', 'td'],
     replacement: () => '',
   });
-  // Turndown's default `escape` aggressively backslash-escapes underscores,
-  // brackets, parens, dots, hashes, etc. to prevent every conceivable markdown
+  // Turndown's default `escape` backslash-escapes underscores, brackets,
+  // parens, dots, hashes, etc. to prevent every conceivable markdown
   // ambiguity. The converter is configured with `emDelimiter: '*'`, so
-  // underscores in source content can never be confused for emphasis — yet the
-  // default escape still mangles `d_H_DLS_nm` → `d\_H\_DLS\_nm`, breaking
-  // downstream tools that grep on field names. Override to escape only the
-  // characters that genuinely break markdown rendering: backslash, asterisk,
-  // backtick.
+  // underscores in source content can never be confused for emphasis — yet
+  // the default escape still mangles `d_H_DLS_nm` → `d\_H\_DLS\_nm`,
+  // breaking downstream tools that grep on field names. Escape only the
+  // characters that genuinely break markdown rendering: backslash,
+  // asterisk, backtick.
   td.escape = (s: string): string =>
     s.replace(/\\/g, '\\\\').replace(/\*/g, '\\*').replace(/`/g, '\\`');
   _converter = td;
@@ -109,49 +216,121 @@ function createMarkdownConverter(): TurndownService {
 }
 
 /**
- * Shape turndown's DOM wrapper exposes for table nodes. We only rely
- * on the subset we actually use, avoiding a DOM lib dep.
+ * Subset of the DOM element API (domino, via Turndown) the table renderer
+ * relies on. Declared locally to avoid a DOM lib dependency.
  */
-interface ElementLike {
+interface ElementNode {
   tagName: string;
   textContent: string | null;
-  children: ArrayLike<ElementLike>;
+  children: ArrayLike<ElementNode>;
+  getAttribute(name: string): string | null;
+  removeAttribute(name: string): void;
+  attributes: ArrayLike<{ name: string }>;
+  querySelectorAll(selector: string): ArrayLike<ElementNode>;
+  cloneNode(deep: boolean): ElementNode;
+  outerHTML: string;
 }
-interface TableLikeNode extends ElementLike {
-  querySelectorAll(selector: string): ArrayLike<ElementLike>;
+type TableNode = ElementNode;
+
+function spanOf(cell: ElementNode, attr: 'colspan' | 'rowspan'): number {
+  const n = Number.parseInt(cell.getAttribute(attr) ?? '1', 10);
+  return Number.isFinite(n) && n > 1 ? n : 1;
 }
 
-function renderTable(table: TableLikeNode): string {
-  const rows: string[][] = [];
-  const domRows = Array.from(table.querySelectorAll('tr'));
-  for (const row of domRows) {
-    const cells = Array.from(row.children)
-      .filter((el) => {
-        const tag = el.tagName.toLowerCase();
-        return tag === 'th' || tag === 'td';
-      })
-      .map((el) => (el.textContent ?? '').replace(/\s+/g, ' ').trim());
-    if (cells.length) rows.push(cells);
+/** Direct `<tr>` rows of this table (not rows of nested tables). */
+function ownRows(table: ElementNode): ElementNode[] {
+  const rows: ElementNode[] = [];
+  const visit = (el: ElementNode): void => {
+    for (const child of Array.from(el.children)) {
+      const tag = child.tagName.toLowerCase();
+      if (tag === 'tr') rows.push(child);
+      else if (tag === 'thead' || tag === 'tbody' || tag === 'tfoot')
+        visit(child);
+    }
+  };
+  visit(table);
+  return rows;
+}
+
+function cellsOf(row: ElementNode): ElementNode[] {
+  return Array.from(row.children).filter((el) => {
+    const tag = el.tagName.toLowerCase();
+    return tag === 'th' || tag === 'td';
+  });
+}
+
+/**
+ * The table as raw HTML, minus TinyMCE's editor-internal `data-mce-*`
+ * attributes. Blank lines are collapsed because a blank line terminates a
+ * raw HTML block in CommonMark/GFM.
+ */
+function tableAsHtml(table: ElementNode): string {
+  const clone = table.cloneNode(true);
+  const all = [clone, ...Array.from(clone.querySelectorAll('*'))];
+  for (const el of all) {
+    for (const attr of Array.from(el.attributes).map((a) => a.name)) {
+      if (attr.startsWith('data-mce-')) el.removeAttribute(attr);
+    }
   }
+  return `\n\n${clone.outerHTML.replace(/\n\s*\n/g, '\n')}\n\n`;
+}
+
+/** Inline markdown for one cell: links/emphasis kept, pipes escaped. */
+function renderCell(cell: ElementNode): string {
+  let md: string;
+  try {
+    md = createMarkdownConverter().turndown(
+      cell as unknown as TurndownService.Node
+    );
+  } catch {
+    md = cell.textContent ?? '';
+  }
+  return md
+    .trim()
+    .replace(/\s*\n+\s*/g, '<br>')
+    .replace(/\|/g, '\\|');
+}
+
+function renderTable(table: TableNode): string {
+  const rows = ownRows(table);
   if (rows.length === 0) return '';
-  const header = rows[0] ?? [];
-  const body = rows.slice(1);
-  const cols = header.length || rows[0]?.length || 0;
+
+  // GFM can't express row spans or nested tables. Emit those as HTML
+  // (which GFM renders and markdown→HTML conversion passes through).
+  const hasNested = table.querySelectorAll('table').length > 0;
+  const hasRowspan = rows.some((r) =>
+    cellsOf(r).some((c) => spanOf(c, 'rowspan') > 1)
+  );
+  if (hasNested || hasRowspan) return tableAsHtml(table);
+
+  const grid: string[][] = [];
+  for (const row of rows) {
+    const out: string[] = [];
+    for (const cell of cellsOf(row)) {
+      out.push(renderCell(cell));
+      for (let i = 1; i < spanOf(cell, 'colspan'); i++) out.push('');
+    }
+    if (out.length) grid.push(out);
+  }
+  if (grid.length === 0) return '';
+  const cols = Math.max(...grid.map((r) => r.length));
   const pad = (cells: string[]): string[] => {
-    const out = cells.slice(0, cols);
+    const out = [...cells];
     while (out.length < cols) out.push('');
     return out;
   };
+
   const lines: string[] = [];
+  const caption = Array.from(table.children).find(
+    (el) => el.tagName.toLowerCase() === 'caption'
+  );
+  const captionText = caption?.textContent?.replace(/\s+/g, ' ').trim();
+  if (captionText) lines.push(`**${captionText}**`, '');
+  const [header = [], ...body] = grid;
   lines.push(`| ${pad(header).join(' | ')} |`);
   lines.push(`| ${Array.from({ length: cols }, () => '---').join(' | ')} |`);
   for (const row of body) lines.push(`| ${pad(row).join(' | ')} |`);
   return `\n\n${lines.join('\n')}\n\n`;
-}
-
-function truncate(text: string, limit = MAX_BODY_PREVIEW): string {
-  if (text.length <= limit) return text;
-  return `${text.slice(0, limit)}… (+${text.length - limit} chars)`;
 }
 
 export function formatEntitySummary(entity: ElabEntity): string {
@@ -179,14 +358,16 @@ export interface EntityExtras {
   comments?: ElabComment[];
   attachments?: ElabUpload[];
   links?: ElabLink[];
+  /** Compounds linked to the entity (`/{entity}/{id}/compounds_links`). */
+  compoundLinks?: ElabCompound[];
 }
 
 export interface FormatEntityOptions extends FormatOptions {
   /**
-   * Body rendering. `'text'` = legacy regex stripper (backwards-
-   * compatible, no tables/links). `'markdown'` = lossless HTML →
-   * markdown with tables and links preserved. `'html'` = raw body,
-   * caller handles.
+   * Body rendering. `'text'` = regex-stripped plain text, capped at
+   * 2000 chars (no tables/links). `'markdown'` = HTML → markdown with
+   * tables and links preserved, never truncated. `'html'` = raw body,
+   * never truncated.
    */
   format?: 'text' | 'markdown' | 'html';
 }
@@ -211,11 +392,7 @@ export function formatEntityFull(
   if (meta.length) lines.push(meta.join(' | '));
 
   if (entity.body) {
-    lines.push('');
-    lines.push('## Body');
-    lines.push(
-      renderBody(entity.body, options.format ?? 'text', entity.content_type)
-    );
+    pushBody(lines, entity.body, options.format ?? 'text', entity.content_type);
   }
 
   if (metadata?.extra_fields) {
@@ -251,34 +428,57 @@ export function formatEntityFull(
     lines.push('## Comments');
     lines.push(formatComments(extras.comments, options));
   }
-  if (extras.links) {
+  if (extras.links || extras.compoundLinks) {
     lines.push('');
     lines.push('## Links');
-    lines.push(formatLinks(extras.links));
+    lines.push(formatLinks(extras.links ?? [], extras.compoundLinks));
   }
 
   return lines.join('\n');
 }
 
+/**
+ * Render a stored body for the prose view. Returns the body text and, for
+ * the capped `text` view only, a truncation notice that callers must place
+ * outside the body (a separate paragraph after it) so the notice can never
+ * be mistaken for — or written back as — body content.
+ */
 function renderBody(
   body: string,
   format: 'text' | 'markdown' | 'html',
   contentType?: number
-): string {
-  if (format === 'html') return body;
+): { body: string; notice?: string } {
+  if (format === 'html') return { body };
   if (format === 'markdown') {
     // elabftw stores bodies natively as markdown when content_type=2.
     // Round-tripping through Turndown (HTML → MD) introduces lossy
     // artifacts (list-marker reflow, table-cell whitespace normalization,
-    // residual escapes). When the body is already markdown, return it
-    // untouched — just enforce the same upper-bound truncation as the
-    // Turndown path so the response stays bounded.
-    if (contentType === 2) {
-      return truncate(body, MAX_MARKDOWN_BODY);
-    }
-    return truncate(htmlToMarkdown(body), MAX_MARKDOWN_BODY);
+    // residual escapes), so a stored-markdown body is returned as-is.
+    if (contentType === 2) return { body: decodeStoredMarkdown(body) };
+    return { body: htmlToMarkdown(body) };
   }
-  return truncate(stripHtml(body), MAX_TEXT_BODY);
+  const plain = stripHtml(body);
+  if (plain.length <= MAX_TEXT_BODY) return { body: plain };
+  return {
+    body: plain.slice(0, MAX_TEXT_BODY),
+    notice: `_[text view truncated: showing ${MAX_TEXT_BODY} of ${plain.length} chars. Use format="markdown" or format="html" for the full body.]_`,
+  };
+}
+
+function pushBody(
+  lines: string[],
+  body: string,
+  format: 'text' | 'markdown' | 'html',
+  contentType?: number
+): void {
+  const rendered = renderBody(body, format, contentType);
+  lines.push('');
+  lines.push('## Body');
+  lines.push(rendered.body);
+  if (rendered.notice) {
+    lines.push('');
+    lines.push(rendered.notice);
+  }
 }
 
 export function formatUploads(uploads: ElabUpload[]): string {
@@ -388,14 +588,11 @@ export function formatRevisionBody(
     }`
   );
   if (revision.body) {
-    lines.push('');
-    lines.push('## Body');
-    lines.push(
-      renderBody(
-        revision.body,
-        options.format ?? 'markdown',
-        revision.content_type
-      )
+    pushBody(
+      lines,
+      revision.body,
+      options.format ?? 'markdown',
+      revision.content_type
     );
   }
   return lines.join('\n');
@@ -422,51 +619,81 @@ export function formatRevisions(
     .join('\n');
 }
 
-export function formatLinks(links: ElabLink[]): string {
-  if (links.length === 0) return 'No links.';
-  return links
-    .map(
-      (l) =>
-        `#${l.entityid} ${l.title ?? '(untitled)'}${l.category_title ? ` [${l.category_title}]` : ''}`
-    )
-    .join('\n');
+/**
+ * One line per link. Entity links render as `<kind> #<id> <title>
+ * [<category>]` (kind from the row's `type`, e.g. `experiments` / `items`);
+ * compound links, when given, as `compounds #<id> <name> | <CAS or CID>`.
+ */
+export function formatLinks(
+  links: ElabLink[],
+  compounds: ElabCompound[] = []
+): string {
+  if (links.length === 0 && compounds.length === 0) return 'No links.';
+  const rows = links.map((l) => {
+    const kind = typeof l.type === 'string' && l.type ? `${l.type} ` : '';
+    const cat = l.category_title ? ` [${l.category_title}]` : '';
+    return `${kind}#${l.entityid} ${l.title ?? '(untitled)'}${cat}`;
+  });
+  for (const c of compounds) {
+    const id = c.cas_number
+      ? `CAS=${c.cas_number}`
+      : c.pubchem_cid != null && c.pubchem_cid !== ''
+        ? `CID=${c.pubchem_cid}`
+        : '';
+    rows.push(`compounds #${c.id} ${c.name ?? '(unnamed)'}${id ? ` | ${id}` : ''}`);
+  }
+  return rows.join('\n');
 }
 
 /**
- * Compact hazard summary for a compound. Drops the `is_` prefix and
- * humanizes a few keys (`is_hazardous2health` → `health-hazard`, etc.).
- * Returns the empty string when no flags are set.
+ * Human labels for compound hazard flags, keyed by the snake_case column
+ * name. The PubChem preview uses camelCase keys for the same flags
+ * (`is_gas_under_pressure` ↔ `isGasUnderPressure`); {@link camelFlag}
+ * derives those so both renderers share this one table.
+ */
+const HAZARD_LABELS: Record<string, string> = {
+  is_corrosive: 'corrosive',
+  is_explosive: 'explosive',
+  is_flammable: 'flammable',
+  is_gas_under_pressure: 'gas-under-pressure',
+  is_hazardous2env: 'env-hazard',
+  is_hazardous2health: 'health-hazard',
+  is_oxidising: 'oxidising',
+  is_toxic: 'toxic',
+  is_radioactive: 'radioactive',
+  is_serious_health_hazard: 'serious-health-hazard',
+  is_antibiotic: 'antibiotic',
+  is_antibiotic_precursor: 'antibiotic-precursor',
+  is_drug: 'drug',
+  is_drug_precursor: 'drug-precursor',
+  is_explosive_precursor: 'explosive-precursor',
+  is_cmr: 'CMR',
+  is_nano: 'nano',
+  is_controlled: 'controlled',
+  is_ed2health: 'endocrine-disruptor-health',
+  is_ed2env: 'endocrine-disruptor-env',
+  is_pbt: 'PBT',
+  is_pmt: 'PMT',
+  is_vpvb: 'vPvB',
+  is_vpvm: 'vPvM',
+};
+
+function camelFlag(flag: string): string {
+  return flag.replace(/_([a-z0-9])/g, (_m, ch: string) => ch.toUpperCase());
+}
+
+function hazardLabel(flag: string): string {
+  return HAZARD_LABELS[flag] ?? flag.replace(/^is_/, '');
+}
+
+/**
+ * Compact hazard summary for a compound (`⚠ corrosive, toxic`). Returns
+ * the empty string when no flags are set.
  */
 function formatCompoundHazards(c: ElabCompound): string {
-  const pretty: Record<string, string> = {
-    is_corrosive: 'corrosive',
-    is_explosive: 'explosive',
-    is_flammable: 'flammable',
-    is_gas_under_pressure: 'gas-under-pressure',
-    is_hazardous2env: 'env-hazard',
-    is_hazardous2health: 'health-hazard',
-    is_oxidising: 'oxidising',
-    is_toxic: 'toxic',
-    is_radioactive: 'radioactive',
-    is_serious_health_hazard: 'serious-health-hazard',
-    is_antibiotic: 'antibiotic',
-    is_antibiotic_precursor: 'antibiotic-precursor',
-    is_drug: 'drug',
-    is_drug_precursor: 'drug-precursor',
-    is_explosive_precursor: 'explosive-precursor',
-    is_cmr: 'CMR',
-    is_nano: 'nano',
-    is_controlled: 'controlled',
-    is_ed2health: 'endocrine-disruptor-health',
-    is_ed2env: 'endocrine-disruptor-env',
-    is_pbt: 'PBT',
-    is_pmt: 'PMT',
-    is_vpvb: 'vPvB',
-    is_vpvm: 'vPvM',
-  };
   const set: string[] = [];
   for (const flag of COMPOUND_HAZARD_FLAGS) {
-    if (c[flag]) set.push(pretty[flag] ?? flag.replace(/^is_/, ''));
+    if (c[flag]) set.push(hazardLabel(flag));
   }
   return set.length ? `⚠ ${set.join(', ')}` : '';
 }
@@ -505,27 +732,15 @@ export function formatCompound(c: ElabCompound): string {
 }
 
 /**
- * Compact hazard summary for a PubChem preview hit. Same shape as
- * {@link formatCompoundHazards} but reads camelCase keys
- * (`isCorrosive`, `isHazardous2health`, …) per the PubChem-importer
- * convention. The CID search path returns no hazard flags; CAS / name
- * paths do.
+ * Compact hazard summary for a PubChem preview hit. Same labels as
+ * {@link formatCompoundHazards}, read from the camelCase keys the PubChem
+ * importer uses (`isCorrosive`, `isHazardous2health`, …). The CID search
+ * path returns no hazard flags; CAS / name paths do.
  */
 function formatPubchemHazards(h: ElabPubchemHit): string {
-  const pretty: Record<string, string> = {
-    isCorrosive: 'corrosive',
-    isExplosive: 'explosive',
-    isFlammable: 'flammable',
-    isGasUnderPressure: 'gas-under-pressure',
-    isHazardous2env: 'env-hazard',
-    isHazardous2health: 'health-hazard',
-    isOxidising: 'oxidising',
-    isToxic: 'toxic',
-    isSeriousHealthHazard: 'serious-health-hazard',
-  };
   const set: string[] = [];
-  for (const key of Object.keys(pretty)) {
-    if (h[key as keyof ElabPubchemHit]) set.push(pretty[key]!);
+  for (const flag of COMPOUND_HAZARD_FLAGS) {
+    if (h[camelFlag(flag)]) set.push(hazardLabel(flag));
   }
   return set.length ? `⚠ ${set.join(', ')}` : '';
 }

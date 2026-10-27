@@ -137,62 +137,54 @@ export function toNativeEntity(entity: ElabEntity): ElabEntityNative {
 
 /**
  * Convert a (partial) native shape back into the PATCH body elabftw
- * expects. Stringifies `canread` / `canwrite` and `metadata`; joins
- * `tags` (elabftw expects an array on PATCH, not a delimited string —
- * see `addEntityTag` reconcile semantics; tags are handled separately
- * by the reconcile loop in `elab_update_entity`). Permission-base /
- * immutability flags are NOT settable on PATCH; we drop them.
- *
- * Returns the PATCH-shaped object plus a `tags` array surfaced
- * separately so the caller can route tag mutation through the
- * tag-add path. The toolkit owns this split because elabftw's PATCH
- * endpoint silently ignores the `tags` field — they have to land via
- * `/{entityType}/{id}/tags/{tagId}`.
+ * expects: permissions and metadata are re-stringified. Tags and state
+ * cannot go through a field PATCH (tags have their own endpoint, state
+ * changes go through the `archive` / `unarchive` actions), so they come
+ * back separately for the caller to apply.
  */
 export interface NativePatchResult {
   patch: ElabEntityUpdate;
-  /** Tag set to reconcile after PATCH (undefined = don't touch tags). */
+  /** Desired tag set (undefined = leave tags alone). */
   tags?: string[];
+  /** Desired state (undefined = leave state alone). */
+  state?: number;
 }
 
 export function nativeToUpdate(
   native: Partial<ElabEntityNative>
 ): NativePatchResult {
   const patch: ElabEntityUpdate = {};
+  // `date` / `category` / … may be null to clear them; the index signature
+  // carries the null through.
+  const loose = patch as Record<string, unknown>;
 
   if (native.title !== undefined) patch.title = native.title;
   if (native.body !== undefined) patch.body = native.body;
   if (native.content_type !== undefined)
     patch.content_type = native.content_type;
-  // `date` / `rating` accept null on the wire reflection but PATCH-side we
-  // route through the index signature to keep null as a clear-action.
-  if (native.date !== undefined)
-    (patch as Record<string, unknown>).date = native.date;
-  if (native.category !== undefined)
-    (patch as Record<string, unknown>).category = native.category;
-  if (native.status !== undefined)
-    (patch as Record<string, unknown>).status = native.status;
-  if (native.rating !== undefined)
-    (patch as Record<string, unknown>).rating = native.rating;
-  if (native.custom_id !== undefined)
-    (patch as Record<string, unknown>).custom_id = native.custom_id;
-  if (native.state !== undefined) patch.state = native.state;
+  if (native.date !== undefined) loose.date = native.date;
+  if (native.category !== undefined) loose.category = native.category;
+  if (native.status !== undefined) loose.status = native.status;
+  if (native.rating !== undefined) loose.rating = native.rating;
+  if (native.custom_id !== undefined) loose.custom_id = native.custom_id;
 
   if (native.canread !== undefined)
     patch.canread = JSON.stringify(native.canread);
   if (native.canwrite !== undefined)
     patch.canwrite = JSON.stringify(native.canwrite);
+  if (native.canread_base !== undefined)
+    patch.canread_base = native.canread_base;
+  if (native.canwrite_base !== undefined)
+    patch.canwrite_base = native.canwrite_base;
+  if (native.canread_is_immutable !== undefined)
+    patch.canread_is_immutable = native.canread_is_immutable;
+  if (native.canwrite_is_immutable !== undefined)
+    patch.canwrite_is_immutable = native.canwrite_is_immutable;
 
   if (native.metadata !== undefined) {
-    // elabftw accepts JSON `null` to clear the blob; the ElabEntityUpdate
-    // shape narrows metadata to string only, so escape through the index
-    // signature for the null case.
-    (patch as Record<string, unknown>).metadata =
-      native.metadata === null ? null : JSON.stringify(native.metadata);
+    // The metadata column is JSON; an empty object clears it.
+    patch.metadata = JSON.stringify(native.metadata ?? {});
   }
 
-  return {
-    patch,
-    tags: native.tags,
-  };
+  return { patch, tags: native.tags, state: native.state };
 }

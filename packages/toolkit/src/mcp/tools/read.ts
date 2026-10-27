@@ -1,9 +1,16 @@
+import { mkdir, writeFile } from 'node:fs/promises';
+import { resolve, sep } from 'node:path';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import {
   type ElabCategory,
+  type ElabComment,
+  type ElabCompound,
   type ElabEntity,
   type ElabEntityType,
+  type ElabLink,
   type ElabStatus,
+  type ElabStep,
+  type ElabUpload,
   type ElabUser,
   type ElabftwClient,
   type EntityExtras,
@@ -30,6 +37,7 @@ import {
   assertTeam,
   clientFor,
   effectiveTeam,
+  entityScope,
   filterByTeam,
   teamParamSchema,
 } from './team-guard';
@@ -126,41 +134,239 @@ function formatCategoriesOrStatuses(
 }
 
 type IncludeKey = 'steps' | 'comments' | 'attachments' | 'links';
+type UnfinishedEntry = {
+  id: number;
+  title: string;
+  steps: Array<[string, string]>;
+};
+type LinkKind = 'experiments' | 'items' | 'compounds';
 
 /**
- * Fetch one entity + its sub-resources. Assumes `assertTeam` already
- * validated the team. Reused by `elab_get` and `elab_get_bulk`.
+ * A sub-resource array embedded in a single-entity GET. eLabFTW's
+ * `AbstractEntity::readOne` inlines steps, uploads, comments and the
+ * three link lists, so the entity fetched by `assertTeam` already carries
+ * them; a separate sub-resource GET is only needed when a version omits
+ * one (then this returns undefined).
+ */
+function embedded<T>(entity: ElabEntity, key: string): T[] | undefined {
+  const value = entity[key];
+  return Array.isArray(value) ? (value as T[]) : undefined;
+}
+
+/**
+ * Links of one kind, from the entity GET when embedded, else from the
+ * sub-resource endpoint.
+ */
+async function linksOf(
+  client: ElabftwClient,
+  entityType: ElabEntityType,
+  entity: ElabEntity,
+  kind: 'experiments' | 'items'
+): Promise<ElabLink[]> {
+  return (
+    embedded<ElabLink>(entity, `${kind}_links`) ??
+    client.listLinks(entityType, entity.id, kind)
+  );
+}
+
+async function compoundLinksOf(
+  client: ElabftwClient,
+  entityType: ElabEntityType,
+  entity: ElabEntity
+): Promise<ElabCompound[]> {
+  return (
+    embedded<ElabCompound>(entity, 'compounds_links') ??
+    client.listCompoundLinks(entityType, entity.id)
+  );
+}
+
+/**
+ * Collect the requested sub-resources of an entity already fetched (and
+ * team-checked) by `assertTeam`, so each entity is fetched once. Reused by
+ * `elab_get` and `elab_get_bulk`.
  */
 async function fetchEntityWithExtras(
   client: ElabftwClient,
   entityType: ElabEntityType,
-  id: number,
+  entity: ElabEntity,
   include: readonly IncludeKey[] | undefined
 ): Promise<{ entity: ElabEntity; extras: EntityExtras }> {
-  const entity = await client.get(entityType, id);
   if (!include || include.length === 0) {
     return { entity, extras: {} };
   }
   const want = new Set(include);
-  const [steps, comments, attachments, linksExp, linksItems] =
+  const id = entity.id;
+  const wantLinks = want.has('links');
+  const [steps, comments, attachments, linksExp, linksItems, compoundLinks] =
     await Promise.all([
-      want.has('steps') ? client.listSteps(entityType, id) : undefined,
-      want.has('comments') ? client.listComments(entityType, id) : undefined,
-      want.has('attachments') ? client.listUploads(entityType, id) : undefined,
-      want.has('links')
-        ? client.listLinks(entityType, id, 'experiments')
+      want.has('steps')
+        ? (embedded<ElabStep>(entity, 'steps') ??
+          client.listSteps(entityType, id))
         : undefined,
-      want.has('links')
-        ? client.listLinks(entityType, id, 'items')
+      want.has('comments')
+        ? (embedded<ElabComment>(entity, 'comments') ??
+          client.listComments(entityType, id))
         : undefined,
+      want.has('attachments')
+        ? (embedded<ElabUpload>(entity, 'uploads') ??
+          client.listUploads(entityType, id))
+        : undefined,
+      wantLinks ? linksOf(client, entityType, entity, 'experiments') : undefined,
+      wantLinks ? linksOf(client, entityType, entity, 'items') : undefined,
+      wantLinks ? compoundLinksOf(client, entityType, entity) : undefined,
     ]);
-  const links = want.has('links')
+  const links = wantLinks
     ? [...(linksExp ?? []), ...(linksItems ?? [])]
     : undefined;
   return {
     entity,
-    extras: { steps, comments, attachments, links },
+    extras: { steps, comments, attachments, links, compoundLinks },
   };
+}
+
+/** File extension per `elab_export` format, for the fallback filename. */
+const EXPORT_EXTENSIONS = {
+  csv: 'csv',
+  json: 'json',
+  pdf: 'pdf',
+  pdfa: 'pdf',
+  zip: 'zip',
+  zipa: 'zip',
+  eln: 'eln',
+  elnhtml: 'eln',
+  qrpdf: 'pdf',
+  qrpng: 'png',
+} as const;
+
+/** Text returned inline up to this size; anything larger goes to disk. */
+const MAX_INLINE_TEXT = 100 * 1024;
+
+const TEXT_EXTENSIONS = new Set([
+  'txt', 'text', 'csv', 'tsv', 'tab', 'json', 'jsonl', 'ndjson', 'md',
+  'markdown', 'xml', 'html', 'htm', 'svg', 'log', 'yaml', 'yml', 'toml',
+  'ini', 'cfg', 'conf', 'tex', 'bib', 'ris', 'rtf', 'sql', 'py', 'r', 'm',
+  'js', 'ts', 'sh', 'jdx', 'dx', 'jcamp', 'cif', 'mol', 'sdf', 'mol2',
+  'pdb', 'xyz', 'smi', 'fasta', 'fa', 'gb', 'gbk', 'asc', 'dat', 'out',
+]);
+
+function extensionOf(filename: string): string {
+  return /\.([A-Za-z0-9]{1,10})$/.exec(filename)?.[1]?.toLowerCase() ?? '';
+}
+
+function isTextContentType(contentType: string | null): boolean {
+  if (!contentType) return false;
+  const ct = contentType.toLowerCase().split(';')[0]!.trim();
+  return (
+    ct.startsWith('text/') ||
+    /[/+](json|xml|csv)$/.test(ct) ||
+    ct === 'application/x-yaml' ||
+    ct === 'application/yaml'
+  );
+}
+
+/**
+ * Reduce an untrusted filename to a safe single path component: no
+ * directories, no leading dots, only `[A-Za-z0-9._-]`, bounded length.
+ */
+function sanitizeFilename(name: string): string {
+  const base = name.split(/[\\/]/).pop() ?? '';
+  const cleaned = base
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^A-Za-z0-9._-]+/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^[._]+/, '')
+    .slice(-120);
+  return cleaned || 'file';
+}
+
+/** `filename` from a Content-Disposition header (RFC 6266), if any. */
+function filenameFromDisposition(header: string | null): string | undefined {
+  if (!header) return undefined;
+  const star = /filename\*\s*=\s*(?:UTF-8|utf-8)''([^;]+)/.exec(header);
+  if (star?.[1]) {
+    try {
+      return decodeURIComponent(star[1].trim());
+    } catch {
+      // fall through to the plain parameter
+    }
+  }
+  const plain = /filename\s*=\s*"?([^";]+)"?/.exec(header);
+  return plain?.[1]?.trim() || undefined;
+}
+
+interface DeliverInput {
+  bytes: ArrayBuffer;
+  /** Display filename (from upload metadata or Content-Disposition). */
+  filename: string;
+  /** Prefix that makes the on-disk name unique, e.g. `experiments-12-upload-34`. */
+  diskPrefix: string;
+  contentType: string | null;
+  downloadDir: string | null | undefined;
+}
+
+/**
+ * Return a downloaded file to the agent. Text (by extension or HTTP
+ * Content-Type, and valid UTF-8) up to {@link MAX_INLINE_TEXT} is returned
+ * inline. Everything else is written to `downloadDir` and the absolute path
+ * returned; without a download dir (hosted mode) only metadata is returned.
+ * Never base64: it costs ~1.3 tokens/byte and agents cannot use it.
+ */
+async function deliverFile(input: DeliverInput): Promise<string> {
+  const { bytes, filename, contentType, downloadDir } = input;
+  const size = bytes.byteLength;
+  const ct = contentType?.split(';')[0]?.trim() || 'unknown';
+  const header = `${filename} (${ct}, ${size} bytes)`;
+
+  const textLike =
+    TEXT_EXTENSIONS.has(extensionOf(filename)) || isTextContentType(contentType);
+  if (textLike && size <= MAX_INLINE_TEXT) {
+    try {
+      const decoded = new TextDecoder('utf-8', { fatal: true }).decode(
+        new Uint8Array(bytes)
+      );
+      return `${header}:\n\n${decoded}`;
+    } catch {
+      // Not valid UTF-8 despite the name — treat as binary below.
+    }
+  }
+
+  const why = !textLike
+    ? 'binary'
+    : size > MAX_INLINE_TEXT
+      ? `text larger than the ${MAX_INLINE_TEXT / 1024} KB inline limit`
+      : 'not valid UTF-8 text';
+  if (!downloadDir) {
+    return (
+      `${header}\nNot returned: the file is ${why}, and this server has no download directory ` +
+      '(hosted mode cannot hand files to the client). Open it in the elabftw web UI instead.'
+    );
+  }
+  const dir = resolve(downloadDir);
+  const target = resolve(
+    dir,
+    `${sanitizeFilename(input.diskPrefix)}-${sanitizeFilename(filename)}`
+  );
+  if (!target.startsWith(dir + sep)) {
+    throw new Error(`Refusing to write outside the download directory: ${target}`);
+  }
+  await mkdir(dir, { recursive: true });
+  await writeFile(target, new Uint8Array(bytes));
+  return `${header}\nSaved to: ${target}\n(${why}; read it from that path.)`;
+}
+
+/** Native view of an entity with the requested sub-resources nested in. */
+function nativeWithExtras(
+  entity: ElabEntity,
+  extras: EntityExtras
+): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...toNativeEntity(entity) };
+  if (extras.steps) out.steps = extras.steps;
+  if (extras.comments) out.comments = extras.comments;
+  if (extras.attachments) out.attachments = extras.attachments;
+  if (extras.links) out.links = extras.links;
+  if (extras.compoundLinks) out.compounds_links = extras.compoundLinks;
+  return out;
 }
 
 /**
@@ -190,7 +396,7 @@ export function registerReadTools(
   const formatOpts = { revealUsers };
   server.tool(
     'elab_search',
-    'Search experiments, items, templates, or items_types within one team. Pass `team` to pick which configured key/team to query; omit for the default team. Results are filtered to that team. Use `extended` for the elabftw DSL (rating:, tag:, date:, category:) when you need precise filters.',
+    'Search experiments, items, templates, or items_types within one team. Results are filtered to that team. Use `extended` for the elabftw DSL (rating:, tag:, date:, category:) when you need precise filters.',
     listInput.shape as Record<string, unknown>,
     async (args) => {
       const input = args as z.infer<typeof listInput>;
@@ -226,11 +432,7 @@ export function registerReadTools(
 
   server.tool(
     'elab_get',
-    'Fetch a single entity with full body, category, status, tags, and parsed extra_fields. ' +
-      'For reviewing a cohort, set `include=["attachments","steps","comments","links"]` to get everything in one round-trip instead of 4 tool calls per entity. ' +
-      'Body rendering: `format="markdown"` (default) preserves tables (as GFM pipes) and link hrefs — use this for quantitative review. `format="text"` is the legacy stripped-plain-text behaviour. `format="html"` returns the raw HTML body. ' +
-      'Output view: `view="prose"` (default) renders a markdown summary suited for human / agent reading. `view="native"` returns the wire shape as a JSON object with the stringified payloads pre-parsed (`canread` / `canwrite` as objects, `metadata` as the parsed extra_fields tree, `tags` as `string[]`, `experiments_links` / `items_links` / `compounds_links` as arrays). Use `view="native"` for round-trip workflows — the same shape is accepted back by `elab_update_entity({native: ...})`. ' +
-      'Pass `team` to scope the lookup.',
+    'Fetch one entity: body, category, status, tags, extra fields. `include` adds steps / comments / attachments / links in the same call. `format`: `markdown` (default; full body, safe to edit and write back), `html` (raw), `text` (2000-char preview). `view: \"native\"` returns the raw record as JSON, accepted back by `elab_update_entity({native})`.',
     {
       entityType: entityTypeSchema,
       id: z.number().int().positive(),
@@ -239,19 +441,19 @@ export function registerReadTools(
         .array(z.enum(['steps', 'comments', 'attachments', 'links']))
         .optional()
         .describe(
-          'Sub-resources to fetch in parallel. In prose view they render under H2 sections; in native view they nest under matching top-level keys (`steps`, `comments`, `attachments`, `links`).'
+          'Sub-resources to include.'
         ),
       format: z
         .enum(['text', 'markdown', 'html'])
         .optional()
         .describe(
-          'Body rendering: `markdown` (default) lossless HTML→markdown with tables+links. `text` legacy stripped plaintext. `html` raw body. Applies in prose view; in native view the body is returned in its stored form (controlled by `content_type`).'
+          'Body format (prose view).'
         ),
       view: z
         .enum(['prose', 'native'])
         .optional()
         .describe(
-          'Output shape: `prose` (default) markdown summary. `native` parsed JSON object — round-tripable through `elab_update_entity({native})`.'
+          '`prose` (default) or `native` JSON.'
         ),
     },
     async (args) => {
@@ -263,25 +465,18 @@ export function registerReadTools(
         format?: 'text' | 'markdown' | 'html';
         view?: 'prose' | 'native';
       };
-      const t = effectiveTeam(registry, team);
-      const client = clientFor(registry, team);
       return guard(
         async () => {
-          await assertTeam(client, entityType, id, t);
-          return fetchEntityWithExtras(client, entityType, id, include);
+          const { client, entity } = await entityScope(registry, team, entityType, id);
+          const fetched = await fetchEntityWithExtras(client, entityType, entity, include);
+          return { ...fetched, metadata: client.parseMetadata(fetched.entity) };
         },
-        ({ entity, extras }) => {
+        ({ entity, extras, metadata }) => {
           if (view === 'native') {
-            const native = toNativeEntity(entity);
-            const out: Record<string, unknown> = { ...native };
-            if (extras.steps) out.steps = extras.steps;
-            if (extras.comments) out.comments = extras.comments;
-            if (extras.attachments) out.attachments = extras.attachments;
-            if (extras.links) out.links = extras.links;
-            return text(JSON.stringify(out, null, 2));
+            return text(JSON.stringify(nativeWithExtras(entity, extras), null, 2));
           }
           return text(
-            formatEntityFull(entity, client.parseMetadata(entity), extras, {
+            formatEntityFull(entity, metadata, extras, {
               ...formatOpts,
               format: format ?? 'markdown',
             })
@@ -293,9 +488,7 @@ export function registerReadTools(
 
   server.tool(
     'elab_get_bulk',
-    'Fetch up to 50 entities of the same kind in one call with shared `include` and `format` options. Ideal for cohort review (40 students × 4 round-trips → 1 call). ' +
-      'Each id is validated against the resolved team before fetch; a cross-team id fails the whole call (same rule as `elab_get`). ' +
-      'Requests are chunked into groups of 8 to avoid opening 50 sockets at once.',
+    'Fetch up to 50 entities of one kind in one call, with the same `include` / `format` / `view` options as `elab_get`. Fails if any id belongs to another team.',
     {
       entityType: entityTypeSchema,
       ids: z
@@ -308,7 +501,7 @@ export function registerReadTools(
         .array(z.enum(['steps', 'comments', 'attachments', 'links']))
         .optional()
         .describe(
-          'Sub-resources to fetch for every id. Same semantics as `elab_get`.'
+          'Sub-resources to include.'
         ),
       format: z
         .enum(['text', 'markdown', 'html'])
@@ -318,7 +511,7 @@ export function registerReadTools(
         .enum(['prose', 'native'])
         .optional()
         .describe(
-          'Output shape: `prose` (default) markdown summary, one per id separated by `---`. `native` JSON array of parsed entity objects (same shape as `elab_get(view: "native")`).'
+          '`prose` (default) or `native` JSON array.'
         ),
     },
     async (args) => {
@@ -335,23 +528,17 @@ export function registerReadTools(
       return guard(
         async () => {
           const factories = ids.map((id) => async () => {
-            await assertTeam(client, entityType, id, t);
-            return fetchEntityWithExtras(client, entityType, id, include);
+            const entity = await assertTeam(client, entityType, id, t);
+            return fetchEntityWithExtras(client, entityType, entity, include);
           });
           return chunkedAll(factories, 8);
         },
         (results) => {
           if (results.length === 0) return text('No entities requested.');
           if (view === 'native') {
-            const arr = results.map(({ entity, extras }) => {
-              const native = toNativeEntity(entity);
-              const out: Record<string, unknown> = { ...native };
-              if (extras.steps) out.steps = extras.steps;
-              if (extras.comments) out.comments = extras.comments;
-              if (extras.attachments) out.attachments = extras.attachments;
-              if (extras.links) out.links = extras.links;
-              return out;
-            });
+            const arr = results.map(({ entity, extras }) =>
+              nativeWithExtras(entity, extras)
+            );
             return text(JSON.stringify(arr, null, 2));
           }
           const blocks = results.map(({ entity, extras }, i) => {
@@ -383,11 +570,9 @@ export function registerReadTools(
         id: number;
         team?: number;
       };
-      const t = effectiveTeam(registry, team);
-      const client = clientFor(registry, team);
       return guard(
         async () => {
-          await assertTeam(client, entityType, id, t);
+          const { client } = await entityScope(registry, team, entityType, id);
           return client.listUploads(entityType, id);
         },
         (uploads) => text(formatUploads(uploads))
@@ -397,7 +582,10 @@ export function registerReadTools(
 
   server.tool(
     'elab_download_attachment',
-    'Download the raw bytes of an attachment. Text files are returned as text; binary files return as base64 with their MIME type and size. Large files (>2 MB) are truncated with a note.',
+    'Download an attachment. Text files (by extension — txt, csv, tsv, json, md, xml, html, log, jcamp, … — or by Content-Type) up to 100 KB are returned inline. ' +
+      (config.downloadDir
+        ? 'Binary files and larger text files are saved to the local download directory and the tool returns the absolute path, size and filename — open the file from that path.'
+        : 'Binary files and larger text files cannot be delivered by this server; the tool returns their metadata only.'),
     {
       entityType: entityTypeSchema,
       id: z.number().int().positive(),
@@ -411,43 +599,22 @@ export function registerReadTools(
         uploadId: number;
         team?: number;
       };
-      const t = effectiveTeam(registry, team);
-      const client = clientFor(registry, team);
       return guard(
         async () => {
-          await assertTeam(client, entityType, id, t);
+          const { client } = await entityScope(registry, team, entityType, id);
           const meta = await client.getUpload(entityType, id, uploadId);
           const resp = await client.downloadUpload(entityType, id, uploadId);
-          const buf = await resp.arrayBuffer();
-          return { meta, buf };
+          const bytes = await resp.arrayBuffer();
+          return deliverFile({
+            bytes,
+            filename:
+              meta.real_name ?? meta.long_name ?? `upload-${uploadId}`,
+            diskPrefix: `${entityType}-${id}-upload-${uploadId}`,
+            contentType: resp.headers.get('content-type'),
+            downloadDir: config.downloadDir,
+          });
         },
-        ({ meta, buf }) => {
-          const ct = meta.type ?? 'application/octet-stream';
-          const name = meta.real_name ?? meta.long_name ?? `upload-${uploadId}`;
-          const size = buf.byteLength;
-          const MAX = 2 * 1024 * 1024;
-
-          const isTextLike =
-            typeof ct === 'string' &&
-            (ct.startsWith('text/') ||
-              ct.includes('json') ||
-              ct.includes('xml') ||
-              ct.includes('csv'));
-
-          if (isTextLike && size <= MAX) {
-            const decoded = new TextDecoder('utf-8', { fatal: false }).decode(
-              new Uint8Array(buf)
-            );
-            return text(`${name} (${ct}, ${size} bytes):\n\n${decoded}`);
-          }
-
-          const capped = size > MAX ? buf.slice(0, MAX) : buf;
-          const base64 = Buffer.from(capped).toString('base64');
-          const suffix = size > MAX ? ` (truncated from ${size} bytes)` : '';
-          return text(
-            `${name} (${ct}, ${size} bytes)${suffix}\nbase64:\n${base64}`
-          );
-        }
+        (out) => text(out)
       );
     }
   );
@@ -466,11 +633,9 @@ export function registerReadTools(
         id: number;
         team?: number;
       };
-      const t = effectiveTeam(registry, team);
-      const client = clientFor(registry, team);
       return guard(
         async () => {
-          await assertTeam(client, entityType, id, t);
+          const { client } = await entityScope(registry, team, entityType, id);
           return client.listComments(entityType, id);
         },
         (comments) => text(formatComments(comments, formatOpts))
@@ -492,11 +657,9 @@ export function registerReadTools(
         id: number;
         team?: number;
       };
-      const t = effectiveTeam(registry, team);
-      const client = clientFor(registry, team);
       return guard(
         async () => {
-          await assertTeam(client, entityType, id, t);
+          const { client } = await entityScope(registry, team, entityType, id);
           return client.listSteps(entityType, id);
         },
         (steps) => text(formatSteps(steps))
@@ -506,59 +669,80 @@ export function registerReadTools(
 
   server.tool(
     'elab_list_links',
-    'List cross-entity links. `targetKind=experiments` returns linked experiments; `targetKind=items` returns linked items; `targetKind=all` (default) returns both kinds merged.',
+    'List an entity\u2019s outgoing links. `targetKind=experiments` → linked experiments; `items` → linked items (resources); `compounds` → linked compounds (from the compound catalog); `all` (default) → all three merged. Rows render as `<kind> #<id> <title> [<category>]`, compounds as `compounds #<id> <name> | <CAS or CID>`.',
     {
       entityType: entityTypeSchema,
       id: z.number().int().positive(),
       targetKind: z
-        .enum(['experiments', 'items', 'all'])
+        .enum(['experiments', 'items', 'compounds', 'all'])
         .optional()
-        .describe('Default `all` — fetches both kinds in parallel and concatenates.'),
+        .describe('Default `all`: experiment, item and compound links merged.'),
       team: teamParamSchema,
     },
     async (args) => {
       const { entityType, id, targetKind, team } = args as {
         entityType: ElabEntityType;
         id: number;
-        targetKind?: 'experiments' | 'items' | 'all';
+        targetKind?: LinkKind | 'all';
         team?: number;
       };
       const kind = targetKind ?? 'all';
-      const t = effectiveTeam(registry, team);
-      const client = clientFor(registry, team);
       return guard(
         async () => {
-          await assertTeam(client, entityType, id, t);
-          if (kind === 'all') {
-            const [exp, items] = await Promise.all([
-              client.listLinks(entityType, id, 'experiments'),
-              client.listLinks(entityType, id, 'items'),
-            ]);
-            return [...exp, ...items];
-          }
-          return client.listLinks(entityType, id, kind);
+          const { client, entity } = await entityScope(registry, team, entityType, id);
+          const [exp, items, compounds] = await Promise.all([
+            kind === 'all' || kind === 'experiments'
+              ? linksOf(client, entityType, entity, 'experiments')
+              : [],
+            kind === 'all' || kind === 'items'
+              ? linksOf(client, entityType, entity, 'items')
+              : [],
+            kind === 'all' || kind === 'compounds'
+              ? compoundLinksOf(client, entityType, entity)
+              : [],
+          ]);
+          return { links: [...exp, ...items], compounds };
         },
-        (links) => text(formatLinks(links))
+        ({ links, compounds }) => text(formatLinks(links, compounds))
       );
     }
   );
 
   server.tool(
     'elab_list_unfinished_steps',
-    'List open checklist steps across all entities visible to the configured team key, grouped by entity kind. Useful for cohort triage (e.g. which students still have unfinished safety-check steps). Pass `team` to pick the configured key/team.',
+    'List open checklist steps in the team, grouped by entity kind. `scope=user` (default): entries you own; `scope=team`: every entry of the team you can read. Only entries belonging to the resolved team are returned. Useful for cohort triage (e.g. which students still have unfinished safety-check steps).',
     {
+      scope: z
+        .enum(['user', 'team'])
+        .optional()
+        .describe('`user` (default): your own entries. `team`: all readable entries of the team.'),
       team: teamParamSchema,
     },
     async (args) => {
-      const { team } = args as { team?: number };
+      const { scope, team } = args as { scope?: 'user' | 'team'; team?: number };
       const client = clientFor(registry, team);
       return guard(
-        async () => client.listUnfinishedSteps(),
+        async () => {
+          // Rows carry no `team`, so `filterByTeam` can't apply. eLabFTW
+          // only restricts `entity.team` to the key's team with
+          // `scope=team`; the default (own entries) also returns the
+          // user's entries from their other teams. Intersect the two.
+          const teamRows = await client.listUnfinishedSteps({ scope: 'team' });
+          if (scope === 'team') return teamRows;
+          const own = await client.listUnfinishedSteps();
+          const inTeam = (
+            kind: 'experiments' | 'items'
+          ): UnfinishedEntry[] => {
+            const ids = new Set((teamRows[kind] ?? []).map((e) => e.id));
+            return (own[kind] ?? []).filter((e) => ids.has(e.id));
+          };
+          return { experiments: inTeam('experiments'), items: inTeam('items') };
+        },
         (data) => {
           const lines: string[] = [];
           const render = (
             kind: 'experiments' | 'items',
-            entries: Array<{ id: number; title: string; steps: Array<[string, string]> }>
+            entries: UnfinishedEntry[]
           ): void => {
             if (!entries || entries.length === 0) return;
             lines.push(`## ${kind} (${entries.length})`);
@@ -582,7 +766,7 @@ export function registerReadTools(
 
   server.tool(
     'elab_list_templates',
-    'List experiment templates available in a team. Useful for discovering what template id to pass to `elab_create_entity`.',
+    'List experiment templates (`experiments_templates`) available in a team. Instantiate one with `elab_create_entity(experiments, template=<id>)`. Resource templates are listed by `elab_list_items_types`.',
     {
       q: z.string().optional(),
       limit: z.number().int().min(1).max(200).optional(),
@@ -614,7 +798,7 @@ export function registerReadTools(
 
   server.tool(
     'elab_list_items_types',
-    'List items_types (the category schemas that define what kinds of items exist in this team, e.g. "Antibody", "Reagent", "Instrument").',
+    'List resource templates (`items_types`, e.g. \"Antibody\", \"Reagent\"); instantiate one with `elab_create_entity(items, template=<id>)`. Resource categories are a separate list (`elab_list_items_categories`).',
     {
       q: z.string().optional(),
       limit: z.number().int().min(1).max(200).optional(),
@@ -709,7 +893,7 @@ export function registerReadTools(
 
   server.tool(
     'elab_me',
-    'Return the authenticated caller\u2019s user record: userid, name, email, team memberships, admin flags. Pass `team` to query via a specific configured key; omit to use the default key.',
+    'Return the authenticated caller\u2019s user record: userid, name, email, team memberships, admin flags.',
     { team: teamParamSchema },
     async (args) => {
       const { team } = args as { team?: number };
@@ -761,11 +945,9 @@ export function registerReadTools(
         id: number;
         team?: number;
       };
-      const t = effectiveTeam(registry, team);
-      const client = clientFor(registry, team);
       return guard(
         async () => {
-          await assertTeam(client, entityType, id, t);
+          const { client } = await entityScope(registry, team, entityType, id);
           return client.listRevisions(entityType, id);
         },
         (revisions) => text(formatRevisions(revisions, formatOpts))
@@ -785,7 +967,7 @@ export function registerReadTools(
         .enum(['text', 'markdown', 'html'])
         .optional()
         .describe(
-          'Body rendering: `markdown` (default) lossless HTML→markdown; `text` legacy stripped plaintext; `html` raw body.'
+          'Body format: `markdown` (default), `html` or `text`.'
         ),
     },
     async (args) => {
@@ -796,11 +978,9 @@ export function registerReadTools(
         team?: number;
         format?: 'text' | 'markdown' | 'html';
       };
-      const t = effectiveTeam(registry, team);
-      const client = clientFor(registry, team);
       return guard(
         async () => {
-          await assertTeam(client, entityType, id, t);
+          const { client } = await entityScope(registry, team, entityType, id);
           return client.getRevision(entityType, id, revisionId);
         },
         (rev) =>
@@ -816,10 +996,7 @@ export function registerReadTools(
 
   server.tool(
     'elab_list_extra_fields',
-    'List the structured `extra_fields` schema on a single entity, including group bindings, position, required/readonly flags, options, and units. ' +
-      'Complements `elab_get`’s prose `## Extra fields` block: that one is flat for human readability; this one exposes the full per-field shape an agent needs to re-create or modify a field. ' +
-      'Fields are grouped by `metadata.elabftw.extra_fields_groups`; fields without a `group_id` (or with one not in the groups list) are rendered under `(no group)`. ' +
-      'For the instance-wide index of every field key in use across all entities, use `elab_list_extra_field_names`.',
+    'List an entity\'s extra fields with their full definition (type, options, units, group, position, required / readonly), grouped as in the UI. Use before changing a field\'s definition.',
     {
       entityType: entityTypeSchema,
       id: z.number().int().positive(),
@@ -831,11 +1008,9 @@ export function registerReadTools(
         id: number;
         team?: number;
       };
-      const t = effectiveTeam(registry, team);
-      const client = clientFor(registry, team);
       return guard(
         async () => {
-          const entity = await assertTeam(client, entityType, id, t);
+          const { client, entity } = await entityScope(registry, team, entityType, id);
           return client.parseMetadata(entity);
         },
         (metadata) => {
@@ -925,7 +1100,7 @@ export function registerReadTools(
 
   server.tool(
     'elab_list_experiments_categories',
-    'List experiment categories defined in the team. Categories drive template selection on experiment create (`elab_create_entity(experiments, category_id=<id>)`) and color-code the experiment list. Returns `#<id> <title>` rows with the color hex if defined, and a `[default]` marker on the team default. Pass `team` to pick a configured team key; omit for the default.',
+    'List experiment categories (id, title, color; `[default]` marks the team default). Set one with `category` on create / update. Templates are a separate list (`elab_list_templates`).',
     { team: teamParamSchema },
     async (args) => {
       const { team } = args as { team?: number };
@@ -938,8 +1113,22 @@ export function registerReadTools(
   );
 
   server.tool(
+    'elab_list_items_categories',
+    'List resource categories (eLabFTW 6.x; id, title, color). Set one with `category` on create / update. Their ids differ from resource templates (`elab_list_items_types`), even when titles match.',
+    { team: teamParamSchema },
+    async (args) => {
+      const { team } = args as { team?: number };
+      const client = clientFor(registry, team);
+      return guard(
+        () => client.listItemsCategories(),
+        (rows) => text(formatCategoriesOrStatuses(rows, 'categories'))
+      );
+    }
+  );
+
+  server.tool(
     'elab_list_experiments_status',
-    'List experiment statuses (workflow tags like "Running", "Success", "Need to be redone", "Fail"). The `status` arg on `elab_create_entity` / `elab_update_entity` takes an id from here. Returns `#<id> <title>` rows with the color hex if defined, and a `[default]` marker on the team default. Pass `team` to pick a configured team key; omit for the default.',
+    'List experiment statuses (workflow tags like "Running", "Success", "Need to be redone", "Fail"). The `status` arg on `elab_create_entity` / `elab_update_entity` takes an id from here. Returns `#<id> <title>` rows with the color hex if defined, and a `[default]` marker on the team default.',
     { team: teamParamSchema },
     async (args) => {
       const { team } = args as { team?: number };
@@ -953,7 +1142,7 @@ export function registerReadTools(
 
   server.tool(
     'elab_list_items_status',
-    'List item (resource) statuses defined in the team — workflow tags like "In stock", "Depleted", "Ordered". The `status` arg on `elab_create_entity(items, ...)` / `elab_update_entity` takes an id from here. Returns `#<id> <title>` rows with the color hex if defined, and a `[default]` marker on the team default. Pass `team` to pick a configured team key; omit for the default.',
+    'List item (resource) statuses defined in the team — workflow tags like "In stock", "Depleted", "Ordered". The `status` arg on `elab_create_entity(items, ...)` / `elab_update_entity` takes an id from here. Returns `#<id> <title>` rows with the color hex if defined, and a `[default]` marker on the team default.',
     { team: teamParamSchema },
     async (args) => {
       const { team } = args as { team?: number };
@@ -967,7 +1156,7 @@ export function registerReadTools(
 
   server.tool(
     'elab_search_compounds',
-    'Search the team’s compound catalog (chemical substances with PubChem / CAS / InChI / SMILES identifiers and GHS hazard flags). Compounds are a first-class elabftw entity, separate from `items` / `experiments`. The `q` parameter does a server-side full-text search across name + identifiers; omit for an unfiltered listing. Returns one row per compound: `#<id> <name> | <CAS or PubChem CID> | <formula> | ⚠ <hazards>`. Use `elab_get_compound` to pull the full record. Pass `team` to pick a configured team key; omit for the default.',
+    'Search the team\'s compound catalog by name, CAS, PubChem CID, InChI / SMILES or formula (`q`; omit to list all). One row per compound with its hazards; full record via `elab_get_compound`.',
     {
       q: z
         .string()
@@ -996,7 +1185,7 @@ export function registerReadTools(
 
   server.tool(
     'elab_search_pubchem',
-    'Preview a compound from PubChem WITHOUT storing it. Useful before calling `elab_create_compound_from_pubchem` — confirms what the importer will pull in (name, CID, CAS, structure, IUPAC, and on the CAS / name paths, hazard flags). Exactly one of `cid` / `cas` / `name` must be provided. `cid` returns a single hit (no hazard flags); `cas` / `name` return arrays (with hazard flags). Prefer `cid` or `cas` over `name` (names are ambiguous).',
+    'Look up a compound on PubChem without storing it, to check what `elab_create_compound_from_pubchem` would import. Give exactly one of `cid`, `cas`, `name` (names are ambiguous).',
     {
       cid: z
         .number()
@@ -1044,7 +1233,7 @@ export function registerReadTools(
 
   server.tool(
     'elab_get_compound',
-    'Fetch a single compound by id and render its identifying fields (name, CAS, PubChem CID, ChEMBL, EC, formula, MW, IUPAC name, SMILES, InChIKey) plus a hazard summary. Compounds linked from an entity surface under `compounds_links` on `elab_get`; this tool gives the full record. Pass `team` to pick a configured team key; omit for the default.',
+    'Fetch a single compound by id and render its identifying fields (name, CAS, PubChem CID, ChEMBL, EC, formula, MW, IUPAC name, SMILES, InChIKey) plus a hazard summary. Compounds linked to an entity are listed by `elab_list_links` (and `elab_get` with `include=["links"]`); this tool gives the full record.',
     {
       id: z.number().int().positive(),
       team: teamParamSchema,
@@ -1061,7 +1250,7 @@ export function registerReadTools(
 
   server.tool(
     'elab_list_extra_field_names',
-    'List every `extra_fields` key the instance has data for, instance-wide, with usage frequency. Useful for cohort review: discovers which structured fields students are filling across templates. Rows render as `name (used N×)`, sorted by frequency desc. Note: this index does not carry field type or options — call `elab_get` on an `experiments_templates` or `items_types` id to see the per-template/per-type schema (types, options, units, groups).',
+    'List every extra-field name used across the instance, with usage counts. Names only; a field\'s type and options are on its template (`elab_list_extra_fields` on the experiments_templates / items_types entry).',
     {},
     async () =>
       guard(
@@ -1105,11 +1294,7 @@ export function registerReadTools(
 
   server.tool(
     'elab_search_users',
-    'Search users by name/email (empty `q` lists everyone visible). Returns the mapping from `userid` to identity for cross-referencing entity owners in cohort review. ' +
-      (revealUsers
-        ? 'Identity reveal is ENABLED (`ELABFTW_REVEAL_USER_IDENTITIES=true`): rows include name + email.'
-        : 'Identity reveal is DISABLED (default): rows include only `userid` and team memberships. Set `ELABFTW_REVEAL_USER_IDENTITIES=true` to surface names/emails.') +
-      ' `/users` is sysadmin-broad; team-admin keys typically succeed but are limited to users visible via team membership. 403 means the key is not admin.',
+    'Search users by name or email (empty `q` lists all visible). Needs a team-admin key. Names and emails appear only when the server sets ELABFTW_REVEAL_USER_IDENTITIES=true; otherwise rows show user ids and teams.',
     {
       q: z
         .string()
@@ -1214,7 +1399,11 @@ export function registerReadTools(
 
   server.tool(
     'elab_export',
-    'Export an entity to pdf / pdfa / zip / zipa / eln / elnhtml / qrpng / qrpdf / csv / json. Returns either text (for csv/json) or base64-encoded binary with its MIME type. Set `changelog=true` to include revision history in PDFs.',
+    'Export an entity to pdf / pdfa / zip / zipa / eln / elnhtml / qrpng / qrpdf / csv / json. csv and json (text, up to 100 KB) are returned inline. ' +
+      (config.downloadDir
+        ? 'Binary formats (pdf, zip, eln, elnhtml — a zip archive —, qr*) and larger text are saved to the local download directory; the tool returns the absolute path, size and filename. '
+        : 'Binary formats and larger text cannot be delivered by this server; the tool returns their metadata only. ') +
+      'Set `changelog=true` to include revision history in PDFs.',
     {
       entityType: entityTypeSchema,
       id: z.number().int().positive(),
@@ -1237,46 +1426,29 @@ export function registerReadTools(
       const { entityType, id, format, changelog, team } = args as {
         entityType: ElabEntityType;
         id: number;
-        format:
-          | 'csv'
-          | 'json'
-          | 'pdf'
-          | 'pdfa'
-          | 'zip'
-          | 'zipa'
-          | 'eln'
-          | 'elnhtml'
-          | 'qrpdf'
-          | 'qrpng';
+        format: keyof typeof EXPORT_EXTENSIONS;
         changelog?: boolean;
         team?: number;
       };
-      const t = effectiveTeam(registry, team);
-      const client = clientFor(registry, team);
       return guard(
         async () => {
-          await assertTeam(client, entityType, id, t);
+          const { client } = await entityScope(registry, team, entityType, id);
           const resp = await client.export(entityType, id, format, {
             changelog,
           });
-          const ct = resp.headers.get('content-type') ?? 'application/octet-stream';
-          const buf = await resp.arrayBuffer();
-          return { ct, buf };
+          const bytes = await resp.arrayBuffer();
+          const filename =
+            filenameFromDisposition(resp.headers.get('content-disposition')) ??
+            `${entityType}-${id}.${EXPORT_EXTENSIONS[format]}`;
+          return deliverFile({
+            bytes,
+            filename,
+            diskPrefix: `${entityType}-${id}-export`,
+            contentType: resp.headers.get('content-type'),
+            downloadDir: config.downloadDir,
+          });
         },
-        ({ ct, buf }) => {
-          const size = buf.byteLength;
-          const MAX = 2 * 1024 * 1024;
-          if (format === 'csv' || format === 'json' || format === 'elnhtml') {
-            const decoded = new TextDecoder('utf-8', { fatal: false }).decode(
-              new Uint8Array(buf)
-            );
-            return text(`${ct} (${size} bytes):\n\n${decoded}`);
-          }
-          const capped = size > MAX ? buf.slice(0, MAX) : buf;
-          const base64 = Buffer.from(capped).toString('base64');
-          const suffix = size > MAX ? ` (truncated from ${size} bytes)` : '';
-          return text(`${ct} (${size} bytes)${suffix}\nbase64:\n${base64}`);
-        }
+        (out) => text(out)
       );
     }
   );

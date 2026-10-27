@@ -1,8 +1,14 @@
-import { elabFetch, elabJson, extractLocationId } from './http';
+import {
+  ElabftwApiError,
+  elabFetch,
+  elabJson,
+  extractLocationId,
+} from './http';
 import type {
   ElabCategory,
   ElabComment,
   ElabCompound,
+  ElabCompoundCreateResult,
   ElabCompoundPatch,
   ElabCompoundQuery,
   ElabPubchemHit,
@@ -42,9 +48,11 @@ import type {
  *   - Honest: unknown fields survive as `unknown`; we do not pretend
  *     elabftw's shape is stable across minor versions.
  *
- * All paths documented in the OpenAPI spec map to a single method here.
- * The wrapper does not model admin-only endpoints (config, idps, audit,
- * reports); those should be added when a concrete need arises.
+ * Targets eLabFTW 6.0 (6.0.9) and stays compatible with 5.6 where the
+ * endpoint exists there (6.0-only endpoints are marked). Only the subset
+ * of the v2 API the toolkit needs is wrapped; admin-only endpoints
+ * (config, idps, audit, reports) are not. Use {@link request} for
+ * anything not covered.
  */
 export class ElabftwClient {
   constructor(private readonly config: ElabftwConfig) {}
@@ -146,8 +154,9 @@ export class ElabftwClient {
   }
 
   /**
-   * `PATCH /{entityType}/{id}` with the patch body sent directly. elabftw
-   * silently drops unknown fields.
+   * `PATCH /{entityType}/{id}` with the patch body sent directly. Every key
+   * must be a writable column: eLabFTW rejects unknown keys with
+   * `400 "Invalid update target."` (`EntityParams::getContent`).
    *
    * Do not wrap the body in `{action:'update', ...}` — modern elabftw v2
    * treats `action:'update'` as a legacy dispatch requiring `target` and
@@ -398,9 +407,8 @@ export class ElabftwClient {
    *
    * Returns the (possibly unchanged) step row.
    *
-   * Source of truth: `elabftw/src/Models/Steps.php:281-304`
-   * (`toggleFinished` — note the `deadline = null, deadline_notif = 0`
-   * in the UPDATE).
+   * Source of truth: `Steps::toggleFinished` (note the
+   * `deadline = null, deadline_notif = 0` in its UPDATE).
    */
   async toggleStep(
     entityType: ElabEntityType,
@@ -438,7 +446,7 @@ export class ElabftwClient {
    *
    * - **No `action` key on field updates.** The controller defaults to
    *   `Action::Update` when no `action` is in the body
-   *   (`Apiv2Controller::handlePatch:262-264`). The `Action::Update`
+   *   (`Apiv2Controller::handlePatch`). The `Action::Update`
    *   branch in `Steps::patch` then iterates `$params` and calls
    *   `StepParams($key, $value)` for each entry — including any `action`
    *   key the caller sent, which fails the whitelist (`body`,
@@ -457,10 +465,8 @@ export class ElabftwClient {
    *   server reads the current `deadline` to populate the notification
    *   record).
    *
-   * Source of truth: `elabftw/src/Models/Steps.php:171-200` (patch
-   * dispatcher), `elabftw/src/Params/StepParams.php` (writable columns),
-   * `elabftw/src/Controllers/Apiv2Controller.php:262-264` (default
-   * action for PATCH).
+   * Source of truth: `Steps::patch` (dispatcher), `StepParams` (writable
+   * columns), `Apiv2Controller::handlePatch` (default action for PATCH).
    */
   async updateStep(
     entityType: ElabEntityType,
@@ -508,9 +514,10 @@ export class ElabftwClient {
    * Links between entities. elabftw splits these by target kind:
    *   - `/experiments_links` when the target is an experiment
    *   - `/items_links` when the target is an item
-   *   - `/compounds_links` when the target is a compound (add/delete only;
-   *     this method does not list compound links — they're surfaced on the
-   *     parent entity via the GET handler's `compounds_links` block)
+   *   - `/compounds_links` when the target is a compound — see
+   *     {@link listCompoundLinks} / {@link addCompoundLink} /
+   *     {@link deleteCompoundLink} (compound link rows have a different
+   *     shape: they are compound records, not entity link rows).
    */
   listLinks(
     fromType: ElabEntityType,
@@ -556,6 +563,54 @@ export class ElabftwClient {
     await elabFetch(
       this.config,
       `/${fromType}/${fromId}/${sub}/${targetId}`,
+      undefined,
+      { method: 'DELETE' }
+    );
+  }
+
+  /**
+   * `GET /{entityType}/{id}/compounds_links` — compounds linked to an
+   * entity. Each row is the full compound record (`id` is the compound
+   * id), from `AbstractCompoundsLinks::readAll`; deleted compounds are
+   * excluded.
+   */
+  listCompoundLinks(
+    entityType: ElabEntityType,
+    id: number
+  ): Promise<ElabCompound[]> {
+    return elabJson(this.config, `/${entityType}/${id}/compounds_links`);
+  }
+
+  /**
+   * `POST /{entityType}/{id}/compounds_links/{compoundId}` with
+   * `{action:"create"}` — link a compound to an entity. Idempotent
+   * (`INSERT IGNORE`): re-linking an already-linked compound succeeds.
+   */
+  async addCompoundLink(
+    entityType: ElabEntityType,
+    id: number,
+    compoundId: number
+  ): Promise<void> {
+    await elabFetch(
+      this.config,
+      `/${entityType}/${id}/compounds_links/${compoundId}`,
+      undefined,
+      { method: 'POST', body: { action: 'create' } }
+    );
+  }
+
+  /**
+   * `DELETE /{entityType}/{id}/compounds_links/{compoundId}` — unlink a
+   * compound from an entity. The compound itself is untouched.
+   */
+  async deleteCompoundLink(
+    entityType: ElabEntityType,
+    id: number,
+    compoundId: number
+  ): Promise<void> {
+    await elabFetch(
+      this.config,
+      `/${entityType}/${id}/compounds_links/${compoundId}`,
       undefined,
       { method: 'DELETE' }
     );
@@ -623,12 +678,7 @@ export class ElabftwClient {
   // Global collections
   // ------------------------------------------------------------------------
 
-  /**
-   * `GET /teams/current/tags` — tags in the caller's current team.
-   *
-   * Endpoint history: `/tags` (pre-5.x) → `/team_tags` (early 5.x) →
-   * `/teams/current/tags` (5.5+). We target the current spelling.
-   */
+  /** `GET /teams/current/tags` — tags in the caller's current team. */
   listTags(query?: { q?: string }): Promise<ElabTag[]> {
     return elabJson(this.config, '/teams/current/tags', query);
   }
@@ -643,7 +693,7 @@ export class ElabftwClient {
    * Returns the new (or existing) tag id, or `null` if elabftw did not
    * surface it via the Location header.
    *
-   * Source of truth: `elabftw/src/Models/TeamTags.php:57-78`.
+   * Source of truth: `TeamTags::create`.
    */
   async createTag(tag: string): Promise<number | null> {
     const response = await elabFetch(
@@ -660,7 +710,7 @@ export class ElabftwClient {
    * elabftw first unreferences the tag from every entity that carried it,
    * then deletes the row. Resolve the id via {@link listTags} first.
    *
-   * Source of truth: `elabftw/src/Models/TeamTags.php:133-...` (destroy).
+   * Source of truth: `TeamTags::destroy`.
    */
   async deleteTag(tagId: number): Promise<void> {
     await elabFetch(
@@ -673,16 +723,29 @@ export class ElabftwClient {
 
   /**
    * `GET /teams/current/experiments_categories` — the team's experiment
-   * categories. Categories also act as template selectors on experiment
-   * create (`elab_create_entity(experiments, category_id=<id>)`) and
-   * color-code the experiment list.
+   * categories: a classification label (with color) set via an
+   * experiment's `category` field. Categories are not templates; experiment
+   * templates are `/experiments_templates` ({@link listTemplates}).
    *
-   * Source of truth: `elabftw/src/Enums/ApiSubModels.php:25`
-   * (`ExperimentsCategories = 'experiments_categories'`) +
-   * `elabftw/src/Models/AbstractStatus.php:96-123` (readAll query).
+   * Source of truth: `ApiSubModels::ExperimentsCategories` +
+   * `AbstractStatus::readAll`.
    */
   listExperimentsCategories(): Promise<ElabCategory[]> {
     return elabJson(this.config, '/teams/current/experiments_categories');
+  }
+
+  /**
+   * `GET /teams/current/resources_categories` — the team's resource (item)
+   * categories, set via an item's `category` field. eLabFTW 6.0+: resource
+   * categories are separate from resource templates (`/items_types`,
+   * {@link listItemsTypes}) — e.g. category #51 "Reaction" and items_type
+   * #33 "Reaction" are different rows. Not available on 5.x (404).
+   *
+   * Source of truth: `ApiSubModels::ResourcesCategories` +
+   * `AbstractStatus::readAll`.
+   */
+  listItemsCategories(): Promise<ElabCategory[]> {
+    return elabJson(this.config, '/teams/current/resources_categories');
   }
 
   /**
@@ -691,8 +754,7 @@ export class ElabftwClient {
    * on `elab_create_entity` / `elab_update_entity` takes an id from this
    * list.
    *
-   * Source of truth: `elabftw/src/Models/ExperimentsStatus.php` extends
-   * AbstractStatus; see `elabftw/src/Models/AbstractStatus.php:96-123`.
+   * Source of truth: `ExperimentsStatus` (extends `AbstractStatus`).
    */
   listExperimentsStatus(): Promise<ElabStatus[]> {
     return elabJson(this.config, '/teams/current/experiments_status');
@@ -704,8 +766,7 @@ export class ElabftwClient {
    * table because items can declare their own state vocabulary
    * (e.g. "In stock", "Depleted").
    *
-   * Source of truth: `elabftw/src/Models/ItemsStatus.php` extends
-   * AbstractStatus.
+   * Source of truth: `ItemsStatus` (extends `AbstractStatus`).
    */
   listItemsStatus(): Promise<ElabStatus[]> {
     return elabJson(this.config, '/teams/current/items_status');
@@ -716,7 +777,7 @@ export class ElabftwClient {
    * parameter does a server-side full-text search across name + identifiers
    * (CAS, CID, InChI, SMILES, formula).
    *
-   * Source of truth: `elabftw/src/Models/Compounds.php` (readAll).
+   * Source of truth: `Compounds::readAll`.
    */
   listCompounds(query?: ElabCompoundQuery): Promise<ElabCompound[]> {
     return elabJson(
@@ -750,14 +811,40 @@ export class ElabftwClient {
    * reconcile-on-POST PATCH that lands every non-POST-accepted field
    * the caller provided.
    *
-   * Returns the new compound id parsed from the `Location` header.
+   * Returns the new compound id parsed from the `Location` header. If the
+   * POST succeeds but the reconcile PATCH fails, this throws an
+   * {@link ElabCompoundReconcileError} that carries the new id
+   * (`compoundId`) — the compound EXISTS, so callers must not retry the
+   * create. Prefer {@link createCompoundDetailed}, which returns the id and
+   * the reconcile failure as data instead of throwing.
    *
-   * Source of truth: `elabftw/src/Models/Compounds.php:192-216`
-   * (`postAction`), `elabftw/src/Models/Compounds.php:create()` signature.
+   * Source of truth: `Compounds::postAction` / `Compounds::create`.
    */
   async createCompound(input: { name: string } & ElabCompoundPatch): Promise<
     number | null
   > {
+    const result = await this.createCompoundDetailed(input);
+    if (result.reconcileError && result.id != null) {
+      throw new ElabCompoundReconcileError(
+        result.id,
+        result.unreconciledFields ?? [],
+        result.reconcileError
+      );
+    }
+    return result.id;
+  }
+
+  /**
+   * Same as {@link createCompound}, but a failed reconcile PATCH is
+   * reported in the result instead of thrown: `{ id, reconcileError,
+   * unreconciledFields }`. `id` is the created compound (null only when
+   * elabftw returned no `Location` header). When `reconcileError` is set,
+   * the compound exists with the POST-accepted fields only; re-apply
+   * `unreconciledFields` with {@link updateCompound}.
+   */
+  async createCompoundDetailed(
+    input: { name: string } & ElabCompoundPatch
+  ): Promise<ElabCompoundCreateResult> {
     const serialized = serializeCompoundPatch(input);
     const response = await elabFetch(
       this.config,
@@ -766,24 +853,32 @@ export class ElabftwClient {
       { method: 'POST', body: { action: 'create', ...serialized } }
     );
     const id = extractLocationId(response);
-    if (id == null) return null;
+    if (id == null) return { id: null };
 
     // The reconcile patch covers everything that didn't make it onto the
-    // POST signature. We don't bother diffing against a fresh GET — the
-    // PATCH endpoint is idempotent for re-asserting fields that already
-    // landed via POST, and the cost is one extra round-trip on creates
-    // that need it.
+    // POST signature. Re-asserting fields that already landed via POST is
+    // harmless, so no diff against a fresh GET.
     const reconcilePatch: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(serialized)) {
       if (!COMPOUND_POST_ACCEPTED_FIELDS.has(k)) reconcilePatch[k] = v;
     }
-    if (Object.keys(reconcilePatch).length > 0) {
+    const fields = Object.keys(reconcilePatch);
+    if (fields.length === 0) return { id };
+    try {
       await elabFetch(this.config, `/compounds/${id}`, undefined, {
         method: 'PATCH',
         body: reconcilePatch,
       });
+      return { id };
+    } catch (error) {
+      const message =
+        error instanceof ElabftwApiError
+          ? `${error.message}${error.body ? `: ${error.body}` : ''}`
+          : error instanceof Error
+            ? error.message
+            : String(error);
+      return { id, reconcileError: message, unreconciledFields: fields };
     }
-    return id;
   }
 
   /**
@@ -820,8 +915,8 @@ export class ElabftwClient {
    * the CAS / name paths). Useful for showing the agent what a record will
    * look like before committing to a create.
    *
-   * Source of truth: `elabftw/src/Models/Compounds.php:94-101`,
-   * `elabftw/src/Services/PubChemImporter.php`.
+   * Source of truth: `Compounds::readAll` (search_pubchem_* params),
+   * `PubChemImporter`.
    */
   searchPubchemCid(cid: number): Promise<ElabPubchemHit> {
     return elabJson(this.config, '/compounds', {
@@ -858,8 +953,7 @@ export class ElabftwClient {
    * hazard flags). Returns the new compound id from the `Location`
    * header.
    *
-   * Source of truth: `elabftw/src/Models/Compounds.php:192-216` —
-   * `postAction` dispatches `Action::Duplicate` to
+   * Source of truth: `Compounds::postAction` dispatches `Action::Duplicate` to
    * `createCompoundFromIdentifier` which routes by `cid` (preferred) or
    * `cas` (fallback).
    */
@@ -884,7 +978,11 @@ export class ElabftwClient {
     return extractLocationId(response);
   }
 
-  /** `GET /users` (sysadmin) or `GET /users/search?q=...`. */
+  /**
+   * `GET /users?q=...` — users matching `q` (name / email); empty `q`
+   * lists every user the key can see (sysadmin: everyone; team admin:
+   * users of their teams).
+   */
   searchUsers(q: string): Promise<ElabUser[]> {
     return elabJson(this.config, '/users', { q });
   }
@@ -903,8 +1001,6 @@ export class ElabftwClient {
    * autocomplete / cohort discovery. Returns `[{extra_fields_key, frequency}]`
    * sorted by frequency desc. Does NOT carry per-field type/options — those
    * live inside each entity's `metadata.extra_fields[<name>]`.
-   *
-   * (Endpoint was `/extra_fields` in older versions.)
    */
   listExtraFieldNames(): Promise<ElabExtraFieldKey[]> {
     return elabJson(this.config, '/extra_fields_keys');
@@ -920,15 +1016,23 @@ export class ElabftwClient {
   }
 
   /**
-   * `GET /unfinished_steps` — open checklist items across accessible entries
-   * for the API key's team. Response groups by entity kind, with each entity
-   * carrying its open steps as `[stepId, body]` tuples (string-typed).
+   * `GET /unfinished_steps` — open checklist items, grouped by entity kind,
+   * each entity carrying its open steps as `[stepId, body]` tuples
+   * (string-typed). Rows have no `team` field.
+   *
+   * Default: the caller's own entries — from every team the caller belongs
+   * to, not only the key's team. `scope: 'team'`: every readable entry
+   * whose `team` is the key's team (`UnfinishedSteps` with `teamScoped`).
    */
-  listUnfinishedSteps(): Promise<{
+  listUnfinishedSteps(options?: { scope?: 'team' }): Promise<{
     experiments?: Array<{ id: number; title: string; steps: Array<[string, string]> }>;
     items?: Array<{ id: number; title: string; steps: Array<[string, string]> }>;
   }> {
-    return elabJson(this.config, '/unfinished_steps');
+    return elabJson(
+      this.config,
+      '/unfinished_steps',
+      options?.scope ? { scope: options.scope } : undefined
+    );
   }
 
   /** `GET /todolist` — personal todos. */
@@ -938,6 +1042,7 @@ export class ElabftwClient {
     return elabJson(this.config, '/todolist');
   }
 
+  /** `GET /experiments_templates` — experiment templates. */
   listTemplates(query?: ElabListQuery): Promise<ElabExperimentsTemplate[]> {
     return elabJson(
       this.config,
@@ -946,6 +1051,12 @@ export class ElabftwClient {
     );
   }
 
+  /**
+   * `GET /items_types` — resource templates (eLabFTW 6.0 UI: "Resource
+   * templates"; 5.x: "Resource categories"). Instantiate one with
+   * `create('items', { template: <id> })`. In 6.0 the resource *category*
+   * is a separate concept, listed by {@link listItemsCategories}.
+   */
   listItemsTypes(query?: ElabListQuery): Promise<ElabItemsType[]> {
     return elabJson(
       this.config,
@@ -1007,13 +1118,32 @@ export class ElabftwClient {
 }
 
 /**
+ * Thrown by {@link ElabftwClient.createCompound} when the compound was
+ * created but the follow-up PATCH (fields `POST /compounds` ignores)
+ * failed. The compound exists as `compoundId`; do not re-create it.
+ */
+export class ElabCompoundReconcileError extends Error {
+  constructor(
+    readonly compoundId: number,
+    readonly unreconciledFields: string[],
+    readonly reason: string
+  ) {
+    super(
+      `Compound #${compoundId} was created, but setting ${unreconciledFields.join(', ')} failed (${reason}). ` +
+        `Do not create it again; re-apply those fields with an update of compound #${compoundId}.`
+    );
+    this.name = 'ElabCompoundReconcileError';
+  }
+}
+
+/**
  * Fields that elabftw's `POST /compounds` actually persists. Everything
  * else in the request body is silently dropped (see the elabftw
  * `Compounds::postAction` create signature). The toolkit's
  * `createCompound` PATCHes the remaining fields after POST so callers
  * don't have to track the limitation themselves.
  *
- * Source of truth: `elabftw/src/Models/Compounds.php` —
+ * Source of truth: `Compounds::postAction` —
  * `postAction(... default => $this->create(name, inchi, inchi_key, smiles,
  * molecular_formula, cas_number, iupac_name, pubchem_cid, isCorrosive,
  * isSeriousHealthHazard, isExplosive, isFlammable, isGasUnderPressure,
@@ -1050,8 +1180,8 @@ const COMPOUND_POST_ACCEPTED_FIELDS = new Set<string>([
  * verbs. Undefined fields are omitted so they don't accidentally clear
  * existing values on PATCH.
  *
- * Source of truth: `elabftw/src/Params/CompoundParams.php:33-55`
- * (`is_*` columns) and `elabftw/src/Services/Filter.php:onToBinary`.
+ * Source of truth: `CompoundParams` (`is_*` columns) and
+ * `Filter::onToBinary`.
  */
 function serializeCompoundPatch(
   patch: ElabCompoundPatch

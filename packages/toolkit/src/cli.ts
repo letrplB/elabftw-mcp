@@ -19,12 +19,13 @@ import { buildElabMcpServer } from './mcp/server';
 async function main(): Promise<void> {
   const config = loadConfig();
 
-  // Validate the registry up front so the user sees a clear error before
-  // the MCP handshake instead of a tool-call failure later.
+  // Check the keys before the MCP handshake so problems show up in the
+  // client's server log. Failures are logged, not fatal; the same registry
+  // backs the server so a team resolved here is the one tools use.
   const registry = new ClientRegistry(config);
   await validateRegistry(registry, config.teamDeclaredByUser);
 
-  const server = buildElabMcpServer(config);
+  const server = buildElabMcpServer(config, { registry });
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }

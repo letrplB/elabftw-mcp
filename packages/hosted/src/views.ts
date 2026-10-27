@@ -5,16 +5,22 @@
  * Pages:
  *   - GET  /register         → renderRegisterForm
  *   - POST /register success → renderRegisterSuccess
- *   - GET  /manage           → renderManageLogin (paste eLabFTW key)
- *   - POST /manage / /mint / /revoke → renderManageList
+ *   - GET  /manage           → renderManageLogin (no session) or
+ *                              renderManageList (logged in)
+ *   - GET  /manage/<result>  → one-shot result pages (minted, revoked, …)
  *   - any error              → renderError
+ *
+ * Every interpolated value goes through `escape()` — including numbers,
+ * so a future change to a field's type can't open an injection hole.
+ * Manage forms carry only a CSRF token and a non-secret token id; the
+ * eLabFTW API key and the bearer token are never rendered into a form.
  *
  * Kept deliberately plain: this is institutional infrastructure, not a
  * marketing site. Every byte of HTML the operator might need to audit
  * lives here.
  */
 
-import type { Registration } from './store';
+import { type Registration, tokenIdOf } from './store';
 
 const LAYOUT_STYLE = `
   body { font-family: system-ui, -apple-system, sans-serif; background: #f5f5f7;
@@ -109,6 +115,13 @@ const LAYOUT_STYLE = `
   .flash.ok { background: #e8f9ee; border: 1px solid #b3e6c2; color: #1f7a3a; }
   .flash.err { background: #fdecea; border: 1px solid #f5c6c2; color: #a8261c; }
   .cross-link { margin-top: 18px; font-size: 0.9em; color: #6e6e73; }
+  select { width: 100%; padding: 10px 12px; border: 1px solid #d2d2d7;
+           border-radius: 8px; font: inherit; background: #fff; }
+  .checkbox-row input[type="checkbox"]:disabled + label { opacity: 0.6; }
+  .capped { color: #a8261c; }
+  button.link { background: none; color: #0071e3; width: auto; padding: 0;
+                margin: 0; font-weight: 400; }
+  button.link:hover { background: none; text-decoration: underline; }
 `.trim();
 
 const COPY_SCRIPT = `
@@ -135,8 +148,8 @@ const COPY_SCRIPT = `
   });
 `.trim();
 
-function escape(s: string): string {
-  return s
+function escape(s: string | number): string {
+  return String(s)
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
@@ -171,51 +184,96 @@ function copyRow(value: string): string {
 </div>`;
 }
 
+
 function formatTimestamp(iso: string | undefined): string {
   if (!iso) return 'never';
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return iso;
-  return d.toISOString().replace('T', ' ').slice(0, 16) + ' UTC';
+  return `${d.toISOString().replace('T', ' ').slice(0, 16)} UTC`;
 }
 
 /**
- * Three-checkbox permission group used on /register and /manage/mint.
- * The checkboxes default to off so a fresh registration is least-
- * privilege; the user explicitly opts into write/destructive/reveal.
+ * Operator-level upper bounds on the per-token flags (the
+ * `ELABFTW_ALLOW_*` / `ELABFTW_REVEAL_USER_IDENTITIES` env vars). A
+ * flag whose cap is off is rendered disabled with an explanation —
+ * ticking it would have no effect.
+ */
+export interface PermissionCaps {
+  allowWrites: boolean;
+  allowDestructive: boolean;
+  revealUserIdentities: boolean;
+}
+
+interface PermissionValues {
+  allowWrites: boolean;
+  allowDestructive: boolean;
+  revealUserIdentities: boolean;
+}
+
+const NO_PERMISSIONS: PermissionValues = {
+  allowWrites: false,
+  allowDestructive: false,
+  revealUserIdentities: false,
+};
+
+function cappedHint(envVar: string): string {
+  return `<span class="hint capped">Disabled by the server operator (${escape(envVar)} is off).</span>`;
+}
+
+/**
+ * Three-checkbox permission group used on /register, the mint form,
+ * and each token's edit form. Checkboxes default to off so a fresh
+ * registration is least-privilege; the user explicitly opts in.
  *
  * The destructive box's enable-state is tied to the writes box via a
  * tiny inline script — when writes is unchecked, destructive becomes
- * disabled and unchecks itself. Server-side `parseCheckbox` enforces
- * the same rule belt-and-braces.
+ * disabled and unchecks itself. The server enforces the same rule.
  */
-function permissionsFieldset(): string {
+function permissionsFieldset(
+  idPrefix: string,
+  caps: PermissionCaps,
+  current: PermissionValues = NO_PERMISSIONS
+): string {
+  const writesCapped = !caps.allowWrites;
+  const destructiveCapped = !caps.allowDestructive || !caps.allowWrites;
+  const revealCapped = !caps.revealUserIdentities;
+  const w = `${idPrefix}-w`;
+  const d = `${idPrefix}-d`;
+  const n = `${idPrefix}-n`;
+  const checked = (on: boolean, capped: boolean) => (on && !capped ? 'checked' : '');
   return `<fieldset>
 <legend>Permissions</legend>
 <div class="checkbox-row">
-  <input type="checkbox" id="allowWrites" name="allowWrites" value="on">
-  <label for="allowWrites" class="label-block">
+  <input type="checkbox" id="${escape(w)}" name="allowWrites" value="on" ${checked(current.allowWrites, writesCapped)} ${writesCapped ? 'disabled' : ''}>
+  <label for="${escape(w)}" class="label-block">
     <span class="name">Allow write tools</span>
     <span class="hint">create / update / delete entities, comments, steps, links, tags.</span>
+    ${writesCapped ? cappedHint('ELABFTW_ALLOW_WRITES') : ''}
   </label>
 </div>
 <div class="checkbox-row">
-  <input type="checkbox" id="allowDestructive" name="allowDestructive" value="on" disabled>
-  <label for="allowDestructive" class="label-block">
+  <input type="checkbox" id="${escape(d)}" name="allowDestructive" value="on" ${checked(current.allowDestructive, destructiveCapped)} disabled>
+  <label for="${escape(d)}" class="label-block">
     <span class="name">Allow destructive tools</span>
     <span class="hint">lock / sign / timestamp / bloxberg. Irreversible. Requires write tools.</span>
+    ${destructiveCapped ? cappedHint(caps.allowWrites ? 'ELABFTW_ALLOW_DESTRUCTIVE' : 'ELABFTW_ALLOW_WRITES') : ''}
   </label>
 </div>
 <div class="checkbox-row">
-  <input type="checkbox" id="revealUserIdentities" name="revealUserIdentities" value="on">
-  <label for="revealUserIdentities" class="label-block">
+  <input type="checkbox" id="${escape(n)}" name="revealUserIdentities" value="on" ${checked(current.revealUserIdentities, revealCapped)} ${revealCapped ? 'disabled' : ''}>
+  <label for="${escape(n)}" class="label-block">
     <span class="name">Reveal real names</span>
     <span class="hint">surface user names / emails / orcids in tool output. Off = "user &lt;id&gt;" only.</span>
+    ${revealCapped ? cappedHint('ELABFTW_REVEAL_USER_IDENTITIES') : ''}
   </label>
 </div>
-<script>
+${
+  destructiveCapped
+    ? ''
+    : `<script>
 (function () {
-  var w = document.getElementById('allowWrites');
-  var d = document.getElementById('allowDestructive');
+  var w = document.getElementById('${escape(w)}');
+  var d = document.getElementById('${escape(d)}');
   if (!w || !d) return;
   var sync = function () {
     d.disabled = !w.checked;
@@ -224,11 +282,38 @@ function permissionsFieldset(): string {
   w.addEventListener('change', sync);
   sync();
 })();
-</script>
+</script>`
+}
 </fieldset>`;
 }
 
-export function renderRegisterForm(defaultBaseUrl: string): string {
+/**
+ * Instance picker. With one allowed instance there's nothing to pick —
+ * we just name it and the server fills it in. With several, a select
+ * restricted to the operator's allow-list.
+ */
+function baseUrlField(allowed: string[], selected?: string): string {
+  if (allowed.length === 1) {
+    return `<p class="hint">eLabFTW instance: <code>${escape(allowed[0]!)}</code></p>`;
+  }
+  const options = allowed
+    .map(
+      (u) =>
+        `<option value="${escape(u)}"${u === selected ? ' selected' : ''}>${escape(u)}</option>`
+    )
+    .join('');
+  return `<label for="baseUrl">eLabFTW instance</label>
+  <select id="baseUrl" name="baseUrl" required>${options}</select>`;
+}
+
+function csrfField(csrf: string): string {
+  return `<input type="hidden" name="csrf" value="${escape(csrf)}">`;
+}
+
+export function renderRegisterForm(
+  allowedBaseUrls: string[],
+  caps: PermissionCaps
+): string {
   return layout(
     'Register · elabftw MCP',
     `<h1>Register an MCP token</h1>
@@ -240,22 +325,21 @@ Claude Desktop, Claude mobile, or any other MCP-aware client.</p>
   <input id="apiKey" name="apiKey" type="password" required autocomplete="off"
          placeholder="3-cb2314b00d2845…">
 
-  <label for="baseUrl">eLabFTW base URL</label>
-  <input id="baseUrl" name="baseUrl" type="url" required
-         value="${escape(defaultBaseUrl)}">
+  ${baseUrlField(allowedBaseUrls)}
 
   <label for="label">Label (optional)</label>
-  <input id="label" name="label" type="text"
+  <input id="label" name="label" type="text" maxlength="200"
          placeholder="e.g. Lab notebook · MacBook">
 
-  ${permissionsFieldset()}
+  ${permissionsFieldset('reg', caps)}
 
   <button type="submit">Generate MCP URL</button>
 </form>
 
-<p class="hint">Your key is stored on this server, encrypted only by file-system
-permissions. Treat the resulting URL as a secret — anyone with it can act on
-eLabFTW as you.</p>
+<p class="hint">Your eLabFTW API key is stored on this server encrypted
+(AES-256-GCM); the MCP token is stored only as a hash and shown exactly
+once on the next page. Treat that token as a secret — anyone with it can
+act on eLabFTW as you, within the permissions you pick here.</p>
 
 <p class="hint">Multi-team users: register with one team's key here, then add
 more teams from the manage page.</p>
@@ -265,24 +349,13 @@ more teams from the manage page.</p>
   );
 }
 
-export interface RegisterSuccessOptions {
-  /** Path of the manage page to deep-link from the success view. */
-  manageUrl?: string;
-}
-
-export function renderRegisterSuccess(
+/** URL / header / fallback-URL block shared by both "new token" pages. */
+function tokenCopyBlock(
   personalUrl: string,
   bearerUrl: string,
-  bearerToken: string,
-  options: RegisterSuccessOptions = {}
+  token: string
 ): string {
-  const headerValue = `Bearer ${bearerToken}`;
-  const manageUrl = options.manageUrl ?? '/manage';
-  return layout(
-    'Registered · elabftw MCP',
-    `<h1>You're registered.</h1>
-
-<p style="margin-top: 18px;"><strong>Recommended — Authorization header</strong></p>
+  return `<p style="margin-top: 18px;"><strong>Recommended — Authorization header</strong></p>
 
 <div class="field-label">URL</div>
 ${copyRow(bearerUrl)}
@@ -291,7 +364,7 @@ ${copyRow(bearerUrl)}
 ${copyRow('Authorization')}
 
 <div class="field-label">Header — value</div>
-${copyRow(headerValue)}
+${copyRow(`Bearer ${token}`)}
 
 <p class="hint">Paste these into a client that supports custom MCP headers
 (claude.ai Custom Connector, VS Code, mcp-inspector). Header-based auth
@@ -301,23 +374,45 @@ keeps the token out of access logs and browser history.</p>
 ${copyRow(personalUrl)}
 <p class="hint">For older clients that only accept a URL. The MCP server
 emits a <code>Deprecation</code> response header on every call when this
-path is used.</p>
+path is used.</p>`;
+}
+
+export function renderRegisterSuccess(
+  personalUrl: string,
+  bearerUrl: string,
+  bearerToken: string,
+  tokenId: string
+): string {
+  return layout(
+    'Registered · elabftw MCP',
+    `<h1>You're registered.</h1>
+<p>Copy the token now — this server only keeps a hash of it and can never
+show it again. On the manage page it appears as id
+<code>${escape(tokenId)}</code>.</p>
+
+${tokenCopyBlock(personalUrl, bearerUrl, bearerToken)}
 
 <p class="hint" style="margin-top: 24px;">The token does not expire on its
-own. Lost the link? <a href="${escape(manageUrl)}">Manage your tokens</a>
-— log in with any current eLabFTW key for this user to see and revoke it.</p>
+own. Lost it? <a href="/manage">Manage your tokens</a> — log in with any
+current eLabFTW key for this user to revoke it and mint a new one.</p>
 
 <p style="margin-top: 24px;"><a href="/register">← Register another key</a></p>`,
     true
   );
 }
 
-export function renderError(message: string): string {
+export function renderError(
+  message: string,
+  back: { href: string; label: string } = {
+    href: '/register',
+    label: 'Back to registration',
+  }
+): string {
   return layout(
     'Error · elabftw MCP',
     `<h1>Something went wrong.</h1>
 <p>${escape(message)}</p>
-<p style="margin-top: 24px;"><a href="/register">← Back to registration</a></p>`
+<p style="margin-top: 24px;"><a href="${escape(back.href)}">← ${escape(back.label)}</a></p>`
   );
 }
 
@@ -325,17 +420,17 @@ export interface JustMintedFlash {
   personalUrl: string;
   bearerUrl: string;
   token: string;
+  tokenId: string;
   label?: string;
 }
 
 /**
- * Banner-only success page reached via 303 redirect from
- * `POST /manage/mint`. Refreshing this page is harmless — the
- * one-shot cookie that fed it is already cleared, so a refresh just
- * shows the empty state. No form re-submission, no duplicate tokens.
+ * Success page reached via 303 redirect from `POST /manage/mint`. The
+ * token lives in the server-side session flash and is cleared on first
+ * render, so a refresh shows the empty state — no form re-submission,
+ * no duplicate tokens, no second chance to read the secret.
  */
 export function renderJustMinted(flash: JustMintedFlash): string {
-  const headerValue = `Bearer ${flash.token}`;
   const labelLine = flash.label
     ? `<p>Label: <strong>${escape(flash.label)}</strong></p>`
     : '';
@@ -343,22 +438,12 @@ export function renderJustMinted(flash: JustMintedFlash): string {
     'New token · elabftw MCP',
     `<h1>New token minted.</h1>
 ${labelLine}
-<p>Copy these now — the plaintext value is only shown on this page.
-Reload, navigate away, or close the tab and the value is gone for good
-(use it in a client first, or revoke + re-mint from the manage page).</p>
+<p>Copy these now — the token is only shown on this page (the server
+keeps just a hash). Reload, navigate away, or close the tab and it is
+gone for good. In your token list it appears as id
+<code>${escape(flash.tokenId)}</code>.</p>
 
-<div class="field-label">URL</div>
-${copyRow(flash.bearerUrl)}
-
-<div class="field-label">Header — name</div>
-${copyRow('Authorization')}
-
-<div class="field-label">Header — value</div>
-${copyRow(headerValue)}
-
-<p class="hint" style="margin-top: 14px;">Fallback URL with the token in
-the query string (for clients that don't support custom MCP headers):</p>
-${copyRow(flash.personalUrl)}
+${tokenCopyBlock(flash.personalUrl, flash.bearerUrl, flash.token)}
 
 <p class="cross-link" style="margin-top: 28px;"><a href="/manage">←
 Back to all my tokens</a></p>`,
@@ -367,16 +452,16 @@ Back to all my tokens</a></p>`,
 }
 
 /**
- * Empty state for `GET /manage/minted` when the one-shot cookie is
- * gone (e.g. user reloaded the success page or landed on it cold).
+ * Empty state for `GET /manage/minted` when the one-shot flash is gone
+ * (e.g. user reloaded the success page or landed on it cold).
  */
 export function renderJustMintedEmpty(): string {
   return layout(
     'New token · elabftw MCP',
     `<h1>Nothing to show.</h1>
-<p>The one-shot link to a freshly minted token has expired (cookies are
-short-lived and single-use). Mint a new token from the manage page if
-you need another.</p>
+<p>A freshly minted token is shown exactly once, and that view has
+already been used (or your manage session expired). Mint a new token
+from the manage page if you need another.</p>
 <p class="cross-link" style="margin-top: 18px;"><a href="/manage">←
 Back to manage</a></p>`
   );
@@ -392,15 +477,14 @@ export function renderJustRevoked(label: string): string {
     `<h1>Token revoked.</h1>
 <div class="flash ok" style="margin-top: 14px;">Revoked: ${escape(label)}</div>
 <p style="margin-top: 18px;">Any active MCP sessions using this token
-have been closed. Re-paste your eLabFTW key from the manage page to see
-your remaining tokens.</p>
+have been closed.</p>
 <p class="cross-link" style="margin-top: 24px;"><a href="/manage">←
 Back to manage</a></p>`
   );
 }
 
 export function renderManageLogin(
-  defaultBaseUrl: string,
+  allowedBaseUrls: string[],
   errorMessage?: string
 ): string {
   return layout(
@@ -417,12 +501,14 @@ ${errorMessage ? `<div class="flash err">${escape(errorMessage)}</div>` : ''}
   <input id="apiKey" name="apiKey" type="password" required autocomplete="off"
          placeholder="3-cb2314b00d2845…">
 
-  <label for="baseUrl">eLabFTW base URL</label>
-  <input id="baseUrl" name="baseUrl" type="url" required
-         value="${escape(defaultBaseUrl)}">
+  ${baseUrlField(allowedBaseUrls)}
 
   <button type="submit">Show my tokens</button>
 </form>
+
+<p class="hint">Logging in starts a 30-minute session on this page only.
+The API key is checked once against eLabFTW and not kept in your
+browser.</p>
 
 <p class="cross-link">No tokens yet? <a href="/register">Register one</a>.</p>`
   );
@@ -434,45 +520,56 @@ export interface ManageUser {
   email?: string;
 }
 
-export function renderManageList(
-  baseUrl: string,
-  user: ManageUser,
-  registrations: Registration[]
-): string {
+export interface ManageListOptions {
+  baseUrl: string;
+  user: ManageUser;
+  registrations: Registration[];
+  csrf: string;
+  caps: PermissionCaps;
+  maxTokens: number;
+}
+
+export function renderManageList(opts: ManageListOptions): string {
+  const { baseUrl, user, registrations, csrf, caps } = opts;
   const userLine = user.fullname
     ? `${user.fullname} · userid ${user.userid}`
     : `userid ${user.userid}`;
 
   const rows = registrations.length
     ? `<div class="token-list">${registrations
-        .map((r) => renderTokenRow(r, baseUrl))
+        .map((r) => renderTokenRow(r, csrf, caps))
         .join('')}</div>`
     : '<div class="token-list"><div class="empty-state">No tokens yet for this user on this instance.</div></div>';
+
+  const atLimit = registrations.length >= opts.maxTokens;
+  const mintSection = atLimit
+    ? `<p class="hint">You have reached the limit of ${escape(opts.maxTokens)}
+tokens on this instance. Revoke one to mint another.</p>`
+    : `<form method="post" action="/manage/mint">
+  ${csrfField(csrf)}
+  <label for="label">Label (optional)</label>
+  <input id="label" name="label" type="text" maxlength="200"
+         placeholder="e.g. Lab notebook · MacBook">
+
+  ${permissionsFieldset('mint', caps)}
+
+  <button type="submit">Mint new token</button>
+</form>`;
 
   return layout(
     'Manage tokens · elabftw MCP',
     `<h1>Your MCP tokens</h1>
 <p>${escape(userLine)} on <code>${escape(baseUrl)}</code></p>
+<form method="post" action="/manage/logout">
+  ${csrfField(csrf)}
+  <button type="submit" class="link">Log out</button>
+</form>
 
 <h2>Tokens</h2>
 ${rows}
 
 <h2>Mint a new token</h2>
-<form method="post" action="/manage/mint">
-  <input type="hidden" name="apiKey" value="${escape(getHiddenKey())}">
-  <input type="hidden" name="baseUrl" value="${escape(baseUrl)}">
-  <label for="label">Label (optional)</label>
-  <input id="label" name="label" type="text"
-         placeholder="e.g. Lab notebook · MacBook">
-
-  ${permissionsFieldset()}
-
-  <button type="submit">Mint new token</button>
-</form>
-
-<p class="hint" style="margin-top: 18px;">Re-submit your eLabFTW key from
-<a href="/manage">the manage page</a> if this form complains — for security
-the API key is not stored in your browser session.</p>`,
+${mintSection}`,
     true
   );
 }
@@ -503,7 +600,7 @@ export function renderTeamAdded(tokenLabel: string, team: number): string {
     'Team added · elabftw MCP',
     `<h1>Team added.</h1>
 <div class="flash ok" style="margin-top: 14px;">
-  Team ${team} added to <strong>${escape(tokenLabel)}</strong>.
+  Team ${escape(team)} added to <strong>${escape(tokenLabel)}</strong>.
 </div>
 <p style="margin-top: 18px;">Any in-flight MCP sessions for this token
 were closed so the next reconnect picks up the new team list. Multi-team
@@ -519,7 +616,7 @@ export function renderTeamRemoved(tokenLabel: string, team: number): string {
     'Team removed · elabftw MCP',
     `<h1>Team removed.</h1>
 <div class="flash ok" style="margin-top: 14px;">
-  Team ${team} removed from <strong>${escape(tokenLabel)}</strong>.
+  Team ${escape(team)} removed from <strong>${escape(tokenLabel)}</strong>.
 </div>
 <p style="margin-top: 18px;">The token still authenticates for the
 remaining teams. Live MCP sessions on this token were closed; new
@@ -529,36 +626,28 @@ Back to manage</a></p>`
   );
 }
 
-/**
- * Sentinel that the routes substitute with the real eLabFTW key inside
- * the form's hidden input. We never render the key itself — the
- * caller's POST handler wraps the rendered HTML and replaces this
- * marker via a separate, explicit pass.
- *
- * This is a layering escape hatch: views shouldn't know the key, but
- * the mint form needs to re-submit it. The route does the
- * substitution.
- */
-export const HIDDEN_KEY_PLACEHOLDER = '__ELAB_KEY_PLACEHOLDER__';
-function getHiddenKey(): string {
-  return HIDDEN_KEY_PLACEHOLDER;
-}
-
-function renderTokenRow(reg: Registration, baseUrl: string): string {
+function renderTokenRow(
+  reg: Registration,
+  csrf: string,
+  caps: PermissionCaps
+): string {
+  const id = tokenIdOf(reg.tokenHash);
   const labelDisplay = reg.label
     ? `<div class="label-text">${escape(reg.label)}</div>`
     : '<div class="label-text empty">(no label)</div>';
 
-  const prefix = `${reg.token.slice(0, 8)}…`;
   const teamChips = reg.keys
-    .map((k) => renderTeamChip(reg, k.team, baseUrl))
+    .map((k) => renderTeamChip(reg, k.team, csrf))
     .join('');
 
+  // Chips show *effective* permissions: the token's opt-in AND-ed with
+  // the operator cap, matching what the runtime actually exposes.
+  const writes = reg.allowWrites && caps.allowWrites;
   const flagChips: string[] = ['<span class="chip flag">read</span>'];
-  if (reg.allowWrites) flagChips.push('<span class="chip flag">write</span>');
-  if (reg.allowDestructive)
+  if (writes) flagChips.push('<span class="chip flag">write</span>');
+  if (writes && reg.allowDestructive && caps.allowDestructive)
     flagChips.push('<span class="chip flag danger">destructive</span>');
-  if (reg.revealUserIdentities)
+  if (reg.revealUserIdentities && caps.revealUserIdentities)
     flagChips.push('<span class="chip flag">names</span>');
 
   const defaultMarker =
@@ -568,34 +657,32 @@ function renderTokenRow(reg: Registration, baseUrl: string): string {
 <div>
   ${labelDisplay}
   <div class="meta">
-    <span class="token-prefix">${escape(prefix)}</span>
+    <span class="token-prefix">id ${escape(id)}</span>
     · created ${escape(formatTimestamp(reg.createdAt))}
     · last used ${escape(formatTimestamp(reg.lastUsedAt))}${escape(defaultMarker)}
   </div>
   <div class="chips">${teamChips}${flagChips.join('')}</div>
   <details class="add-team-fold">
     <summary>Edit token settings</summary>
-    ${renderEditForm(reg, baseUrl)}
+    ${renderEditForm(reg, csrf, caps)}
   </details>
   <details class="add-team-fold">
     <summary>Add a team to this token</summary>
     <form method="post" action="/manage/add-team">
-      <input type="hidden" name="apiKey" value="${escape(HIDDEN_KEY_PLACEHOLDER)}">
-      <input type="hidden" name="baseUrl" value="${escape(baseUrl)}">
-      <input type="hidden" name="token" value="${escape(reg.token)}">
+      ${csrfField(csrf)}
+      <input type="hidden" name="id" value="${escape(id)}">
       <label>Additional eLabFTW API key (must belong to the same user)</label>
       <input name="newApiKey" type="password" required autocomplete="off"
              placeholder="3-cb2314b00d2845…">
       <label>Per-team label (optional)</label>
-      <input name="keyLabel" type="text" placeholder="e.g. Teaching Group">
+      <input name="keyLabel" type="text" maxlength="200" placeholder="e.g. Teaching Group">
       <button type="submit">Add team</button>
     </form>
   </details>
 </div>
 <form method="post" action="/manage/revoke">
-  <input type="hidden" name="apiKey" value="${escape(HIDDEN_KEY_PLACEHOLDER)}">
-  <input type="hidden" name="baseUrl" value="${escape(baseUrl)}">
-  <input type="hidden" name="token" value="${escape(reg.token)}">
+  ${csrfField(csrf)}
+  <input type="hidden" name="id" value="${escape(id)}">
   <button type="submit" class="danger" onclick="return confirm('Revoke this token? This cannot be undone.');">Revoke</button>
 </form>
 </div>`;
@@ -607,13 +694,12 @@ function renderTokenRow(reg: Registration, baseUrl: string): string {
  * values. Submitting POSTs to /manage/edit; the route applies only
  * the diffs.
  */
-function renderEditForm(reg: Registration, baseUrl: string): string {
-  const labelValue = reg.label ?? '';
-  const writesChecked = reg.allowWrites ? 'checked' : '';
-  const destructiveChecked = reg.allowDestructive ? 'checked' : '';
-  const destructiveDisabled = reg.allowWrites ? '' : 'disabled';
-  const namesChecked = reg.revealUserIdentities ? 'checked' : '';
-
+function renderEditForm(
+  reg: Registration,
+  csrf: string,
+  caps: PermissionCaps
+): string {
+  const id = tokenIdOf(reg.tokenHash);
   const defaultTeamSection =
     reg.keys.length >= 2
       ? `<label>Default team (used when a tool call omits <code>team</code>)</label>
@@ -621,61 +707,23 @@ function renderEditForm(reg: Registration, baseUrl: string): string {
 ${reg.keys
   .map(
     (k) => `<label class="label-block" style="margin-right: 14px;">
-  <input type="radio" name="defaultTeam" value="${k.team}" ${k.team === reg.defaultTeam ? 'checked' : ''}>
-  team ${k.team}${k.label ? ` — ${escape(k.label)}` : ''}
+  <input type="radio" name="defaultTeam" value="${escape(k.team)}" ${k.team === reg.defaultTeam ? 'checked' : ''}>
+  team ${escape(k.team)}${k.label ? ` — ${escape(k.label)}` : ''}
 </label>`
   )
   .join('')}
 </div>`
       : '';
 
-  const formId = `edit-${reg.token.slice(0, 8)}`;
-
-  return `<form method="post" action="/manage/edit" id="${formId}">
-  <input type="hidden" name="apiKey" value="${escape(HIDDEN_KEY_PLACEHOLDER)}">
-  <input type="hidden" name="baseUrl" value="${escape(baseUrl)}">
-  <input type="hidden" name="token" value="${escape(reg.token)}">
+  return `<form method="post" action="/manage/edit">
+  ${csrfField(csrf)}
+  <input type="hidden" name="id" value="${escape(id)}">
 
   <label>Label</label>
-  <input name="label" type="text" value="${escape(labelValue)}"
+  <input name="label" type="text" maxlength="200" value="${escape(reg.label ?? '')}"
          placeholder="(empty = clear)">
 
-  <fieldset>
-    <legend>Permissions</legend>
-    <div class="checkbox-row">
-      <input type="checkbox" id="${formId}-w" name="allowWrites" value="on" ${writesChecked}>
-      <label for="${formId}-w" class="label-block">
-        <span class="name">Allow write tools</span>
-        <span class="hint">create / update / delete entities, comments, steps, links, tags.</span>
-      </label>
-    </div>
-    <div class="checkbox-row">
-      <input type="checkbox" id="${formId}-d" name="allowDestructive" value="on" ${destructiveChecked} ${destructiveDisabled}>
-      <label for="${formId}-d" class="label-block">
-        <span class="name">Allow destructive tools</span>
-        <span class="hint">lock / sign / timestamp / bloxberg. Irreversible. Requires write tools.</span>
-      </label>
-    </div>
-    <div class="checkbox-row">
-      <input type="checkbox" id="${formId}-n" name="revealUserIdentities" value="on" ${namesChecked}>
-      <label for="${formId}-n" class="label-block">
-        <span class="name">Reveal real names</span>
-        <span class="hint">surface user names / emails / orcids in tool output.</span>
-      </label>
-    </div>
-    <script>
-    (function () {
-      var w = document.getElementById('${formId}-w');
-      var d = document.getElementById('${formId}-d');
-      if (!w || !d) return;
-      var sync = function () {
-        d.disabled = !w.checked;
-        if (!w.checked) d.checked = false;
-      };
-      w.addEventListener('change', sync);
-    })();
-    </script>
-  </fieldset>
+  ${permissionsFieldset(`edit-${id}`, caps, reg)}
 
   ${defaultTeamSection}
 
@@ -687,20 +735,18 @@ ${reg.keys
  * Team chip — plain when the token has only one team (revoke covers
  * removal), with an inline remove button when the token has 2+ teams.
  */
-function renderTeamChip(
-  reg: Registration,
-  team: number,
-  baseUrl: string
-): string {
+function renderTeamChip(reg: Registration, team: number, csrf: string): string {
   if (reg.keys.length <= 1) {
-    return `<span class="chip team">team ${team}</span>`;
+    return `<span class="chip team">team ${escape(team)}</span>`;
   }
-  return `<form method="post" action="/manage/remove-team" class="chip-action" onsubmit="return confirm('Remove team ${team} from this token? The token will keep working for the remaining teams.');">
-  <input type="hidden" name="apiKey" value="${escape(HIDDEN_KEY_PLACEHOLDER)}">
-  <input type="hidden" name="baseUrl" value="${escape(baseUrl)}">
-  <input type="hidden" name="token" value="${escape(reg.token)}">
-  <input type="hidden" name="team" value="${team}">
-  <span class="chip team">team ${team}</span>
-  <button type="submit" title="Remove team ${team}">×</button>
+  const confirmMsg = escape(
+    `Remove team ${team} from this token? The token will keep working for the remaining teams.`
+  );
+  return `<form method="post" action="/manage/remove-team" class="chip-action" onsubmit="return confirm(this.dataset.confirm);" data-confirm="${confirmMsg}">
+  ${csrfField(csrf)}
+  <input type="hidden" name="id" value="${escape(tokenIdOf(reg.tokenHash))}">
+  <input type="hidden" name="team" value="${escape(team)}">
+  <span class="chip team">team ${escape(team)}</span>
+  <button type="submit" title="Remove team ${escape(team)}">×</button>
 </form>`;
 }

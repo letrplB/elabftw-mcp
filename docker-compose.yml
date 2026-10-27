@@ -5,11 +5,19 @@
 # container rebuilds.
 #
 # Required environment (set via .env or your orchestrator):
-#   ELABFTW_BASE_URL     — default base URL prefilled in the registration form
-#   MCP_PUBLIC_URL       — public origin used in personal URLs (https://mcp.example.tum.de)
+#   ELABFTW_BASE_URL     — the eLabFTW instance users register against
+#                          (also the allow-list unless MCP_ALLOWED_BASE_URLS is set)
+#   MCP_PUBLIC_URL       — public origin used in personal URLs and for the
+#                          Host/Origin allow-list (https://mcp.example.tum.de)
 #   MCP_DOMAIN           — bare hostname for Caddy's automatic TLS (mcp.example.tum.de)
-#   MCP_ALLOWED_HOSTS    — DNS-rebind protection allow-list
-#   MCP_ALLOWED_ORIGINS  — origin allow-list
+#
+# Strongly recommended:
+#   MCP_STORE_KEY        — 32-byte key (base64/hex) encrypting stored API keys.
+#                          Unset → a key file is generated on the data volume.
+#
+# Optional: MCP_ALLOWED_BASE_URLS, MCP_ALLOWED_HOSTS, MCP_ALLOWED_ORIGINS,
+# MCP_TRUST_PROXY, MCP_MAX_SESSIONS, MCP_MAX_SESSIONS_PER_TOKEN,
+# MCP_MAX_TOKENS_PER_USER, and the ELABFTW_* permission caps. See .env.example.
 
 services:
   mcp-elabftw:
@@ -21,13 +29,24 @@ services:
       - "8000"
     environment:
       ELABFTW_BASE_URL: ${ELABFTW_BASE_URL:?must be set}
+      MCP_ALLOWED_BASE_URLS: ${MCP_ALLOWED_BASE_URLS:-}
+      # Operator-level caps; per-token opt-ins are AND-ed against these.
+      ELABFTW_ALLOW_WRITES: ${ELABFTW_ALLOW_WRITES:-false}
+      ELABFTW_ALLOW_DESTRUCTIVE: ${ELABFTW_ALLOW_DESTRUCTIVE:-false}
+      ELABFTW_REVEAL_USER_IDENTITIES: ${ELABFTW_REVEAL_USER_IDENTITIES:-false}
       MCP_HOST: 0.0.0.0
       MCP_PORT: "8000"
-      MCP_PUBLIC_URL: ${MCP_PUBLIC_URL:-}
+      MCP_PUBLIC_URL: ${MCP_PUBLIC_URL:?must be set, e.g. https://<MCP_DOMAIN>}
       MCP_ALLOWED_HOSTS: ${MCP_ALLOWED_HOSTS:-}
       MCP_ALLOWED_ORIGINS: ${MCP_ALLOWED_ORIGINS:-}
+      # Caddy is the single proxy hop in front of the app.
+      MCP_TRUST_PROXY: ${MCP_TRUST_PROXY:-1}
       MCP_STORE_BACKEND: ${MCP_STORE_BACKEND:-json}
       MCP_REGISTRATIONS_PATH: ${MCP_REGISTRATIONS_PATH:-/var/lib/elabftw-mcp/registrations.json}
+      MCP_STORE_KEY: ${MCP_STORE_KEY:-}
+      MCP_MAX_SESSIONS: ${MCP_MAX_SESSIONS:-500}
+      MCP_MAX_SESSIONS_PER_TOKEN: ${MCP_MAX_SESSIONS_PER_TOKEN:-5}
+      MCP_MAX_TOKENS_PER_USER: ${MCP_MAX_TOKENS_PER_USER:-20}
     volumes:
       - mcp_registrations:/var/lib/elabftw-mcp
 

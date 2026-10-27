@@ -6,6 +6,282 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+Target is now eLabFTW **6.0** (tested against 6.0.9, the latest
+stable). 5.6 keeps working where that costs little; resource
+categories need 6.x.
+
+**Breaking changes** (details in the sections below):
+
+- `elab_sign` is removed.
+- Compound hazards are one `hazards: string[]` parameter instead of 24
+  `is_*` booleans on `elab_create_compound` / `elab_update_compound`.
+- `elab_create_entity`: `loadFieldsFromCategory` is removed and
+  `category_id` now means `template` (deprecated alias).
+- `elab_duplicate_entity`: `targetTeam` is removed.
+- `elab_lock`: `force` is removed.
+- With a single API key the `team` parameter is no longer in the tool
+  schemas.
+- `elab_download_attachment` / `elab_export` no longer return base64.
+- Hosted mode: the registration store is migrated (hashed tokens,
+  encrypted API keys) and eLabFTW base URLs must be allow-listed. Read
+  the operator notes under Security before upgrading.
+
+### Added
+
+- `elab_convert_body_to_html`: render an existing markdown body to HTML
+  in place. Handles `content_type=2` entries and entries a user flipped
+  to the rich-text editor that still hold raw markdown.
+  `elab_update_entity({ content_type: "html" })` without a `body` does
+  the same conversion.
+- `elab_list_items_categories`: resource categories
+  (`/teams/current/resources_categories`, eLabFTW 6.x). Their ids differ
+  from resource templates (`items_types`) even when titles match.
+- `elab_create_entity`: `template` (an `experiments_templates` id for
+  experiments, an `items_types` id for items) instantiates the template
+  server-side the way the UI does: body, extra-fields schema, steps,
+  links, tags, permissions and category. Fields passed alongside are
+  applied on top; `metadata` is merged into the template's, the
+  caller's winning per field. New `category` sets the experiment
+  category / resource category.
+- `elab_link_entities` / `elab_unlink_entities` / `elab_list_links`
+  accept `targetKind: "compounds"`. `elab_get` with `include: ["links"]`
+  lists linked compounds too.
+- `elab_list_unfinished_steps`: `scope` (`user`, default: entries you
+  own; `team`: every readable entry of the team).
+- `ELABFTW_TOOLSETS`: register only some tool groups (`core` always on;
+  `extra_fields`, `steps`, `comments`, `files`, `compounds`, `history`,
+  `users`, `scheduler`, `integrity`; default all). See README →
+  Toolsets for which tool is in which group.
+- `ELABFTW_DOWNLOAD_DIR` (default `<os tmpdir>/elabftw-mcp`): where
+  `elab_download_attachment` / `elab_export` save files they don't
+  return inline.
+- MCP server instructions carry the vocabulary shared by all tools
+  (entity kinds, markdown bodies, extra fields, and the `team`
+  parameter when several keys are configured).
+- Programmatic API: `ElabftwClient.listItemsCategories`,
+  `listCompoundLinks` / `addCompoundLink` / `deleteCompoundLink`,
+  `createCompoundDetailed`, `listUnfinishedSteps({ scope })`;
+  exports `markdownToHtml`, `looksLikeHtml`, `decodeStoredMarkdown`,
+  `ElabftwTransportError`, `TeamResolutionError`,
+  `ElabCompoundReconcileError`, `PACKAGE_VERSION`, `DEFAULT_USER_AGENT`.
+
+### Changed
+
+- **Agent-written bodies now open in the rich-text editor.** `body` on
+  `elab_create_entity` / `elab_update_entity` is rendered from markdown
+  to HTML client-side (via `marked`, GFM + line breaks) and stored with
+  `content_type=1`. Previously the tool description steered agents to
+  `content_type: "markdown"`, which forced elabftw's markdown editor;
+  switching such entries to the rich-text editor left users with one
+  unformatted paragraph. New `body_format: "markdown" | "html"` pins the
+  input syntax (when omitted, a body starting with a block-level HTML tag
+  is taken as HTML, anything else as markdown). `content_type: "markdown"`
+  remains as an explicit opt-in. `elab_update_entity` without
+  `content_type` keeps the entry's current editor.
+- `elab_create_entity` reconcile no longer re-PATCHes `body` when
+  elabftw merely sanitized it (HTML purifier, entity-escaping); it only
+  re-sends a body that did not land at all. `metadata` must be a JSON
+  object string (rejected otherwise). `state: "archived"` archives
+  (and locks) the entry via the archive action after creation. The
+  response names any field that could not be applied.
+- **Breaking:** `elab_create_entity`: `category_id` is a deprecated
+  alias of `template`. `loadFieldsFromCategory` is removed: the
+  template's schema now comes from server-side instantiation instead of
+  a client-side copy.
+- `elab_update_entity`: `state` goes through elabftw's archive /
+  unarchive actions (archiving also locks; un-archiving leaves the
+  entry locked). Edits to an archived entry are refused with a message
+  to un-archive first. `native` now applies `tags` (made to match
+  exactly) and `canread_base` / `canwrite_base` /
+  `canread_is_immutable` / `canwrite_is_immutable`; `metadata: null` is
+  written as `{}`. Links inside `native` are still ignored.
+- **Breaking:** `elab_lock` always sets the lock (elabftw's
+  `forcelock`), so calling it on a locked entity no longer unlocks it.
+  The `force` parameter is removed.
+- `elab_unlock` description: allowed for whoever locked the entry and
+  for admins (not "admin only").
+- **Breaking:** `elab_duplicate_entity`: `targetTeam` is removed. The
+  copy lands in the team the API key's user currently has selected; the
+  response says so when that differs from the source team.
+- **Breaking:** compound hazards are one `hazards: string[]` parameter
+  of short names (`["toxic", "flammable"]`; the `is_*` column names
+  without the prefix) replacing the 24 `is_*` booleans on
+  `elab_create_compound` / `elab_update_compound`. On update it replaces
+  the whole set; omitted, the set is left alone. `molecular_weight` is a
+  number and `pubchem_cid` an integer (strings and `null` are no longer
+  accepted).
+- `elab_create_compound` returns the new id even when the follow-up
+  PATCH for fields elabftw ignores on POST fails, and names the fields
+  to retry with `elab_update_compound` (instead of failing and inviting
+  a duplicate create).
+- `elab_update_extra_field` coerces values per field type: checkbox
+  `true` / `false` → `"on"` / `""`, numbers to strings, `null` clears.
+- `elab_clone_extra_fields_schema`: the source defines each field's
+  schema (type, options, units, group, …) and only the target's values
+  are kept; `blankValues: true` blanks the source's example values only,
+  never the target's own values.
+- `elab_set_extra_field` in `mode: "merge"` validates a new
+  `select` / `radio` value against the field's existing options when no
+  `options` are passed.
+- `elab_remove_extra_field` writes an emptied metadata blob as `{}`
+  instead of `null`.
+- **Read path.** `format: "markdown"` bodies are no longer truncated
+  (they were capped at 4000 characters, which broke read-edit-write
+  round trips); `format: "text"` keeps a 2000-character
+  preview with the notice outside the body. Tables: `colspan` is padded,
+  `|` in cells is escaped, and tables GFM cannot express (row spans,
+  nested tables) are emitted as raw HTML. `<sub>` / `<sup>` are kept;
+  HTML entities (named, Greek letters, numeric) are decoded in one pass.
+  Markdown bodies read through `elab_get` / `elab_get_revision` are
+  entity-decoded (`&gt;` → `>`, `&amp;` → `&`).
+- `elab_get` / `elab_get_bulk` reuse the steps, comments, uploads and
+  links embedded in the entity GET instead of fetching each separately.
+- **Breaking:** `elab_download_attachment` / `elab_export`: text (by
+  extension or Content-Type, valid UTF-8) up to 100 KB is returned
+  inline; binaries and larger text are saved to `ELABFTW_DOWNLOAD_DIR`
+  and the absolute path is returned. No more base64 (it cost about 1.3
+  tokens per byte and agents could not use it) and no 2 MB truncation.
+  Hosted mode returns metadata only for anything not returned inline.
+- **Breaking (schema):** with a single API key the `team` parameter is
+  dropped from every tool schema. Tool and parameter descriptions are
+  shorter. Serialized tool list with writes and destructive tools on:
+  about 89k characters before, now 48k with one key, 59k with two keys,
+  21k with `ELABFTW_TOOLSETS=core`.
+- `elab_list_templates` / `elab_list_items_types` /
+  `elab_list_experiments_categories` descriptions distinguish templates
+  (`template` on create) from categories (`category`).
+- **Network.** The request timeout covers the whole exchange including
+  reading the response body. Redirects are refused with an error that
+  says to set `ELABFTW_BASE_URL` to the final https URL (following one
+  turns POST into GET and can send the API key to another host).
+  Timeouts, redirects and connection failures raise
+  `ElabftwTransportError`. Error bodies are cut to about 1 KB with the
+  API key redacted; HTML error pages are reduced to their text; a
+  non-JSON response where JSON was expected is reported as such.
+  `ELABFTW_TIMEOUT_MS` must be a positive integer (at most 2147483647)
+  and is rejected at startup otherwise.
+- **Lazy team resolution.** With a single `ELABFTW_API_KEY` and no
+  `ELABFTW_TEAM_ID`, the server starts even if `/users/me` fails at
+  startup, logs why, and retries when a tool needs the team. Until the
+  lookup succeeds, calls that need the team return an error saying
+  what failed.
+- Version reporting: the MCP server version and the default
+  User-Agent (`sura-elabftw-mcp/<version>`) come from `package.json` at
+  build time (previously hard-coded `0.4.0` / `0.1.0`).
+- Programmatic API: `ElabCreateEntityInput` takes `template` /
+  `category` instead of `category_id`; `ElabDuplicateOptions.team` and
+  the `sign` / `exclusiveeditmode` entity actions are removed (`unarchive`
+  and `restore` added); `ElabftwClient.update` documents that elabftw
+  rejects unknown keys; `ClientRegistry.labelFor` is removed and `rekey`
+  no longer takes a label; `buildElabMcpServer` accepts a `registry`
+  option. `createCompound` throws `ElabCompoundReconcileError` (carrying
+  the new id) when only the follow-up PATCH fails.
+
+### Removed
+
+- **Breaking:** `elab_sign`. elabftw's sign action needs the user's
+  signature-key passphrase, which should not pass through an agent; sign
+  in the elabftw UI.
+
+### Fixed
+
+- The stdio CLI resolved the key's team on a different `ClientRegistry`
+  than the one the server used, so a team discovered via `/users/me` at
+  startup never reached the tools.
+- Read-merge-write extra-field tools (`elab_set_extra_field`,
+  `elab_remove_extra_field`, `elab_clone_extra_fields_schema`,
+  `elab_set_extra_field_groups`) are serialized per entity, so parallel
+  calls on one entity no longer drop each other's fields.
+- Team checks added where they were missing: `elab_update_compound` /
+  `elab_delete_compound` and compound link targets check the compound's
+  team; `elab_create_tag` / `elab_delete_tag` refuse when the key's user
+  currently has a different team selected than the call targets.
+- `elab_list_unfinished_steps` returned the caller's open steps from
+  every team they belong to; it now returns only entries of the
+  resolved team.
+- `elab_lock` on an already locked entity unlocked it (`lock` is a
+  toggle in elabftw).
+
+### Security
+
+Hosted mode (`@sura_ai/elabftw-hosted`, 0.6.0) hardening. Existing
+stores migrate on first start and existing bearer tokens keep working;
+see the operator notes at the end.
+
+- **eLabFTW base URLs are allow-listed.** The server only talks to
+  instances in `MCP_ALLOWED_BASE_URLS` (comma-separated) or, failing
+  that, `ELABFTW_BASE_URL`, and refuses to start without one. URLs are
+  canonicalised (`origin + path`; query, fragment, and userinfo
+  rejected). `/register` and `/manage` show a picker only when more than
+  one instance is allowed. Previously any URL could be submitted, which
+  made the server an open relay / SSRF probe. Tokens registered against
+  an instance that is not (or no longer) allowed get `403` on `/mcp`.
+- **Probe errors are generic.** A failed `/users/me` check returns
+  "rejected this API key" or "Could not verify this API key against
+  <url>"; upstream details are logged server-side only.
+- **Secrets at rest.** Bearer tokens are stored as `sha256(token)` only;
+  eLabFTW API keys are AES-256-GCM encrypted with a 32-byte key from
+  `MCP_STORE_KEY` (base64 or hex) or, when unset, a generated
+  `<store>.key` file (0600) with a startup warning. JSON schema v3 and
+  SQLite schema v2 stores are migrated in place (SQLite is VACUUMed so
+  no plaintext survives in free pages). The process runs with umask 077;
+  the data directory is 0700 and store, key, and SQLite `-wal`/`-shm`
+  files 0600. Because tokens can't be shown again, `/manage` lists them
+  by a non-secret id (first 12 hex chars of the hash) and a minted
+  token is shown exactly once.
+- **`/manage` uses server-side sessions.** One login with an API key
+  creates a 30-minute idle session (random id in an HttpOnly,
+  SameSite=Strict, `Path=/manage` cookie; `Secure` over https). Every
+  POST needs the session's CSRF token. The API key is no longer
+  embedded in hidden form fields, and one-shot results (minted token,
+  revoke/edit summaries) live in the session instead of client-side
+  JSON cookies. New log-out button.
+- `/register` and `/manage` responses send `Cache-Control: no-store`
+  (plus `X-Frame-Options`, `Referrer-Policy`, `nosniff`); all view
+  interpolations are HTML-escaped (team ids on the team-added/removed
+  pages were not).
+- **Resource limits.** MCP sessions are capped per token
+  (`MCP_MAX_SESSIONS_PER_TOKEN`, default 5) and globally
+  (`MCP_MAX_SESSIONS`, default 500), least-recently-used evicted, and
+  closed after 30 min without a request. Tokens per user and instance
+  are capped (`MCP_MAX_TOKENS_PER_USER`, default 20). `/register` is
+  rate-limited like `/manage`; limiter state is pruned.
+- **Request ordering on `/mcp`.** Host/Origin are validated in Express
+  middleware (from `MCP_PUBLIC_URL`, overridable via
+  `MCP_ALLOWED_HOSTS` / `MCP_ALLOWED_ORIGINS`) before any `McpServer` is
+  built, replacing the SDK's deprecated transport options; bearer auth
+  runs before the JSON body parser. `trust proxy` hops are configurable
+  via `MCP_TRUST_PROXY` (default 1).
+- Fixed: `/manage/revoke` reported success for tokens it didn't own or
+  that didn't exist (now 404); `/manage/edit` could report the wrong
+  change summary (JSON store returned live objects); the JSON store
+  could leave memory ahead of disk on a failed write (now
+  build → tmp + fsync + rename → commit). The JSON store is documented as
+  single-instance only. Dropped the bogus
+  `Link: rel="successor-version"` header on `?token=` requests.
+- Per-token write / destructive / reveal-names checkboxes are rendered
+  disabled with an explanation when the operator cap
+  (`ELABFTW_ALLOW_WRITES` / `ELABFTW_ALLOW_DESTRUCTIVE` /
+  `ELABFTW_REVEAL_USER_IDENTITIES`) is off; edits keep the stored
+  opt-in instead of clearing it.
+- Deployment: `docker-compose.yml` requires `MCP_PUBLIC_URL` and passes
+  through the `ELABFTW_*` caps and the new `MCP_*` variables; the data
+  directory in the image is 0700.
+
+**Operator notes (breaking for hosted deployments):**
+
+- Set `MCP_STORE_KEY` (`openssl rand -base64 32`) before upgrading and
+  keep a copy, or back up the generated `<MCP_REGISTRATIONS_PATH>.key`
+  right after the first start. Losing it makes stored API keys
+  unreadable and every user has to register again.
+- Make sure `ELABFTW_BASE_URL` / `MCP_ALLOWED_BASE_URLS` cover every
+  instance existing tokens use, and set `MCP_PUBLIC_URL` (required by
+  `docker-compose.yml`).
+- Backups taken before the upgrade still hold plaintext tokens and
+  keys.
+- Everyone is logged out of `/manage` on every restart (MCP tokens are
+  unaffected).
+
 ## [0.5.0] — 2026-05-13
 
 ### Fixed

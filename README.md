@@ -5,7 +5,10 @@ search, read, and (optionally) mutate experiments, items, attachments,
 comments, steps, and links in an electronic lab notebook from any
 MCP-aware AI client.
 
-Target: elabftw **5.5+** via the [API v2](https://doc.elabftw.net/api/v2/).
+Target: elabftw **6.0** (tested against 6.0.9, the latest stable) via the
+[API v2](https://doc.elabftw.net/api/v2/). 5.6 keeps working for most
+tools; resource categories (`elab_list_items_categories`, `category` on
+items) need 6.x.
 
 This repo ships **two npm packages** that share the same MCP tool
 surface but run in different shapes:
@@ -19,6 +22,81 @@ If you're a single user adding eLabFTW to your own AI client, you want
 **`@sura_ai/elabftw`** — see [Quick start](#quick-start). If you're
 running a lab server that several people will share, you want
 **`@sura_ai/elabftw-hosted`** — see [Hosted mode](#hosted-mode).
+
+> **Upgrading to 0.6?** It fixes several bugs that affected 0.5.x and
+> changes some tool parameters. Hosted operators must set up a store key
+> **before** upgrading. See [Upgrading to 0.6](#upgrading-to-06).
+
+## Upgrading to 0.6
+
+Full details are in the [CHANGELOG](CHANGELOG.md).
+
+### Bugs fixed
+
+If you used 0.5.x or earlier, these may have affected your data or
+results:
+
+- **AI-written entries were hard to edit.** Bodies were stored as
+  markdown, so entries opened in eLabFTW's markdown editor, and
+  switching to the rich-text editor showed the markdown as one
+  unformatted paragraph. Bodies are now stored as rich text (HTML).
+  Convert existing entries with `elab_convert_body_to_html`.
+- **Single-key setups without `ELABFTW_TEAM_ID` saw no data.** The
+  team was looked up on a client the server never used, so searches
+  returned "No results." and `elab_get` reported a cross-team error.
+  (Workaround on 0.5.x: set `ELABFTW_TEAM_ID`.)
+- **Creating from a template did not instantiate it.** eLabFTW ignores
+  the `category_id` the tool sent: items got no category, and
+  experiments did not get the template's body, steps, links or tags
+  (only the extra-field schema was copied).
+- **Long bodies were cut at 4,000 characters** by `elab_get`. Editing
+  such a body and writing it back deleted everything after the cut and
+  saved the truncation marker into the entry. Check long entries an
+  agent edited.
+- **Parallel extra-field edits lost data.** Several
+  `elab_set_extra_field` calls on one entry at the same time kept only
+  one of the fields.
+- **`elab_lock` unlocked already locked entries** (eLabFTW's `lock`
+  toggles).
+- `elab_clone_extra_fields_schema` with `blankValues: true` also
+  blanked values the target already had.
+- Tables with a merged title row collapsed to a single column when
+  read; attachments always came back as base64, even text files.
+- `elab_update_extra_field` failed on `true`, `null` and decimals;
+  un-archiving with `state: "normal"` always failed; `elab_sign` always
+  failed; `elab_duplicate_entity` ignored `targetTeam`.
+- Compound update / delete and tag create / delete did not check the
+  team.
+- The request timeout did not cover reading the response, so calls
+  could hang; redirects silently turned writes into reads.
+
+### Breaking changes
+
+For the stdio package these only matter if your prompts, skills or
+scripts use the parameters below:
+
+- `elab_sign` is removed; sign entries in the eLabFTW UI.
+- Compound hazards are one list, `hazards: ["toxic", "flammable"]`,
+  instead of 24 `is_*` booleans.
+- `elab_create_entity`: use `template` and `category`. `category_id` is
+  a deprecated alias of `template`; `loadFieldsFromCategory` is removed.
+- `elab_duplicate_entity` loses `targetTeam`; `elab_lock` loses `force`.
+- With one API key configured, tools no longer have a `team` parameter.
+- `elab_download_attachment` / `elab_export` no longer return base64:
+  text up to 100 KB comes back inline, anything else is saved under
+  `ELABFTW_DOWNLOAD_DIR` and the tool returns the path.
+- Redirects are not followed: `ELABFTW_BASE_URL` must be the final
+  (https) URL.
+- Programmatic API: see the CHANGELOG.
+
+### Hosted operators
+
+The registration store is migrated on first start (tokens hashed, API
+keys encrypted) and eLabFTW base URLs must now be allow-listed. Before
+upgrading, set `MCP_STORE_KEY` and keep a copy of it, set
+`MCP_PUBLIC_URL`, and make sure every instance your users registered
+against is allow-listed. Step by step:
+[Upgrading to 0.6 (hosted)](#upgrading-to-06-hosted).
 
 ## Quick start
 
@@ -69,10 +147,12 @@ team and configure them with indexed env vars:
 }
 ```
 
-Every tool now takes an optional `team` parameter. Omit for the default;
-pass `team=7` to route a call through the team-7 key. The tool
-`elab_search_all_teams` runs the same query across every configured
-team in parallel and merges results.
+With two or more keys, every tool takes an optional `team` parameter.
+Omit it for the default; pass `team=7` to route a call through the
+team-7 key. The tool `elab_search_all_teams` runs the same query across
+every configured team in parallel and merges results. With a single key
+the `team` parameter is left out of the tool schemas, since it could
+only ever take one value.
 
 ## Environment (stdio package)
 
@@ -87,35 +167,76 @@ Hosted-mode env vars are documented separately in
 | `ELABFTW_KEY_<teamId>` | one of | — | One API key per team (multi-team mode). Example: `ELABFTW_KEY_19=26-abc...`. Repeat for each team. |
 | `ELABFTW_KEY_<teamId>_LABEL` | no | — | Optional label shown by `elab_configured_teams`. |
 | `ELABFTW_DEFAULT_TEAM` | no | lowest id | In multi-team mode, which team's key is used when a tool call omits `team`. |
-| `ELABFTW_TEAM_ID` | no | auto | Single-team mode: pin the inferred team. Discovered at startup via `/users/me` when unset. |
+| `ELABFTW_TEAM_ID` | no | auto | Single-team mode: pin the team. When unset it is looked up via `/users/me`; if that fails at startup the server starts anyway and retries when a tool needs the team. |
 | `ELABFTW_ALLOW_WRITES` | no | `false` | `true` to expose create / update / delete / comment / step / link / tag tools. |
-| `ELABFTW_ALLOW_DESTRUCTIVE` | no | `false` | `true` to additionally expose lock / unlock / sign / timestamp / bloxberg / delete-entity / delete-comment / delete-tag / delete-compound. Irreversible or audit-affecting. Requires `ELABFTW_ALLOW_WRITES=true`. |
+| `ELABFTW_ALLOW_DESTRUCTIVE` | no | `false` | `true` to additionally expose lock / unlock / timestamp / bloxberg / delete-entity / delete-comment / delete-tag / delete-compound. Irreversible or audit-affecting. Requires `ELABFTW_ALLOW_WRITES=true`. |
 | `ELABFTW_REVEAL_USER_IDENTITIES` | no | `false` | `true` to surface user names / emails / orcids in formatter output. Default-off means user tools and comment listings return `user <id>` instead of PII. `elab_me` is exempt (callers always see their own identity). |
-| `ELABFTW_TIMEOUT_MS` | no | `30000` | Per-request timeout. |
+| `ELABFTW_TOOLSETS` | no | all | Comma-separated tool groups to register, or `all`. `core` is always on. See [Toolsets](#toolsets). |
+| `ELABFTW_DOWNLOAD_DIR` | no | `<os tmpdir>/elabftw-mcp` | Where `elab_download_attachment` / `elab_export` save files they don't return inline (binaries, text over 100 KB). |
+| `ELABFTW_TIMEOUT_MS` | no | `30000` | Per-request timeout in ms, covering the whole request including reading the response body. Must be a positive integer (max 2147483647); anything else is rejected at startup. |
 | `ELABFTW_USER_AGENT` | no | `sura-elabftw-mcp/<version>` | Shows up in instance access logs. |
 
 **Exactly one of `ELABFTW_API_KEY` or `ELABFTW_KEY_<teamId>` must be
 set.** Mixing the two is rejected at startup.
 
+`ELABFTW_BASE_URL` must be the final URL the instance is served from
+(usually `https://`, exact host name). The client does not follow
+redirects: following one would turn a POST into a GET and could send
+the API key to another host. A redirect is reported as an error that
+says so.
+
+### Toolsets
+
+Every MCP client without client-side tool search sends the full tool
+list with each request, so a lab can drop groups it never uses.
+`ELABFTW_TOOLSETS=extra_fields,steps` registers `core` plus those two
+groups; unset or `all` registers everything.
+
+| Toolset | Tools |
+|---|---|
+| `core` (always on) | `elab_search`, `elab_search_all_teams`, `elab_get`, `elab_get_bulk`, `elab_list_links`, `elab_list_templates`, `elab_list_items_types`, `elab_list_tags`, `elab_list_experiments_categories`, `elab_list_items_categories`, `elab_list_experiments_status`, `elab_list_items_status`, `elab_me`, `elab_info`, `elab_list_teams`, `elab_configured_teams`, `elab_create_entity`, `elab_update_entity`, `elab_convert_body_to_html`, `elab_duplicate_entity`, `elab_link_entities`, `elab_unlink_entities`, `elab_add_tag`, `elab_remove_tag`, `elab_create_tag`, `elab_delete_entity`, `elab_lock`, `elab_unlock`, `elab_delete_tag` |
+| `extra_fields` | `elab_list_extra_fields`, `elab_list_extra_field_names`, `elab_set_extra_field`, `elab_update_extra_field`, `elab_remove_extra_field`, `elab_clone_extra_fields_schema`, `elab_set_extra_field_groups` |
+| `steps` | `elab_list_steps`, `elab_list_unfinished_steps`, `elab_add_step`, `elab_update_step`, `elab_toggle_step`, `elab_delete_step` |
+| `comments` | `elab_list_comments`, `elab_add_comment`, `elab_update_comment`, `elab_delete_comment` |
+| `files` | `elab_list_attachments`, `elab_download_attachment`, `elab_export` |
+| `compounds` | `elab_search_compounds`, `elab_get_compound`, `elab_search_pubchem`, `elab_create_compound`, `elab_create_compound_from_pubchem`, `elab_update_compound`, `elab_delete_compound` |
+| `history` | `elab_list_revisions`, `elab_get_revision` |
+| `users` | `elab_search_users`, `elab_get_user`, `elab_list_team_users` |
+| `scheduler` | `elab_list_events` |
+| `integrity` | `elab_timestamp`, `elab_bloxberg` |
+
+Toolsets combine with the permission flags: write and destructive tools
+in an enabled group still need `ELABFTW_ALLOW_WRITES` /
+`ELABFTW_ALLOW_DESTRUCTIVE`, and `elab_search_all_teams` only appears
+with two or more keys. An unknown toolset name is rejected at startup.
+
+Measured size of the serialized tool list with writes and destructive
+tools on: about 48k characters with one key, 59k with two keys (the
+`team` parameter and `elab_search_all_teams` appear), 21k with
+`ELABFTW_TOOLSETS=core`. Vocabulary shared by all tools (entity kinds,
+markdown bodies, extra fields, the `team` parameter) is sent once in
+the MCP server instructions rather than in every tool description.
+
 ## Tools
 
-### Read (always enabled)
+### Read (no permission flag needed)
 
 | Tool | Purpose |
 |---|---|
-| `elab_me` | Show the user the API key is authenticated as. Accepts `team`. |
+| `elab_me` | Show the user the API key is authenticated as. |
 | `elab_info` | Instance version, PHP version, aggregate counts. |
 | `elab_search` | List experiments / items / templates / items_types within one team. Supports the elabftw `extended` DSL (`rating:5 and tag:"buffer"`). |
-| `elab_get` | Fetch a single entity with body and parsed `extra_fields`. Pass `include=["attachments","steps","comments","links"]` to fan out sub-resources in one call (cohort-review shortcut). Body rendering: `format="markdown"` (default) preserves tables + link hrefs; `format="text"` = legacy stripped plaintext; `format="html"` = raw. `view="prose"` (default) returns a markdown summary; `view="native"` returns the wire shape as JSON with `canread` / `canwrite` parsed, `metadata` as the parsed extra_fields tree, `tags` as `string[]`, and `experiments_links` / `items_links` / `compounds_links` as arrays — round-tripable through `elab_update_entity({native: ...})`. |
+| `elab_get` | Fetch a single entity with body and parsed `extra_fields`. `include=["attachments","steps","comments","links"]` adds sub-resources in the same call (links include linked compounds). Body rendering: `format="markdown"` (default) is the full body with tables and link hrefs preserved, never truncated, safe to edit and write back; `format="html"` is the raw body, never truncated; `format="text"` is a stripped 2000-character preview. `view="prose"` (default) returns a markdown summary; `view="native"` returns the record as JSON (see [Native view](#native-view--round-trippable-json)), round-trippable through `elab_update_entity({native: ...})`. |
 | `elab_get_bulk` | Fetch up to 50 entities of the same kind with shared `include` / `format` / `view`. Chunks requests into groups of 8. Each id is team-validated before fetch. `view="native"` returns a JSON array. |
 | `elab_list_attachments` | File attachment metadata on an entity. |
-| `elab_download_attachment` | Raw bytes. Text files returned as text; binary as base64. Files >2 MB are truncated with a note. |
+| `elab_download_attachment` | Text files (by extension or Content-Type, valid UTF-8) up to 100 KB are returned inline. Binaries and larger text are saved to `ELABFTW_DOWNLOAD_DIR` and the tool returns the absolute path, size and filename. In hosted mode only metadata is returned. No base64. |
 | `elab_list_comments` | Comments on an entity. |
 | `elab_list_steps` | Checklist steps. Unfinished shown as `[ ]`, finished as `[x]`. |
-| `elab_list_links` | Cross-entity links. `targetKind=experiments` / `items` for one kind; `targetKind=all` (default) merges both in parallel. |
-| `elab_list_unfinished_steps` | Open checklist steps across all entities visible to the team key. Cohort-triage shortcut. |
-| `elab_list_templates` | Experiment templates in a team. |
-| `elab_list_items_types` | Items type schemas. |
+| `elab_list_links` | An entity's outgoing links. `targetKind=experiments` / `items` / `compounds` for one kind; `targetKind=all` (default) merges all three. |
+| `elab_list_unfinished_steps` | Open checklist steps in the team, grouped by entity kind. `scope=user` (default): entries you own; `scope=team`: every readable entry of the team. Only entries of the resolved team are returned. |
+| `elab_list_templates` | Experiment templates (`experiments_templates`). Instantiate one with `elab_create_entity(experiments, template=<id>)`. |
+| `elab_list_items_types` | Resource templates (`items_types`). Instantiate one with `elab_create_entity(items, template=<id>)`. |
+| `elab_list_items_categories` | Resource categories (eLabFTW 6.x). Set one with `category` on create / update. Their ids differ from `items_types` ids even when titles match. |
 | `elab_list_tags` | Tags in a team. |
 | `elab_list_events` | Scheduler / booking events. |
 | `elab_list_teams` | All teams on the instance (for id → name mapping). Marks which teams have keys configured. |
@@ -123,39 +244,47 @@ set.** Mixing the two is rejected at startup.
 | `elab_search_users` | Search users by name/email (empty `q` lists visible). Resolves opaque `userid` to identity. Requires team-admin key. Identity fields gated behind `ELABFTW_REVEAL_USER_IDENTITIES=true`. |
 | `elab_list_extra_field_names` | Instance-wide list of every `extra_fields` key with usage counts. Returns `key (used N×)` rows for discovery; per-field type / options live in the owning template's metadata (see `elab_list_extra_fields`). |
 | `elab_list_extra_fields` | Structured per-entity view of `extra_fields` — group, name, type, value, unit, required, options, position, description. Complements the prose `## Extra fields` block in `elab_get`. |
-| `elab_list_experiments_categories` | Templates / experiment categories on the current team (id, title, color, default marker). |
+| `elab_list_experiments_categories` | Experiment categories (id, title, color, default marker). Set one with `category` on create / update. Categories are not templates. |
 | `elab_list_experiments_status` | Experiment statuses on the current team. |
 | `elab_list_items_status` | Item statuses on the current team. |
-| `elab_search_compounds` | Search the team’s compound catalog by name / CAS / PubChem CID / InChI / SMILES / formula. Server-side full-text via `q`. Returns one row per compound with a compact hazard summary. |
+| `elab_search_compounds` | Search the team’s compound catalog by name / CAS / PubChem CID / InChI / SMILES / formula (`q`; omit to list all). One row per compound with a compact hazard summary. |
 | `elab_get_compound` | Fetch one compound by id — name, identifiers (CAS, PubChem CID, ChEMBL, EC, ChEBI, KEGG, DrugBank, …), structure (InChI / SMILES / formula / MW / IUPAC), and an aggregated GHS / regulatory hazard summary. |
-| `elab_search_pubchem` | Preview a compound from PubChem WITHOUT storing it. Provide exactly one of `cid` / `cas` / `name`. CID returns one hit; CAS / name return arrays (and include hazard flags). Use to confirm what the importer will pull in before committing. |
+| `elab_search_pubchem` | Preview a compound from PubChem without storing it. Provide exactly one of `cid` / `cas` / `name`. CID returns one hit; CAS / name return arrays (and include hazard flags). |
 | `elab_list_revisions` | List body revisions for an entity. Surfaces edit history (who / when / size) for cohort review. Per-instance availability. |
 | `elab_get_revision` | Fetch one revision's body. Rendered through the markdown path (tables + hrefs preserved). |
 | `elab_get_user` | Fetch one user by `userid`. Identity fields gated behind `ELABFTW_REVEAL_USER_IDENTITIES=true`. |
 | `elab_list_team_users` | Roster for a given team. Works around the lack of a `/teams/{id}/users` endpoint by filtering `/users` client-side. Requires team-admin key. |
-| `elab_export` | PDF / PDF-A / ZIP / ZIP-A / ELN / ELN-HTML / CSV / JSON / QR-PNG / QR-PDF. |
-| `elab_search_all_teams` | (multi-team only) Fan out a search across every configured team in parallel. Accepts the same `q` / `extended` / `category` / `status` / `tags` / `owner` / `scope` / `state` / `order` / `sort` / `limit` / `offset` filters as `elab_search`. |
+| `elab_export` | PDF / PDF-A / ZIP / ZIP-A / ELN / ELN-HTML / CSV / JSON / QR-PNG / QR-PDF. CSV and JSON up to 100 KB are returned inline; everything else is saved to `ELABFTW_DOWNLOAD_DIR` and the path returned (hosted mode: metadata only). |
+| `elab_search_all_teams` | (two or more keys only) Fan out a search across every configured team in parallel. Accepts the same `q` / `extended` / `category` / `status` / `tags` / `owner` / `scope` / `state` / `order` / `sort` / `limit` / `offset` filters as `elab_search`. |
 
 ### Write (requires `ELABFTW_ALLOW_WRITES=true`)
 
 | Tool | Purpose |
 |---|---|
-| `elab_create_entity` | Create any of the four kinds (experiments, items, templates, items_types). Accepts `title` / `body` / `content_type` / `tags` / `metadata` / `category_id` plus all PATCH-symmetric fields: `date` / `rating` / `status` / `custom_id` / `canread` / `canwrite` / `state`. For `items` / `experiments` with `category_id` set, auto-loads the items_type / template's `extra_fields` schema (caller-provided `metadata` wins per-field); pass `loadFieldsFromCategory: false` to opt out. Reconcile loop re-PATCHes `metadata` / `body` / `tags` and any other field elabftw drops or normalizes on POST. |
-| `elab_update_entity` | Patch any of the four kinds. Title / body / content_type / category / status / rating / date / custom_id / metadata / permissions / `state` (`"normal"` / `"archived"` — soft-delete goes through `elab_delete_entity`). Accepts an optional `native` arg (the shape returned by `elab_get(view: "native")`) for whole-record round-trip; toolkit re-stringifies `canread` / `canwrite` / `metadata` before PATCH. Tag and link sub-arrays inside `native` are ignored — use the dedicated tag / link tools. |
-| `elab_set_extra_field` | Create-or-update one `extra_fields` entry via read-merge-PATCH. Typed: `text`, `number`, `checkbox`, `date`, `datetime-local`, `email`, `time`, `url`, `select`, `radio`, `experiments`, `items`, `users`, `compounds`, `uploads`. Validates per type (e.g. `select`/`radio` require `options`). For `experiments` / `items` / `compounds` types, also creates the entity-link unless `autoLink: false`. `mode: 'replace'` (default) writes the whole entry; `mode: 'merge'` updates only-provided properties. |
-| `elab_update_extra_field` | Value-only fast path on an existing field — bypasses the read-merge-PATCH cycle. Cannot create fields or change type / options / unit; pre-flights with a GET and returns a friendly error pointing at `elab_set_extra_field` when the field is missing. |
-| `elab_remove_extra_field` | Delete one `extra_fields` entry, prune empty groups + namespace, send `metadata: null` when the blob is empty after cleanup. `alsoUnlink: true` (default) also removes the entity-link for typed pointer fields (`experiments` / `items` / `compounds`). |
-| `elab_clone_extra_fields_schema` | Mirror the UI's "Load fields" button: copy `extra_fields` shape (plus groups) from one entity (typically an items_type / template) onto another. Target's existing per-field `value`s are preserved. `blankValues: true` strips defaults for schema-only copy. |
+| `elab_create_entity` | Create any of the four kinds (experiments, items, experiments_templates, items_types). `template` (an `experiments_templates` id for experiments, an `items_types` id for items) instantiates it server-side the way the UI does: body, extra-fields schema, steps, links, tags, permissions and category come from the template, and everything else you pass is applied on top (`metadata` is merged into the template's, yours winning per field). `category` sets the experiment category / resource category. Also accepts `title` / `body` (markdown or HTML, stored as rich text; see [Rich body rendering](#rich-body-rendering)) / `body_format` / `content_type` / `tags` / `metadata` / `date` / `rating` / `status` / `custom_id` / `canread` / `canwrite` / `state` (`archived` archives and locks the entry after creation). Fields elabftw drops on POST are re-PATCHed; the response names any field that could not be applied. `category_id` is a deprecated alias of `template`. |
+| `elab_update_entity` | Patch any of the four kinds; omitted fields stay unchanged. Title / body / `body_format` / content_type / category / status / rating / date / custom_id / metadata (replaces the whole blob) / permissions / `state`. `state: "archived"` archives and locks through elabftw's archive action; `state: "normal"` un-archives (the entry stays locked). Archived entries reject other edits until un-archived. Without `content_type` the entry keeps its current editor. Accepts `native` (the shape from `elab_get(view: "native")`) for a whole-record round-trip, including tags (made to match exactly) and permission base / immutability fields; explicit args win over `native`. Links inside `native` are ignored. Soft-delete goes through `elab_delete_entity`. |
+| `elab_set_extra_field` | Create-or-replace one `extra_fields` entry via read-merge-PATCH. Typed: `text`, `number`, `checkbox`, `date`, `datetime-local`, `email`, `time`, `url`, `select`, `radio`, `experiments`, `items`, `users`, `compounds`, `uploads`. Validates per type (e.g. `select`/`radio` require `options` and a value among them; in `mode: 'merge'` a new value is checked against the field's existing options). For `experiments` / `items` / `compounds` types, also creates the entity-link unless `autoLink: false`. `mode: 'replace'` (default) writes the whole entry; `mode: 'merge'` updates only-provided properties. |
+| `elab_update_extra_field` | Value-only fast path on an existing field (elabftw's server-side JSON_SET). Checkbox fields take `true` / `false`; numbers are sent as strings; `null` clears the value. Cannot create fields or change type / options / unit; pre-flights with a GET and returns an error pointing at `elab_set_extra_field` when the field is missing. |
+| `elab_remove_extra_field` | Delete one `extra_fields` entry and prune empty groups; an emptied blob is written as `{}`. `alsoUnlink: true` (default) also removes the entity-link for typed pointer fields (`experiments` / `items` / `compounds`). |
+| `elab_clone_extra_fields_schema` | Mirror the UI's "Load fields" button: the source defines each field's schema (type, options, units, group, …); values the target already has are kept, fields it lacks are added with the source's values. Groups merge by `id`. `blankValues: true` drops the source's example values (the target's own values are still kept). |
 | `elab_set_extra_field_groups` | Manage `metadata.elabftw.extra_fields_groups` (named clusters that organize fields in the UI). `mode: 'replace'` overwrites; `mode: 'merge'` upserts by `id`. Rejects `id=-1` (reserved for the implicit default bucket). |
-| `elab_duplicate_entity` | Duplicate with optional file copy and back-link. `targetTeam` re-targets the duplicate to a different team than the source. |
+| `elab_convert_body_to_html` | Render a markdown body (stored as `content_type=2`, or raw markdown left under `content_type=1` after a user switched editors) to HTML so the entry opens formatted in the rich-text editor. No-op on HTML bodies. |
+| `elab_duplicate_entity` | Duplicate with optional file copy and back-link. The copy lands in the team the API key's user currently has selected; the response says so when that differs from the source team. |
 | `elab_add_comment` / `elab_update_comment` | Add / edit comments. Delete is gated behind destructive — see below. |
 | `elab_add_step` / `elab_update_step` / `elab_toggle_step` / `elab_delete_step` | Manage checklist steps. `elab_add_step` accepts `deadline_notif`. `elab_update_step` edits `body` / `deadline` / `deadline_notif` in place (omitted fields untouched; pass `deadline: null` to clear). Step delete is permanent. |
-| `elab_link_entities` / `elab_unlink_entities` | Cross-entity links. Both ends must be in the same team. |
+| `elab_link_entities` / `elab_unlink_entities` | Link an entity to an experiment, item or compound (`targetKind`: `experiments` / `items` / `compounds`). Both ends must be in the same team. Linking twice is harmless. |
 | `elab_add_tag` / `elab_remove_tag` | Tag management on a single entity. |
-| `elab_create_tag` | Create a team-scoped tag without attaching it to any entity. Idempotent — elabftw's `INSERT ... ON DUPLICATE KEY UPDATE` returns the existing id on a duplicate string. Requires team-admin. |
-| `elab_create_compound` | Create a compound in the team’s catalog. Only `name` is required; everything else (PubChem / CAS / ChEMBL identifiers, InChI / SMILES / formula / MW / IUPAC name, GHS hazard flags) is optional. Hazard flags accept booleans, coerced to 0/1 on the wire. Pair with `elab_link_entities(targetKind: "compounds")` to attach the new compound to an entity. |
+| `elab_create_tag` | Create a team-scoped tag without attaching it to any entity. Idempotent — elabftw's `INSERT ... ON DUPLICATE KEY UPDATE` returns the existing id on a duplicate string. Requires team-admin. Refuses when the key's user currently has a different team selected than the one the call targets. |
+| `elab_create_compound` | Create a compound in the team’s catalog. Only `name` is required; everything else (PubChem / CAS / ChEMBL identifiers, InChI / SMILES / formula / MW / IUPAC name) is optional. Hazards are one `hazards: string[]` of short names, e.g. `["toxic", "flammable"]` (see below). If the follow-up PATCH for fields elabftw ignores on POST fails, the response still returns the new id and names the fields to retry with `elab_update_compound`. Attach with `elab_link_entities(targetKind: "compounds")`. |
 | `elab_create_compound_from_pubchem` | Create a compound by fetching its full record from PubChem. Provide `cid` (preferred) or `cas`; elabftw resolves the identifier and pulls name / structure / IUPAC / hazard flags into the new row. Preview with `elab_search_pubchem` first. |
-| `elab_update_compound` | Patch any subset of a compound’s fields. Plain PATCH — omitted fields stay untouched. Hazard flags accept booleans. |
+| `elab_update_compound` | Patch any subset of a compound’s fields; omitted fields stay untouched. `hazards` replaces the whole hazard set; omit it to keep the current one. Checks the compound's team first. |
+
+Hazard names for `hazards`: `corrosive`, `explosive`, `flammable`,
+`gas_under_pressure`, `hazardous2env`, `hazardous2health`, `oxidising`,
+`toxic`, `radioactive`, `serious_health_hazard`, `antibiotic`,
+`antibiotic_precursor`, `drug`, `drug_precursor`, `explosive_precursor`,
+`cmr`, `nano`, `controlled`, `ed2health`, `ed2env`, `pbt`, `pmt`, `vpvb`,
+`vpvm` (elabftw's `is_*` columns without the prefix).
 
 ### Destructive (requires `ELABFTW_ALLOW_DESTRUCTIVE=true`)
 
@@ -164,38 +293,58 @@ intervention. Gated behind a second flag on purpose.
 
 | Tool | Purpose |
 |---|---|
-| `elab_delete_entity` | Soft-delete (state=3). The record is still retrievable with `state=deleted`. Permanent deletion is sysadmin-only and not exposed. Gated behind destructive because even a soft-delete hides the row from default listings and can disrupt downstream readers. |
+| `elab_delete_entity` | Soft-delete (state=3). The record is still retrievable with `state=deleted` and can be restored in the elabftw UI. Permanent deletion is sysadmin-only and not exposed. Gated behind destructive because even a soft-delete hides the row from default listings and can disrupt downstream readers. |
 | `elab_delete_comment` | Permanently delete a comment. Not a soft-delete — the row is removed and the audit-trail entry shows the deletion. |
-| `elab_delete_compound` | Soft-delete a compound (state=3). Permanent deletion is sysadmin-only and not exposed. Gated behind destructive because deletion can cascade through `compounds_links` references on experiments / items, removing link end-points downstream readers depend on. |
-| `elab_lock` | Lock an entity. |
-| `elab_unlock` | Force-unlock. Admin only. |
+| `elab_delete_compound` | Soft-delete a compound (state=3). Permanent deletion is sysadmin-only and not exposed. Gated behind destructive because deletion can cascade through `compounds_links` references on experiments / items, removing link end-points downstream readers depend on. Checks the compound's team first. |
+| `elab_lock` | Lock an entity. Idempotent: an already locked entity stays locked. |
+| `elab_unlock` | Unlock an entity. Allowed for whoever locked it and for admins. |
 | `elab_timestamp` | RFC 3161 trusted timestamp. Consumes from `ts_balance`. |
 | `elab_bloxberg` | Anchor on the Bloxberg blockchain. |
-| `elab_sign` | Cryptographic signature with a configured signature key. |
-| `elab_delete_tag` | Permanently delete a team-scoped tag. Cascades — elabftw's `TeamTags::destroy` detaches the tag from every entity that referenced it before deleting the row. Gated behind destructive flag because some teams use tags as permission gates. Requires team-admin. |
+| `elab_delete_tag` | Permanently delete a team-scoped tag. Cascades — elabftw's `TeamTags::destroy` detaches the tag from every entity that referenced it before deleting the row. Gated behind destructive flag because some teams use tags as permission gates. Requires team-admin; refuses when the key's user currently has a different team selected. |
+
+There is no signing tool. elabftw's signature action needs the user's
+signature-key passphrase, which should not pass through an agent; sign
+entries in the elabftw UI.
 
 ### Rich body rendering
 
-elabftw stores each entity body with a `content_type`: **HTML (default)**
-or **markdown**. If you send a markdown-flavoured body
-(`# heading`, GFM tables, `**bold**`) under `content_type: "html"`, it
-is stored verbatim as HTML and rendered as raw characters in the UI.
+elabftw stores each entity body with a `content_type`: **HTML** (opens
+in the rich-text TinyMCE editor) or **markdown** (opens in the markdown
+editor). Lab members edit entries in the rich-text editor, and flipping
+a markdown entry to rich text in the UI does not render it: the raw
+markdown shows up as one unformatted paragraph.
 
-Both `elab_create_entity` and `elab_update_entity` accept
-`content_type: "html" | "markdown"`. Pass `"markdown"` whenever the body
-uses GFM constructs:
+So the write tools take markdown and store HTML. `body` on
+`elab_create_entity` / `elab_update_entity` may be written in markdown
+(headings, `**bold**`, lists, GFM tables, links); the toolkit renders it
+to HTML and stores it with `content_type: "html"`. Raw HTML bodies pass
+through unchanged. `body_format: "markdown" | "html"` pins the input
+syntax; when omitted it is auto-detected.
 
 ```
-elab_create_entity({ entityType: "experiments", title, body, content_type: "markdown", tags })
-elab_update_entity({ entityType: "experiments", id, content_type: "markdown", body })
+elab_create_entity({ entityType: "experiments", title, body: "## Protocol\n\n| Reagent | Amount |\n|---|---|\n| TEOS | 4 mL |", tags })
+elab_update_entity({ entityType: "experiments", id, body })
 ```
 
-elabftw's POST endpoints honor `content_type` on recent versions. On
-older instances that ignore it on POST, `elab_create_entity`
-transparently re-PATCHes after creation so the value lands and the body
-is re-served through elabftw's markdown → HTML pipeline. If the
-fallback PATCH itself fails, the tool surfaces a note in its response
-pointing you at `elab_update_entity` to retry.
+Pass `content_type: "markdown"` only when a user explicitly wants an
+entry kept in the markdown editor; the body is then stored as-is.
+`elab_update_entity` without `content_type` keeps the entry's current
+editor, so entries a user deliberately keeps in markdown stay there.
+
+Entries written before this change (or by other tools) can be fixed in
+place with `elab_convert_body_to_html`, or with
+`elab_update_entity({ content_type: "html" })` without a `body`. Both
+render the stored markdown to HTML; entries that already hold HTML are
+left alone.
+
+On the read side, `elab_get` / `elab_get_bulk` / `elab_get_revision`
+with `format: "markdown"` (default) return the full body converted back
+to markdown, never truncated, so an agent can edit it and write it
+back. Tables become GFM pipe tables (`colspan` padded with empty cells,
+`|` inside cells escaped); tables GFM cannot express (row spans, nested
+tables) stay raw HTML so no cell is lost. `<sub>` / `<sup>` are kept as
+inline HTML and HTML entities are decoded. `format: "text"` is a
+stripped 2000-character preview and is not meant for write-back.
 
 ## Working with extra fields
 
@@ -205,21 +354,28 @@ pointer to another entity, …) that live on every entity's `metadata`
 blob and render as a structured form in the elabftw UI. Three patterns
 cover the workflows that actually show up:
 
-### Pattern 1 — Inherit a schema from an items_type / template
+### Pattern 1 — Create from a template
 
-When you create an `items` or `experiments` with `category_id` set,
-the tool auto-loads the source schema:
+Pass `template` to create an `items` from a resource template
+(`items_types`) or an `experiments` from an experiment template:
 
 ```
-elab_create_entity({ entityType: "items", category_id: 32, title: "DMSN_028" })
+elab_create_entity({ entityType: "items", template: 32, title: "DMSN_028" })
 ```
 
-The new item comes back already wearing the items_type's `extra_fields`
-schema. The response message tells you how many fields were inherited.
+elabftw instantiates the template server-side, as the UI's "create
+from template" does: the new entry gets the template's body,
+`extra_fields` schema, steps, links, tags, permissions and category.
+Anything else you pass is applied on top; your own `metadata` is merged
+into the template's, yours winning per field. Omit `template` for a
+blank entity.
 
-Pass `loadFieldsFromCategory: false` for a blank entity, or pass your
-own `metadata` to override per-field — caller's metadata wins per
-field, the inherited schema fills in the rest.
+Templates and categories are different things. `elab_list_templates`
+and `elab_list_items_types` list templates (pass their ids as
+`template`); `elab_list_experiments_categories` and
+`elab_list_items_categories` list categories (pass their ids as
+`category`). On eLabFTW 6.x a resource category and a resource template
+with the same title have different ids.
 
 ### Pattern 2 — Add or update a single field
 
@@ -268,7 +424,7 @@ entity-link unless `autoLink: false`):
 }
 ```
 
-The full type vocabulary is the 15 elabftw 5.5 types: `text`,
+The full type vocabulary is the 15 elabftw extra-field types: `text`,
 `number`, `checkbox`, `date`, `datetime-local`, `email`, `time`, `url`,
 `select`, `radio`, `experiments`, `items`, `users`, `compounds`,
 `uploads`. Note that `select` is the internal type name for what the
@@ -287,9 +443,21 @@ endpoint:
 elab_update_extra_field({ entityType: "items", id: 475, fieldName: "d_H_DLS_nm", value: 84 })
 ```
 
-The tool pre-flights with a GET and returns a friendly error pointing
-at `elab_set_extra_field` if the field doesn't exist yet — previously
-this was a silent SQL no-op.
+The tool pre-flights with a GET and returns an error pointing at
+`elab_set_extra_field` if the field doesn't exist yet. Checkbox fields
+take `true` / `false`, numbers are sent as strings, and `null` clears
+the value.
+
+### Parallel calls
+
+`elab_set_extra_field`, `elab_remove_extra_field`,
+`elab_clone_extra_fields_schema` and `elab_set_extra_field_groups` read
+the whole `metadata` blob, modify it and write it back. Calls on the
+same entity are serialized inside the server, so an agent firing
+several of them in parallel does not lose fields. `elab_update_extra_field`
+writes a single value and is safe in parallel anyway. Serialization is
+per server process; edits from other clients or the UI at the same
+moment can still race.
 
 ### Discovery — listing what exists
 
@@ -305,8 +473,11 @@ this was a silent SQL no-op.
 
 `elab_clone_extra_fields_schema({sourceEntityType, sourceId,
 targetEntityType, targetId, blankValues: true})` is the agent
-equivalent of the UI's "Load fields" button. Pass `blankValues: true`
-when you want the schema shape only, not the example values.
+equivalent of the UI's "Load fields" button. The source defines each
+field's schema (type, options, units, group, …); values the target
+already has are kept, and fields it lacks are added with the source's
+values. Pass `blankValues: true` to leave out the source's example
+values; the target's own values are kept either way.
 
 ## Native view — round-trippable JSON
 
@@ -334,14 +505,19 @@ The same shape goes back through `elab_update_entity({native: ...})` —
 the toolkit re-stringifies `canread` / `canwrite` / `metadata` before
 PATCH. Only fields present in the supplied object are written; omitted
 fields stay untouched. Explicit individual args (`title`, `body`, …)
-win over `native` when both are passed.
+win over `native` when both are passed. Specifically:
 
-Tag and link sub-arrays inside `native` are **not** applied on update.
-Use `elab_add_tag` / `elab_remove_tag` and
-`elab_link_entities` / `elab_unlink_entities` for those. The native
-shape is round-trippable for the entity's *own* fields; relationships
-sit on separate endpoints and stay there to keep PATCH semantics
-predictable.
+- `tags` is applied: the entity's tags are made to match the array
+  exactly (missing ones added, extra ones removed).
+- `canread_base` / `canwrite_base` / `canread_is_immutable` /
+  `canwrite_is_immutable` are written.
+- `state` goes through elabftw's archive / unarchive actions rather
+  than a field PATCH. Archiving also locks the entry; archived entries
+  reject edits until un-archived.
+- `metadata: null` is written as `{}` (clears the blob).
+
+Link arrays inside `native` are **not** applied on update. Use
+`elab_link_entities` / `elab_unlink_entities` for those.
 
 For typed single-field edits (`extra_fields[<name>].value`), keep using
 `elab_set_extra_field` / `elab_update_extra_field` — those handle
@@ -352,8 +528,9 @@ the read-modify-write loop doesn't.
 
 ## How team scoping works
 
-Every tool that touches team-scoped data accepts an optional
-`team: number` argument:
+With two or more keys configured, every tool that touches team-scoped
+data accepts an optional `team: number` argument (with a single key the
+argument is not offered):
 
 - **Without `team`** the default team's key is used (lowest configured
   id, or whatever `ELABFTW_DEFAULT_TEAM` says).
@@ -372,7 +549,15 @@ the UI.
 **Startup self-check** calls `/users/me` with every configured key
 and logs a stderr warning if a key's current team doesn't match its
 declared index. Non-fatal, but usually means `elab_create_entity`
-would create entries in the wrong team.
+would create entries in the wrong team. `elab_create_tag` and
+`elab_delete_tag` act on the key's *current* team and refuse to run on
+such a mismatch.
+
+With a single `ELABFTW_API_KEY` and no `ELABFTW_TEAM_ID`, the key's
+team is looked up via `/users/me`. If that fails at startup (instance
+unreachable, VPN down), the server still starts, logs the reason, and
+retries the lookup when a tool needs the team. Calls that need the team
+return an error explaining what failed until the lookup succeeds.
 
 This is a soft guardrail running in the MCP process, not in elabftw.
 For hard isolation, use an account that is only a member of the
@@ -425,19 +610,28 @@ sanity-check that tool exists for.
   string (or use `elab_update_extra_field` for targeted edits).
 - **Pagination is offset-based with no total count.** Tools cap at 200
   rows per call; use `offset` to page further.
-- **Locked entities reject edits.** `elab_update_entity` will fail on a
-  locked entry. `elab_unlock` is available under
-  `ELABFTW_ALLOW_DESTRUCTIVE`.
+- **Locked and archived entities reject edits.** `elab_update_entity`
+  fails on a locked entry; `elab_unlock` is available under
+  `ELABFTW_ALLOW_DESTRUCTIVE`. Archiving also locks, so an archived
+  entry needs `state: "normal"` and then `elab_unlock` before it can be
+  edited.
 - **Upload `type` field is the parent entity type, not MIME.** The
-  attachment formatter uses the filename extension instead.
+  download tools decide text vs binary from the filename extension and
+  the response Content-Type.
 - **Attachment uploads are not exposed.** `elab_list_attachments` and
   `elab_download_attachment` are available, but there is currently no
   MCP tool for adding files to an entry — those still need to go
   through the elabftw UI. The underlying client method
   (`ElabftwClient.uploadFile`) exists for programmatic use.
-- **Bodies are HTML by default on create.** Pass
-  `content_type: "markdown"` to `elab_create_entity` for markdown bodies
-  — see "Rich body rendering" above.
+- **Write bodies in markdown.** They are converted to HTML and stored
+  for the rich-text editor; see "Rich body rendering" above. Pass
+  `content_type: "markdown"` only when a user wants the markdown editor.
+- **Redirects are not followed.** Set `ELABFTW_BASE_URL` to the final
+  URL (usually `https://`, exact host name). Error messages carry at
+  most about 1 KB of the instance's response, with the API key
+  redacted.
+- **Signing is not exposed.** It needs the user's signature-key
+  passphrase; use the elabftw UI.
 
 ## Programmatic use
 
@@ -492,26 +686,47 @@ to reach it.
 
 ### Two-layer session model
 
-- **Registration** (durable). One per user. Maps a 256-bit bearer
-  token to that user's `apiKey` + `baseUrl` + eLabFTW `userid`.
-  Created via `/register`, persisted to a JSON file (default) or
-  SQLite (opt-in), survives restart.
+- **Registration** (durable). One per token. Maps a 256-bit bearer
+  token to that user's eLabFTW API key(s), instance URL and eLabFTW
+  `userid`. Created via `/register`, persisted to a JSON file (default)
+  or SQLite (opt-in), survives restart. The store holds only
+  `sha256(token)` and the API keys encrypted (see
+  [Secrets at rest](#secrets-at-rest)).
 - **MCP session** (ephemeral). One per active MCP connection,
   identified by the `Mcp-Session-Id` header per spec. Lives in memory;
   clients reconnect cheaply and persisting these across restarts buys
-  nothing.
+  nothing. Sessions close after 30 minutes without a request and are
+  capped per token and globally (least recently used evicted first).
 
 A registration is the long-lived "account"; a session is the per-tab
 connection.
 
+### Allowed eLabFTW instances
+
+The server only ever talks to eLabFTW instances on an operator
+allow-list: `MCP_ALLOWED_BASE_URLS` (comma-separated) or, when that is
+unset, `ELABFTW_BASE_URL`. It refuses to start without one. Users
+cannot type in a URL: with one allowed instance the forms just name it,
+with several they show a picker. Tokens registered against an instance
+that is not (or no longer) on the list get `403` on `/mcp`.
+
 ### Self-service token management
 
-`/manage` is a paste-your-eLabFTW-key page. Users see every token
-registered for *their eLabFTW user* (joined by `userid`, not API-key
-value, so rotating their eLabFTW key keeps every token visible),
-revoke any of them, or mint a fresh one. Cross-linked from
-`/register` and the post-registration success page so "lost the link"
-has a one-click recovery path.
+`/manage` is the token management page. Users log in by pasting an
+eLabFTW API key once; that creates a server-side session (HttpOnly,
+SameSite=Strict cookie scoped to `/manage`, 30 minutes idle) and every
+form on the page carries a CSRF token. There is a log-out button.
+Logged in, users see every token registered for *their eLabFTW user* on
+that instance (joined by `userid`, not API-key value, so rotating their
+eLabFTW key keeps every token visible), revoke any of them, or mint a
+fresh one. Cross-linked from `/register` and the post-registration
+success page so "lost the link" has a one-click recovery path.
+
+**Tokens are shown once.** The server stores only a hash, so a token
+is displayed exactly once, on the page right after `/register` or
+*Mint a new token*. `/manage` lists tokens by label and a non-secret
+id (the first 12 hex characters of the hash). A lost token cannot be
+recovered: mint a new one and revoke the old one.
 
 **Per-token permission flags.** The `/register` and *Mint a new
 token* forms expose three checkboxes — *Allow write tools*, *Allow
@@ -519,7 +734,8 @@ destructive tools*, *Reveal real names*. Each token carries its own
 set; effective behaviour at request time is the AND of the
 registration setting and the operator's env-var setting (the env
 vars listed in the *Environment* section below cap institutional
-policy; the registration opts in). A PI can mint themselves a
+policy; the registration opts in). A checkbox whose operator cap is
+off is shown disabled with an explanation. A PI can mint themselves a
 read-write token and student tokens that stay read-only on the same
 server.
 
@@ -542,8 +758,8 @@ permissions or default team change so the next reconnect picks up the
 new shape.
 
 There is no admin dashboard — operators still SSH in for sysadmin-
-grade actions (banning a user, bulk audit). The plain JSON / SQLite
-file is the source of truth.
+grade actions (banning a user, bulk audit). The JSON / SQLite store is
+the source of truth.
 
 ### Quick start — choose your stack
 
@@ -556,7 +772,7 @@ If your VPS already runs Coolify (or Dokploy, CapRover, etc.), the bundled
 handles TLS, you don't ship Caddy.
 
 1. **Coolify → New Resource → Public Repository.** Point at this repo, set
-   the branch (`main` once merged, otherwise `feat/hosted-mode`).
+   the branch (`main`).
 2. **Build pack:** `Dockerfile` (Coolify auto-detects from the file at the
    repo root).
 3. **Domain:** `mcp.example.tum.de`. Coolify provisions a Let's Encrypt cert
@@ -566,21 +782,24 @@ handles TLS, you don't ship Caddy.
 
    | Key | Value |
    |---|---|
-   | `ELABFTW_BASE_URL` | `https://elab.example.com` |
+   | `ELABFTW_BASE_URL` | `https://elab.example.com` (the instance users register against) |
    | `MCP_PUBLIC_URL` | `https://mcp.example.tum.de` |
-   | `MCP_ALLOWED_HOSTS` | `mcp.example.tum.de` |
-   | `MCP_ALLOWED_ORIGINS` | `https://mcp.example.tum.de` |
+   | `MCP_STORE_KEY` | output of `openssl rand -base64 32` (keep a copy outside the server) |
    | `ELABFTW_ALLOW_WRITES` | `true` (optional) |
    | `MCP_STORE_BACKEND` | `json` (default) or `sqlite` |
 
-   `MCP_HOST` / `MCP_PORT` / `MCP_REGISTRATIONS_PATH` are pre-set in
-   the Dockerfile — Coolify inherits them, no need to repeat. For
+   `MCP_ALLOWED_HOSTS` / `MCP_ALLOWED_ORIGINS` are derived from
+   `MCP_PUBLIC_URL`; set them only to accept additional values.
+   `MCP_TRUST_PROXY=1` (the default) fits Traefik as the single proxy
+   hop. `MCP_HOST` / `MCP_PORT` / `MCP_REGISTRATIONS_PATH` are pre-set
+   in the Dockerfile — Coolify inherits them, no need to repeat. For
    SQLite, point `MCP_REGISTRATIONS_PATH` at a `.db` file under the
    same volume mount.
 
 6. **Persistent storage** (Coolify UI → Storages → Add). Mount a named
-   volume at `/var/lib/elabftw-mcp` — that's where the JSON registrations
-   file lives. Without this, every container rebuild wipes your users.
+   volume at `/var/lib/elabftw-mcp` — that's where the registrations
+   store lives (and the generated key file, if `MCP_STORE_KEY` is
+   unset). Without this, every container rebuild wipes your users.
 7. **Deploy.** Coolify pulls, builds, runs, exposes the domain.
    `https://mcp.example.tum.de/healthz` should return `ok` once the
    healthcheck passes (~30s after first start).
@@ -594,14 +813,15 @@ Use this if your VPS doesn't run a PaaS and you want a full stack in one
 command.
 
 ```bash
-cp .env.example .env  # set ELABFTW_BASE_URL, MCP_DOMAIN, MCP_PUBLIC_URL
+cp .env.example .env  # set ELABFTW_BASE_URL, MCP_DOMAIN, MCP_PUBLIC_URL, MCP_STORE_KEY
 docker compose up -d
 ```
 
-Caddy auto-provisions a Let's Encrypt cert for `MCP_DOMAIN` and
-reverse-proxies to the MCP container. Registrations persist to a
-named volume (`mcp_registrations`) so container rebuilds don't lose
-users. Tail logs with `docker compose logs -f mcp-elabftw`.
+`docker-compose.yml` refuses to start without `ELABFTW_BASE_URL` and
+`MCP_PUBLIC_URL`. Caddy auto-provisions a Let's Encrypt cert for
+`MCP_DOMAIN` and reverse-proxies to the MCP container. Registrations
+persist to a named volume (`mcp_registrations`) so container rebuilds
+don't lose users. Tail logs with `docker compose logs -f mcp-elabftw`.
 
 Once it's up, point a browser at `https://${MCP_DOMAIN}/register`,
 fill the form, copy the URL the success page returns, and paste it
@@ -616,6 +836,8 @@ Pre-flight check the night before:
   Note: the MCP container's `EXPOSE 8000` is *internal* — it's reached via
   the reverse proxy (Coolify's Traefik or the bundled Caddy) on 443; you
   do not open 8000 publicly.
+- Store key: `MCP_STORE_KEY` is set and backed up, or you know where
+  the generated key file is (see [Secrets at rest](#secrets-at-rest)).
 
 ### Auth
 
@@ -638,14 +860,20 @@ because some MCP clients still only accept a single URL string.
 
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
-| `ELABFTW_BASE_URL` | yes | — | Default base URL prefilled into the registration form. |
+| `ELABFTW_BASE_URL` | yes, unless `MCP_ALLOWED_BASE_URLS` is set | — | The eLabFTW instance users register against. Also the allow-list when `MCP_ALLOWED_BASE_URLS` is unset. |
+| `MCP_ALLOWED_BASE_URLS` | no | `ELABFTW_BASE_URL` | Comma-separated allow-list of eLabFTW instances. With more than one, `/register` and `/manage` show a picker. Entries are canonicalised (origin + path; query, fragment and userinfo rejected). |
+| `MCP_PUBLIC_URL` | yes (compose); recommended otherwise | — | Public origin for personal URLs (e.g. `https://mcp.example.tum.de`). Also the source of the Host / Origin allow-list. Without it (and without `MCP_ALLOWED_HOSTS`) only requests addressed to the bind address are accepted. |
+| `MCP_STORE_KEY` | strongly recommended | generated key file | 32-byte key, base64 or hex (`openssl rand -base64 32`), that encrypts the stored API keys. When unset, the server generates `<MCP_REGISTRATIONS_PATH>.key` (mode 0600) on first start and logs a warning. Changing or losing the key makes existing registrations unreadable. |
 | `MCP_HOST` | no | `0.0.0.0` | Bind address. Behind a reverse proxy, leave at `0.0.0.0`. |
 | `MCP_PORT` | no | `8000` | Bind port. |
-| `MCP_PUBLIC_URL` | recommended | derived | Public origin for personal URLs (e.g. `https://mcp.example.tum.de`). Also auto-derives the DNS-rebind allow-list. Without this you get a startup warning and fallback to bind-address-only. |
-| `MCP_STORE_BACKEND` | no | `json` | `json` (default; atomic-write JSON file, fine to a few hundred tokens) or `sqlite` (`better-sqlite3`, WAL, indexed lookups, recommended for institutional scale). |
+| `MCP_STORE_BACKEND` | no | `json` | `json` (default; atomic-write JSON file, fine to a few hundred tokens, single server process only) or `sqlite` (`better-sqlite3`, WAL, indexed lookups, recommended for institutional scale). |
 | `MCP_REGISTRATIONS_PATH` | no | `./registrations.json` | Where the store lives. JSON file or SQLite database depending on `MCP_STORE_BACKEND`. Mount a volume here in Docker. The Dockerfile sets it to `/var/lib/elabftw-mcp/registrations.json`. |
-| `MCP_ALLOWED_HOSTS` | no | derived from `MCP_PUBLIC_URL` | Comma-list, DNS-rebind allow-list (overrides the derived value). |
-| `MCP_ALLOWED_ORIGINS` | no | derived from `MCP_PUBLIC_URL` | Comma-list, CORS-style origin validation (overrides derived). |
+| `MCP_ALLOWED_HOSTS` | no | derived from `MCP_PUBLIC_URL` | Comma-list, `Host` allow-list for DNS-rebinding protection (overrides the derived value). |
+| `MCP_ALLOWED_ORIGINS` | no | derived from `MCP_PUBLIC_URL` | Comma-list, `Origin` allow-list (overrides the derived value). |
+| `MCP_TRUST_PROXY` | no | `1` | Number of reverse-proxy hops trusted for client IP and https detection. `1` = one proxy (Caddy, Traefik); `0` = app exposed directly. |
+| `MCP_MAX_SESSIONS` | no | `500` | Live MCP sessions across all tokens; least recently used evicted. |
+| `MCP_MAX_SESSIONS_PER_TOKEN` | no | `5` | Live MCP sessions per token; least recently used evicted. |
+| `MCP_MAX_TOKENS_PER_USER` | no | `20` | Tokens per eLabFTW user per instance. |
 
 `ELABFTW_ALLOW_WRITES` / `ELABFTW_ALLOW_DESTRUCTIVE` /
 `ELABFTW_REVEAL_USER_IDENTITIES` are the operator's **upper bound**.
@@ -655,6 +883,46 @@ and the user's own per-token setting (chosen via checkboxes on the
 to allow users to opt in; leave it `false` to deny across the whole
 process regardless of what users tick. `ELABFTW_ALLOW_DESTRUCTIVE`
 additionally requires `ELABFTW_ALLOW_WRITES` at both layers.
+
+`ELABFTW_TOOLSETS`, `ELABFTW_TIMEOUT_MS` and `ELABFTW_USER_AGENT` from
+the [stdio table](#environment-stdio-package) apply to every token on
+the server. The bundled `docker-compose.yml` does not pass them
+through; add them under `environment:` if you need them.
+`ELABFTW_DOWNLOAD_DIR` has no effect in hosted mode: remote clients
+cannot read the server's disk, so `elab_download_attachment` and
+`elab_export` return text inline (up to 100 KB) and only metadata for
+everything else.
+
+### Secrets at rest
+
+- Bearer tokens are stored as `sha256(token)` only.
+- eLabFTW API keys are encrypted with AES-256-GCM under the store key
+  (`MCP_STORE_KEY`, or the generated `<MCP_REGISTRATIONS_PATH>.key`).
+  The key file sits next to the store on the same volume, so a volume
+  backup alone holds both; prefer `MCP_STORE_KEY` from your platform's
+  secret store and keep a copy of it outside the server.
+- The process runs with umask 077. The data directory is 0700; the
+  store, key file and SQLite `-wal` / `-shm` files are 0600.
+
+### Upgrading to 0.6 (hosted)
+
+Hosted 0.6.0 migrates existing stores in place on first start (JSON
+schema v3, SQLite schema v2; SQLite is VACUUMed so no plaintext stays
+in free pages). Existing bearer tokens keep working. Before upgrading:
+
+1. Set `MCP_STORE_KEY` (`openssl rand -base64 32`) and keep a copy, or
+   plan to back up the generated `<MCP_REGISTRATIONS_PATH>.key` right
+   after the first start. Losing the key makes every stored API key
+   unreadable; users then have to register again.
+2. Set `MCP_PUBLIC_URL` (the compose file now requires it) and make
+   sure `ELABFTW_BASE_URL` / `MCP_ALLOWED_BASE_URLS` cover every
+   instance existing tokens were registered against. Tokens for an
+   instance outside the allow-list get `403`.
+3. Treat backups taken before the upgrade as sensitive: they still hold
+   plaintext tokens and API keys.
+
+Everyone is logged out of `/manage` on every restart (those sessions
+are in memory); MCP tokens are unaffected.
 
 ### Security posture
 
@@ -671,22 +939,33 @@ What's implemented:
 
 - TLS terminated at the reverse proxy (Caddy auto-TLS in the bundled
   Compose).
-- Bearer-token auth required on every `/mcp` request. 401s carry a
-  spec-compliant `WWW-Authenticate` header so clients can discover
-  the auth scheme.
-- DNS-rebinding protection on by default (spec-mandated). Reject any
-  request whose `Origin` doesn't match the allow-list.
+- Bearer-token auth required on every `/mcp` request, checked before
+  the request body is parsed. 401s carry a spec-compliant
+  `WWW-Authenticate` header so clients can discover the auth scheme.
+- **eLabFTW instance allow-list.** The server never contacts an
+  instance the operator did not list, so it cannot be used as an open
+  relay or to probe internal hosts. Failed API-key checks return a
+  generic message; upstream details go to the server log only.
+- DNS-rebinding protection on by default (spec-mandated): `Host` and
+  `Origin` are checked against the allow-list before any MCP server is
+  built for the request.
 - Cross-token session isolation: a session id minted by user A is a
   404 for user B's token (no information leak about whether the id is
   valid).
 - Tokens are 256-bit random hex (not UUIDs — UUID v4 is only 122
-  random bits). Stored verbatim in a `0o600` JSON file or SQLite db.
+  random bits), stored only as a hash and shown once. API keys are
+  encrypted at rest (see [Secrets at rest](#secrets-at-rest)).
+- **`/manage` sessions.** Server-side session after one API-key login,
+  HttpOnly / SameSite=Strict cookie (`Secure` over https), CSRF token
+  on every POST. The API key is not embedded in the page.
+- `/register` and `/manage` responses send `Cache-Control: no-store`,
+  `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer` and
+  `X-Content-Type-Options: nosniff`.
 - **Self-service revocation + edit.** Users revoke their own tokens
-  at `/manage` after re-authenticating with their eLabFTW key. They
-  can also edit a token in place (label, permission flags, default
-  team for multi-team tokens) without invalidating the bearer value.
-  Revocation and flag changes close any live MCP sessions on the
-  affected token.
+  at `/manage`. They can also edit a token in place (label, permission
+  flags, default team for multi-team tokens) without invalidating the
+  bearer value. Revocation and flag changes close any live MCP
+  sessions on the affected token.
 - **Per-token permission flags.** Each registration carries its own
   `allowWrites` / `allowDestructive` / `revealUserIdentities`. The
   operator's env vars cap the maximum; the registration opts in.
@@ -694,21 +973,21 @@ What's implemented:
   read-only on the same process.
 - **Tokens joined to eLabFTW userid**, not API-key value — rotating
   the eLabFTW key keeps tokens manageable.
-- Per-IP rate limit on `/manage` POSTs (10 req/min sliding window).
+- **Rate and resource limits.** Per-IP limits on requests that probe
+  an API key against eLabFTW (`/register`, `/manage` login, adding a
+  team: 10 per minute) and on other `/manage` actions (60 per minute).
+  MCP sessions and tokens per user are capped (see
+  [Environment](#environment)).
 - Health probe at `GET /healthz` for orchestrator wiring.
 
 What is **out of scope** for this release:
 
-- Hashed token storage (stored verbatim — encrypt the volume / set
-  filesystem ACLs accordingly).
 - Per-user audit logs.
-- Rate limiting on `/register` itself (the underlying eLabFTW API
-  rate-limits failed key probes already).
-- OAuth 2.1 / OIDC for institutional SSO. Tracked for v0.5; until
-  then the eLabFTW API key is the only credential we accept.
+- OAuth 2.1 / OIDC for institutional SSO. Until then the eLabFTW API
+  key is the only credential we accept.
 
 If your deployment posture requires any of those, file an issue —
-they are deliberate v1 omissions, not inherent limitations.
+they are deliberate omissions, not inherent limitations.
 
 ### Acknowledgements
 
@@ -751,6 +1030,11 @@ MCP_REGISTRATIONS_PATH=./.dev-registrations.json \
 node packages/hosted/dist/cli.js
 # then browser → http://localhost:8000/register
 ```
+
+Without `MCP_STORE_KEY` the first start generates
+`./.dev-registrations.json.key` next to the store; keep it with the
+store or delete both together. Without `MCP_PUBLIC_URL` only
+`localhost:8000` / `127.0.0.1:8000` are accepted as `Host`.
 
 Or SQLite backend:
 
@@ -804,7 +1088,7 @@ registration page — for that, layer OAuth on top.
   set `ELABFTW_ALLOW_WRITES=true`; in hosted mode the env var caps
   the operator's policy *and* each registration must tick the
   matching checkbox at `/register` or `/manage`. Audit-trail actions
-  (lock/sign/timestamp/bloxberg) require a second flag,
+  (lock / unlock / timestamp / bloxberg) and deletes require a second flag,
   `ELABFTW_ALLOW_DESTRUCTIVE=true`, with the same hosted-mode AND
   rule.
 - **Tool-poisoning surface.** Tool descriptions and argument schemas

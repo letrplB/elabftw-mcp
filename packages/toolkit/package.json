@@ -1,6 +1,6 @@
 {
   "name": "@sura_ai/elabftw",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Model Context Protocol toolkit for elabftw (electronic lab notebook). Stdio MCP server + programmatic eLabFTW v2 client. Search, read, and write experiments, items, attachments, comments, steps, and links from any MCP-aware AI client.",
   "type": "module",
   "main": "./dist/index.js",
@@ -27,6 +27,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.25.1",
+    "marked": "^15.0.12",
     "turndown": "^7.2.4",
     "zod": "^4.2.1"
   },

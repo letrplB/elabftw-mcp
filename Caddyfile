@@ -1,8 +1,11 @@
 # Hosted-mode reverse proxy.
 #
 # Caddy auto-provisions a Let's Encrypt cert for {$MCP_DOMAIN}.
-# Long-lived SSE streams need ample read timeouts. We forward the
-# typical proxy headers; the Node app reads them via `trust proxy`.
+# Long-lived SSE streams need ample read timeouts. Caddy sets
+# X-Forwarded-For / -Proto (overwriting any client-supplied values) and
+# passes the original Host header through; the Node app trusts exactly
+# one proxy hop (MCP_TRUST_PROXY=1) and checks Host against
+# MCP_PUBLIC_URL. Add hops there if you put another proxy in front.
 
 {$MCP_DOMAIN} {
 	encode zstd gzip

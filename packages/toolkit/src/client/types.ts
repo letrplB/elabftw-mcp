@@ -75,7 +75,7 @@ export interface ElabftwConfig {
   apiKey: string;
   /**
    * Optional User-Agent. Useful for instance admins grepping logs.
-   * Defaults to `sura-elabftw/1.0`.
+   * Defaults to `sura-elabftw-mcp/<package version>`.
    */
   userAgent?: string;
   /**
@@ -182,8 +182,8 @@ export interface ElabEntity {
 }
 
 /**
- * Subset of `ElabEntity` fields accepted by `PATCH /{entity}/{id}` in the
- * default `action:"update"` mode. elabftw silently drops unknown fields.
+ * Fields accepted by `PATCH /{entity}/{id}` in the default update mode.
+ * elabftw rejects unknown keys with `400 "Invalid update target."`.
  */
 export interface ElabEntityUpdate {
   title?: string;
@@ -196,6 +196,10 @@ export interface ElabEntityUpdate {
   custom_id?: number;
   canread?: string;
   canwrite?: string;
+  canread_base?: number;
+  canwrite_base?: number;
+  canread_is_immutable?: 0 | 1;
+  canwrite_is_immutable?: 0 | 1;
   /** Send as a JSON string to be safe across instance versions. */
   metadata?: string;
   /** Plain-state transitions go through `state` (1=normal, 2=archived). */
@@ -214,69 +218,46 @@ export type ElabEntityAction =
   | 'forcelock'
   | 'forceunlock'
   | 'pin'
-  | 'exclusiveeditmode'
   | 'timestamp'
   | 'bloxberg'
-  | 'sign'
   | 'duplicate'
-  | 'archive';
+  | 'archive'
+  | 'unarchive'
+  | 'restore';
 
 export interface ElabDuplicateOptions {
   /** Defaults to false. */
   copyFiles?: boolean;
   /** Creates a link back to the original. Defaults to false. */
   linkToOriginal?: boolean;
-  /** When duplicating a template into an experiment, set the team. */
-  team?: number;
 }
 
+/**
+ * `POST /{entityType}` body. Fields elabftw does not take on create
+ * (`date`, `rating`, `custom_id`, `state`) are set with a follow-up
+ * `update()`.
+ */
 export interface ElabCreateEntityInput {
-  /** For experiments: template id; for items: items_type id. */
-  category_id?: number;
-  /** Alias used in some versions; client will fall back. */
+  /**
+   * Instantiate from a template: `experiments_templates` id for
+   * experiments, `items_types` id for items. elabftw then applies only
+   * `title` (and, on 6.x, merges `metadata`) from the request.
+   */
   template?: number;
+  /** Experiment category / resource category id. */
+  category?: number;
   title?: string;
   body?: string;
-  /**
-   * 1 = HTML (default), 2 = Markdown. Older elabftw versions may ignore
-   * this on POST; the MCP `elab_create_entity` tool re-PATCHes when the
-   * value doesn't land on the new entity.
-   */
+  /** 1 = HTML, 2 = Markdown. Defaults to the user's editor preference. */
   content_type?: 1 | 2;
   tags?: string[];
-  /** Metadata as a JSON string (safest across versions). */
+  /** Metadata as a JSON string. */
   metadata?: string;
-  /**
-   * YYYYMMDD string (e.g. "20260417"). elabftw drops this on POST and
-   * defaults to "today"; the MCP `elab_create_entity` tool re-PATCHes
-   * when supplied so the value lands.
-   */
-  date?: string;
-  /**
-   * Integer 0-5. elabftw drops this on POST; the MCP layer re-PATCHes.
-   */
-  rating?: number;
-  /** Status id (team-scoped). elabftw honors this on POST in v5.x. */
+  /** Status id (team-scoped). */
   status?: number;
-  /**
-   * Stable per-team identifier. elabftw drops this on POST; the MCP
-   * layer re-PATCHes.
-   */
-  custom_id?: number;
-  /**
-   * JSON string describing read permissions. elabftw normalizes
-   * whitespace/key-order on round-trip; the MCP layer compares with
-   * deep-equal before deciding to re-PATCH.
-   */
+  /** JSON permissions string, e.g. `{"base":30,"teams":[],"users":[],"teamgroups":[]}`. */
   canread?: string;
-  /** Same shape and semantics as `canread`. */
   canwrite?: string;
-  /**
-   * 1 = Normal, 2 = Archived. State `3` (Deleted) is reachable via
-   * `elab_delete_entity` only — keep create/update flows unambiguous.
-   * elabftw drops this on POST; the MCP layer re-PATCHes.
-   */
-  state?: ElabState | number;
 }
 
 /**
@@ -868,4 +849,17 @@ export interface ElabExtraFieldValue {
   blank_value_on_duplicate?: boolean;
   allow_multi_values?: boolean;
   [key: string]: unknown;
+}
+
+/**
+ * Result of `ElabftwClient.createCompoundDetailed`. `id` is the created
+ * compound (null only when elabftw returned no `Location` header). When
+ * `reconcileError` is set, the compound exists but the follow-up PATCH for
+ * `unreconciledFields` (fields `POST /compounds` ignores) failed — re-apply
+ * them with an update instead of creating the compound again.
+ */
+export interface ElabCompoundCreateResult {
+  id: number | null;
+  reconcileError?: string;
+  unreconciledFields?: string[];
 }

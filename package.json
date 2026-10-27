@@ -8,7 +8,7 @@
   ],
   "scripts": {
     "build": "npm run build --workspaces",
-    "typecheck": "npm run typecheck --workspaces",
+    "typecheck": "npm run build:toolkit && npm run typecheck --workspaces",
     "build:toolkit": "npm run build -w @sura_ai/elabftw",
     "build:hosted": "npm run build -w @sura_ai/elabftw-hosted",
     "dev:hosted": "npm run build:toolkit && node packages/hosted/dist/cli.js"

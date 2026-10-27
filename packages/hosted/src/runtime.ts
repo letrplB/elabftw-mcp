@@ -1,12 +1,13 @@
 /**
  * Per-token MCP server factory.
  *
- * Each registered token gets its own `McpServer` instance, lazily built
- * on first connect. Tool wiring is delegated to the toolkit's
- * `buildElabMcpServer` factory so this package never has to know which
- * tools exist.
+ * Each MCP session gets its own `McpServer` instance, built from the
+ * authenticating token's registration on `initialize`. Tool wiring is
+ * delegated to the toolkit's `buildElabMcpServer` factory so this
+ * package never has to know which tools exist.
  *
- * Cost: one `McpServer` + tool-registration pass per active token.
+ * Cost: one `McpServer` + tool-registration pass per live session
+ * (bounded by the session pool's per-token and global caps).
  * Trade-off vs. shared-server-with-per-call-creds: simpler, immune to
  * cross-token bleed, costs a few KB per token. Acceptable at
  * institutional scale.
