@@ -27,6 +27,15 @@
 export * from './client';
 export type { ElabKeyConfig, ElabMcpConfig, LoadConfigOptions } from './mcp/config';
 export { loadConfig } from './mcp/config';
-export { ClientRegistry, validateRegistry } from './mcp/clients';
+export {
+  ClientRegistry,
+  TeamResolutionError,
+  validateRegistry,
+} from './mcp/clients';
+export {
+  DEFAULT_USER_AGENT,
+  ElabftwTransportError,
+  PACKAGE_VERSION,
+} from './client/http';
 export { buildElabMcpServer } from './mcp/server';
 export type { BuildServerOptions } from './mcp/server';
