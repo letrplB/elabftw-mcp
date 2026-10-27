@@ -1,4 +1,4 @@
-export { ElabftwClient } from './client';
+export { ElabCompoundReconcileError, ElabftwClient } from './client';
 export {
   ElabftwApiError,
   buildUrl,
@@ -7,6 +7,11 @@ export {
   extractLocationId,
 } from './http';
 
+export {
+  decodeStoredMarkdown,
+  looksLikeHtml,
+  markdownToHtml,
+} from './markdown';
 export { nativeToUpdate, toNativeEntity } from './native';
 export type { NativePatchResult } from './native';
 
@@ -37,6 +42,7 @@ export type {
   ElabCategory,
   ElabComment,
   ElabCompound,
+  ElabCompoundCreateResult,
   ElabCompoundHazardFlag,
   ElabCompoundPatch,
   ElabCompoundQuery,

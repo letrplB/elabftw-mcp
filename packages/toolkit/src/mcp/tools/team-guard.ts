@@ -32,9 +32,7 @@ export const teamParamSchema = z
   .positive()
   .optional()
   .describe(
-    'Team id to scope the call to. Uses the matching ELABFTW_KEY_<team> API key, ' +
-      'and filters results / asserts entity team membership accordingly. ' +
-      'Omit to use the default team.'
+    'Team id (selects that team\'s API key); omit for the default team.'
   );
 
 interface HasTeam {
@@ -96,4 +94,54 @@ export async function assertTeam(
     );
   }
   return entity;
+}
+
+/** Like {@link assertTeam}, for a compound. */
+export async function assertCompoundTeam(
+  client: ElabftwClient,
+  id: number,
+  expectedTeam: number
+): Promise<void> {
+  const compound = await client.getCompound(id);
+  if (compound.team !== undefined && compound.team !== expectedTeam) {
+    throw new TeamScopeViolation(
+      `Compound ${id} is in team ${compound.team}, but this call is scoped to team ${expectedTeam}. ` +
+        `Retry with team=${compound.team} (if you have a key for that team).`
+    );
+  }
+}
+
+/**
+ * Team-level endpoints (`/teams/current/...`) act on whichever team the
+ * API key's user currently has selected, which can drift from the team the
+ * key was configured for. Refuse to write when they differ.
+ */
+export async function assertCurrentTeam(
+  client: ElabftwClient,
+  expectedTeam: number
+): Promise<void> {
+  const me = await client.me();
+  if (me.team !== undefined && me.team !== expectedTeam) {
+    throw new TeamScopeViolation(
+      `The API key's user is currently in team ${me.team}, not ${expectedTeam}, so this would act on team ${me.team}. ` +
+        'Switch the current team in the elabftw UI, then retry.'
+    );
+  }
+}
+
+/**
+ * Resolve the team and client for a tool call, fetch the entity and check
+ * it belongs to that team. Entity-scoped handlers start with this so the
+ * team check cannot be forgotten.
+ */
+export async function entityScope(
+  registry: ClientRegistry,
+  team: number | undefined,
+  entityType: ElabEntityType,
+  id: number
+): Promise<{ t: number; client: ElabftwClient; entity: ElabEntity }> {
+  const t = effectiveTeam(registry, team);
+  const client = clientFor(registry, team);
+  const entity = await assertTeam(client, entityType, id, t);
+  return { t, client, entity };
 }

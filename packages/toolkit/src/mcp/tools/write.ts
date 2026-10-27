@@ -9,25 +9,39 @@ import type {
   ElabMetadata,
 } from '../../client';
 import {
+  COMPOUND_HAZARD_FLAGS,
   EXTRA_FIELD_TYPES,
+  decodeStoredMarkdown,
   formatCompound,
+  looksLikeHtml,
+  markdownToHtml,
   nativeToUpdate,
 } from '../../client';
 import { z } from 'zod';
 import type { ClientRegistry } from '../clients';
+import { ElabftwApiError } from '../../client';
 import type { ElabMcpConfig } from '../config';
-import { entityTypeSchema, errorText, guard, text } from './helpers';
 import {
+  entityTypeSchema,
+  errorText,
+  guard,
+  text,
+  withEntityLock,
+} from './helpers';
+import {
+  assertCompoundTeam,
+  assertCurrentTeam,
   assertTeam,
   clientFor,
   effectiveTeam,
+  entityScope,
   teamParamSchema,
 } from './team-guard';
 import {
   blankExtraFieldValues,
   buildExtraFieldEntry,
   cleanupMetadata,
-  isMetadataEmpty,
+  coerceCheckboxValue,
   mergeExtraFieldEntry,
   mergeMetadataForClone,
 } from './extra-fields';
@@ -59,50 +73,14 @@ function deepEqualJson(a: unknown, b: unknown): boolean {
   return ak.every((k) => deepEqualJson(ao[k], bo[k]));
 }
 
-/**
- * Normalize "no metadata" — elabftw represents an empty/missing blob as any
- * of `null`, the string `"null"`, the empty string, or `undefined`. Treat
- * them as equivalent to avoid spurious mismatch on round-trip.
- */
-function isEmptyMetadata(v: unknown): boolean {
-  if (v === null || v === undefined) return true;
-  if (typeof v === 'string') {
-    const trimmed = v.trim();
-    if (trimmed === '' || trimmed === 'null') return true;
-  }
-  return false;
-}
-
-function parseMetadataLoose(v: unknown): unknown {
-  if (isEmptyMetadata(v)) return null;
-  if (typeof v === 'string') {
-    try {
-      return JSON.parse(v);
-    } catch {
-      return v;
-    }
-  }
-  return v;
-}
-
-/**
- * Compare a `tags: string[]` request against the response shape. elabftw
- * returns the entity's tags as a pipe-separated string (e.g.
- * `"alpha|beta|gamma"`) or `null` when there are none. Compare as sets.
- */
-function tagsMismatch(requested: string[], current: unknown): boolean {
-  const want = new Set(requested.map((t) => t.trim()).filter(Boolean));
-  const haveStr =
-    typeof current === 'string' ? current : current == null ? '' : String(current);
-  const have = new Set(
-    haveStr
+/** Parse elabftw's pipe-separated tag string into a set. */
+function tagSet(tags: unknown): Set<string> {
+  return new Set(
+    (typeof tags === 'string' ? tags : '')
       .split('|')
       .map((t) => t.trim())
       .filter(Boolean)
   );
-  if (want.size !== have.size) return true;
-  for (const tag of want) if (!have.has(tag)) return true;
-  return false;
 }
 
 function fieldMismatch(
@@ -120,29 +98,76 @@ function fieldMismatch(
       return String(requested) !== String(current);
     }
   }
-  if (key === 'metadata') {
-    // Treat null / "null" / "" / undefined as equivalent — elabftw
-    // normalizes empty metadata to null. Deep-equal parsed JSON otherwise.
-    const r = parseMetadataLoose(requested);
-    const c = parseMetadataLoose(current);
-    if (r === null && c === null) return false;
-    if (r === null || c === null) return true;
-    return !deepEqualJson(r, c);
-  }
   if (key === 'body') {
-    // Guard: never re-PATCH body when the caller asked for an empty body.
-    // elabftw's HTML pipeline may turn "" into something like a wrapping
-    // <div></div>; refusing to clobber it is the safer call.
-    if (typeof requested === 'string' && requested.length === 0) return false;
-    return String(requested ?? '') !== String(current ?? '');
-  }
-  if (key === 'tags') {
-    if (!Array.isArray(requested)) return false;
-    return tagsMismatch(requested as string[], current);
+    // elabftw sanitizes bodies on save (HTML purifier, entity-escaping of
+    // markdown), so the stored body rarely equals the request byte-for-byte.
+    // Only treat the body as dropped when nothing landed. An empty request
+    // never re-PATCHes: elabftw may wrap "" in markup and clobbering it is
+    // not worth it.
+    if (typeof requested !== 'string' || requested.length === 0) return false;
+    return String(current ?? '').trim().length === 0;
   }
   if (current == null) return requested != null;
   return current !== requested;
 }
+
+type BodyFormat = 'markdown' | 'html';
+type EditorMode = 'html' | 'markdown';
+
+/**
+ * Turn the caller's `body` into what elabftw should store. The default is
+ * the rich-text editor: markdown input is rendered to HTML and stored with
+ * `content_type=1`, so users can keep editing the entry in TinyMCE.
+ * `content_type: 'markdown'` opts into storing raw markdown, which forces
+ * elabftw's markdown editor.
+ */
+function prepareBody(
+  body: string,
+  bodyFormat: BodyFormat | undefined,
+  editor: EditorMode | undefined
+): { body: string; content_type: 1 | 2 } {
+  if (editor === 'markdown') return { body, content_type: 2 };
+  const format = bodyFormat ?? (looksLikeHtml(body) ? 'html' : 'markdown');
+  return {
+    body: format === 'markdown' ? markdownToHtml(body) : body,
+    content_type: 1,
+  };
+}
+
+/**
+ * Render an entity's stored markdown body to HTML. Covers entries still in
+ * markdown mode (`content_type=2`) and entries a user flipped to the
+ * rich-text editor in the UI, which leaves the raw markdown behind under
+ * `content_type=1`. Returns null when there is nothing to convert.
+ */
+function storedBodyAsHtml(entity: {
+  body?: string | null;
+  content_type?: number;
+}): string | null {
+  const body = entity.body ?? '';
+  if (entity.content_type !== 2 && (body.trim() === '' || looksLikeHtml(body)))
+    return null;
+  return markdownToHtml(decodeStoredMarkdown(body));
+}
+
+const bodySchema = z
+  .string()
+  .optional()
+  .describe(
+    'Body in markdown (headings, lists, tables, links) or HTML; stored as rich text for the elabftw editor.'
+  );
+const bodyFormatSchema = z
+  .enum(['markdown', 'html'])
+  .optional()
+  .describe(
+    'Syntax of `body`; auto-detected when omitted.'
+  );
+const contentTypeSchema = z
+  .enum(['html', 'markdown'])
+  .optional()
+  .describe(
+    'Editor: `html` (rich text, default). Markdown bodies are converted automatically; pass `markdown` only if the user wants the markdown editor.'
+  );
 
 export function registerWriteTools(
   server: McpServer,
@@ -153,97 +178,65 @@ export function registerWriteTools(
 
   server.tool(
     'elab_create_entity',
-    'Create a new entity. Supports all four kinds:\n' +
-      '  - `experiments`: pass `category_id=<templateId>` to instantiate from a template (optional).\n' +
-      '  - `items`: pass `category_id=<itemsTypeId>` (required — every item belongs to a type).\n' +
-      '  - `experiments_templates` / `items_types`: blank-schema kinds. The elabftw POST endpoint accepts only `title`; this tool follows up with a PATCH for body / metadata / content_type / etc. when supplied.\n' +
-      'Optional fields (`date`, `rating`, `status`, `custom_id`, `canread`, `canwrite`, `state`, `content_type`, `metadata`, `body`, `tags`) are forwarded on POST and, if elabftw drops or normalizes any of them, transparently re-PATCHed after a fresh fetch so the values actually land. (elabftw 5.5 is known to silently drop `metadata` on `POST /items` — the reconcile path closes that gap.) Failures of the follow-up PATCH are reported in the response (call `elab_update_entity` or `elab_add_tag` to retry).\n' +
-      'When `category_id` is set on an `items` or `experiments` create, the source `items_type` / `experiments_templates` schema is auto-loaded onto the new entity (mirroring the elabftw UI’s "Load fields" affordance); any caller-provided `metadata` wins per-field. Pass `loadFieldsFromCategory: false` to skip the auto-load and create a blank entity.\n' +
-      'Pass `team` to target a specific configured team; otherwise the default team is used.',
+    'Create an entity. For experiments / items, `template` instantiates an experiment template / resource template (`items_types`) like the elabftw UI does: body, extra-fields schema, steps, links, tags, permissions, category. Everything else you pass is applied on top; `metadata` is merged into the template\'s, yours winning. The response names any field that could not be applied.',
     {
       entityType: entityTypeSchema,
       team: teamParamSchema,
+      template: z
+        .number()
+        .int()
+        .optional()
+        .describe(
+          'Experiment template id (experiments) or `items_types` id (items).'
+        ),
+      category: z
+        .number()
+        .int()
+        .optional()
+        .describe(
+          'Category id: experiment category for experiments, resource category for items. Overrides the template\'s category.'
+        ),
       category_id: z
         .number()
         .int()
         .optional()
-        .describe(
-          'Template id (for experiments) or items_type id (for items). Required for items, optional for experiments. Ignored for experiments_templates and items_types.'
-        ),
+        .describe('Deprecated alias of `template`.'),
       title: z.string().optional(),
-      body: z.string().optional(),
-      content_type: z
-        .enum(['html', 'markdown'])
-        .optional()
-        .describe(
-          'Body rendering mode. Default `html`. Pass `markdown` when `body` uses GFM tables, `#` headings, fenced code, etc. — otherwise they render as literal characters. Older elabftw versions ignore this on POST; the tool transparently re-PATCHes if the value did not land.'
-        ),
+      body: bodySchema,
+      body_format: bodyFormatSchema,
+      content_type: contentTypeSchema,
       tags: z.array(z.string()).optional(),
       metadata: z
         .string()
         .optional()
-        .describe(
-          'JSON string for the metadata field (extra_fields etc.). Keep it stringified.'
-        ),
-      date: z
-        .string()
-        .optional()
-        .describe(
-          'YYYYMMDD format (e.g. "20260417"). elabftw defaults to today on POST and the tool re-PATCHes the requested value after creation.'
-        ),
-      rating: z
-        .number()
-        .int()
-        .min(0)
-        .max(5)
-        .optional()
-        .describe('Integer 0-5. Re-PATCHed after creation if elabftw drops it.'),
-      status: z
-        .number()
-        .int()
-        .optional()
-        .describe(
-          'Status id (team-scoped). Use `elab_list_*`-discovered status ids; v5.x typically honors this on POST.'
-        ),
-      custom_id: z
-        .number()
-        .int()
-        .optional()
-        .describe('Stable per-team identifier. Re-PATCHed if elabftw drops it.'),
+        .describe('JSON object string for the metadata blob (extra_fields etc.).'),
+      date: z.string().optional().describe('YYYYMMDD, e.g. "20260417".'),
+      rating: z.number().int().min(0).max(5).optional(),
+      status: z.number().int().optional().describe('Status id (team-scoped).'),
+      custom_id: z.number().int().optional(),
       canread: z
         .string()
         .optional()
         .describe(
-          'JSON string describing read permissions, e.g. `{"base":40,"teams":[],"users":[],"teamgroups":[]}`. Compared with deep-equal because elabftw normalizes whitespace.'
+          'JSON permissions string, e.g. `{"base":40,"teams":[],"users":[],"teamgroups":[]}`.'
         ),
-      canwrite: z
-        .string()
-        .optional()
-        .describe('Same shape as `canread`.'),
+      canwrite: z.string().optional().describe('Same shape as `canread`.'),
       state: z
         .enum(['normal', 'archived'])
         .optional()
-        .describe(
-          'Initial state. `normal` (default) or `archived`. To soft-delete an entity use `elab_delete_entity`.'
-        ),
-      loadFieldsFromCategory: z
-        .boolean()
-        .optional()
-        .describe(
-          'Default `true` when `category_id` is set on `items`/`experiments` creates. ' +
-            'Auto-loads the items_type / experiments_template schema onto the new entity, ' +
-            'merging with any caller-provided `metadata` (caller wins per-field). ' +
-            'Mirrors the elabftw UI\'s "Load fields" button. Pass `false` to create a blank entity.'
-        ),
+        .describe('`archived` archives (and locks) the entry right after creation.'),
     },
     async (args) => {
       const input = args as {
         entityType: ElabEntityType;
         team?: number;
+        template?: number;
+        category?: number;
         category_id?: number;
         title?: string;
         body?: string;
-        content_type?: 'html' | 'markdown';
+        body_format?: BodyFormat;
+        content_type?: EditorMode;
         tags?: string[];
         metadata?: string;
         date?: string;
@@ -253,206 +246,119 @@ export function registerWriteTools(
         canread?: string;
         canwrite?: string;
         state?: StateName;
-        loadFieldsFromCategory?: boolean;
       };
-      const ct =
-        input.content_type === 'markdown'
-          ? 2
-          : input.content_type === 'html'
-            ? 1
-            : undefined;
-      const stateNum = input.state ? stateMap[input.state] : undefined;
       const t = effectiveTeam(registry, input.team);
       const client = clientFor(registry, input.team);
       const isSchemaKind =
         input.entityType === 'experiments_templates' ||
         input.entityType === 'items_types';
+      const templateId = isSchemaKind
+        ? undefined
+        : (input.template ?? input.category_id);
 
-      // Auto-load the items_type / experiments_template schema onto the new
-      // entity when `category_id` is set and the caller hasn't opted out.
-      // Mirrors the elabftw UI's "Load fields" button (`metadata.ts:250-260`):
-      // the source defines the schema, any caller-provided `metadata` wins
-      // per-field. The merged blob is fed into `requestedFields.metadata` so
-      // the existing reconcile loop is the single PATCH source — we don't
-      // add a second PATCH after reconcile (that would race on the same blob).
-      //
-      // Schema kinds (`experiments_templates`, `items_types`) are ignored
-      // silently: they ARE the schemas; there's nothing to inherit.
-      const shouldLoadSchema =
-        !isSchemaKind &&
-        input.category_id !== undefined &&
-        input.loadFieldsFromCategory !== false &&
-        (input.entityType === 'items' || input.entityType === 'experiments');
-
-      let effectiveMetadata: string | undefined = input.metadata;
-      let inheritedFieldCount = 0;
-      let inheritFailed: string | null = null;
-      let sourceKindLabel: 'items_types' | 'experiments_templates' | null = null;
-
-      if (shouldLoadSchema) {
-        const sourceKind: 'items_types' | 'experiments_templates' =
-          input.entityType === 'items' ? 'items_types' : 'experiments_templates';
-        sourceKindLabel = sourceKind;
+      let callerMeta: ElabMetadata | undefined;
+      if (input.metadata !== undefined) {
         try {
-          const source = await client.get(sourceKind, input.category_id!);
-          const sourceMeta = client.parseMetadata(source);
-          const sourceExtra = sourceMeta?.extra_fields;
-          if (sourceMeta && sourceExtra && Object.keys(sourceExtra).length > 0) {
-            // Parse caller's metadata (string-encoded) into an object. Treat
-            // empty/null as `{}`. If the caller passed garbage, fall through
-            // to inheriting just the source schema.
-            let callerMeta: ElabMetadata = {};
-            if (input.metadata !== undefined) {
-              try {
-                const parsed = JSON.parse(input.metadata);
-                if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-                  callerMeta = parsed as ElabMetadata;
-                }
-              } catch {
-                // Ignore parse failure; treat caller's metadata as empty for
-                // the purposes of the merge — the original string is still
-                // honored via `effectiveMetadata` below if we end up bailing.
-                callerMeta = {};
-              }
-            }
-            // Per `mergeMetadataForClone` semantics: source is the base,
-            // target (caller) wins per-field. That's exactly what we want.
-            const merged = mergeMetadataForClone(sourceMeta, callerMeta);
-            const callerKeys = new Set(Object.keys(callerMeta.extra_fields ?? {}));
-            // "Genuinely inherited" = fields in source's schema that weren't
-            // already in the caller's metadata. Reflects new schema landed on
-            // the entity, which is the honest signal for the response.
-            for (const k of Object.keys(sourceExtra)) {
-              if (!callerKeys.has(k)) inheritedFieldCount += 1;
-            }
-            effectiveMetadata = JSON.stringify(merged);
-          }
-          // else: source has no schema to inherit; leave effectiveMetadata as-is.
-        } catch (e) {
-          inheritFailed = (e as Error)?.message || String(e);
+          const parsed: unknown = JSON.parse(input.metadata);
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed))
+            throw new Error('not an object');
+          callerMeta = parsed as ElabMetadata;
+        } catch {
+          return errorText('`metadata` must be a JSON object string.');
         }
       }
 
-      // Fields that POST may drop on older elabftw versions. We forward them
-      // anyway, then reconcile from a fresh fetch. `metadata`, `body`, `tags`
-      // are included here because elabftw 5.5 has been observed to drop
-      // `metadata` on `POST /items`, and the schema-kind branch already
-      // needed `body`/`metadata`. Note: `tags` is fed through `requestedFields`
-      // for mismatch detection only — the actual reconcile uses
-      // `client.addEntityTag(...)` (entity update PATCH doesn't accept tags).
-      const requestedFields: Partial<ElabEntityUpdate> & { tags?: string[] } = {
-        ...(ct ? { content_type: ct as 1 | 2 } : {}),
+      const prepared =
+        input.body !== undefined
+          ? prepareBody(input.body, input.body_format, input.content_type)
+          : undefined;
+      const ct =
+        prepared?.content_type ??
+        (input.content_type === 'markdown'
+          ? 2
+          : input.content_type === 'html'
+            ? 1
+            : undefined);
+      const requestedFields: Partial<ElabEntityUpdate> = {
+        ...(input.category !== undefined ? { category: input.category } : {}),
+        ...(ct ? { content_type: ct } : {}),
         ...(input.date !== undefined ? { date: input.date } : {}),
         ...(input.rating !== undefined ? { rating: input.rating } : {}),
         ...(input.status !== undefined ? { status: input.status } : {}),
-        ...(input.custom_id !== undefined
-          ? { custom_id: input.custom_id }
-          : {}),
+        ...(input.custom_id !== undefined ? { custom_id: input.custom_id } : {}),
         ...(input.canread !== undefined ? { canread: input.canread } : {}),
         ...(input.canwrite !== undefined ? { canwrite: input.canwrite } : {}),
-        ...(stateNum !== undefined ? { state: stateNum } : {}),
-        ...(effectiveMetadata !== undefined ? { metadata: effectiveMetadata } : {}),
-        ...(input.body !== undefined ? { body: input.body } : {}),
-        ...(input.tags !== undefined ? { tags: input.tags } : {}),
+        ...(prepared ? { body: prepared.body } : {}),
       };
+
       return guard(
         async () => {
-          const id = await client.create(input.entityType, {
-            category_id: input.category_id,
-            title: input.title,
-            ...requestedFields,
-          });
-          if (id == null)
-            return {
-              id,
-              landedTeam: undefined as number | undefined,
-              reconcileFailed: null as string[] | null,
-              inheritedFieldCount,
-              inheritFailed,
-              sourceKindLabel,
-            };
+          // From a template, elabftw applies only `title` (and, on 6.x,
+          // merges `metadata`); everything else lands via the PATCH below.
+          const id = await client.create(
+            input.entityType,
+            templateId !== undefined
+              ? { template: templateId, title: input.title, metadata: input.metadata }
+              : {
+                  title: input.title,
+                  ...requestedFields,
+                  metadata: input.metadata,
+                  tags: input.tags,
+                }
+          );
+          if (id == null) return { id, landedTeam: undefined, failed: [] as string[] };
           const fresh = await client.get(input.entityType, id);
+          if (fresh.team !== undefined && fresh.team !== t)
+            return { id, landedTeam: fresh.team, failed: [] as string[] };
 
-          // Build a single reconciliation patch:
-          //  1) any optional field whose round-trip value differs from what
-          //     the caller requested (POST may have dropped or normalized it),
-          //  2) for schema kinds, body+metadata always — the POST endpoint
-          //     only honors `title` on templates/items_types,
-          //  3) if content_type is being re-PATCHed and a body was supplied,
-          //     re-send body so it flows through elabftw's md→html pipeline.
-          // `tags` is handled separately (per-tag add calls — the entity
-          // PATCH endpoint does not accept a tags field).
-          const reconcilePatch: Partial<ElabEntityUpdate> = {};
-          let tagsNeedReconcile = false;
+          const patch: Partial<ElabEntityUpdate> = {};
           for (const [key, val] of Object.entries(requestedFields)) {
             const current = (fresh as Record<string, unknown>)[key];
-            if (!fieldMismatch(key, val, current)) continue;
-            if (key === 'tags') {
-              tagsNeedReconcile = true;
-              continue;
-            }
-            (reconcilePatch as Record<string, unknown>)[key] = val;
+            if (templateId !== undefined || isSchemaKind || fieldMismatch(key, val, current))
+              (patch as Record<string, unknown>)[key] = val;
           }
-          if (isSchemaKind) {
-            // Safety net: the elabftw POST endpoint for templates/items_types
-            // only accepts `title`, so always re-PATCH body+metadata when the
-            // caller supplied them — even if fresh appeared to match.
-            if (input.body !== undefined) reconcilePatch.body = input.body;
-            if (effectiveMetadata !== undefined)
-              reconcilePatch.metadata = effectiveMetadata;
-          }
-          if ('content_type' in reconcilePatch && input.body !== undefined) {
-            reconcilePatch.body = input.body;
+          if (callerMeta) {
+            // Server-side merge is 6.x only, and 5.x double-encodes string
+            // metadata on create: merge onto what landed and re-send if needed.
+            const landed = client.parseMetadata(fresh) ?? {};
+            const want =
+              templateId !== undefined
+                ? mergeMetadataForClone(landed, callerMeta)
+                : callerMeta;
+            if (isSchemaKind || !deepEqualJson(want, landed))
+              patch.metadata = JSON.stringify(want);
           }
 
-          const reconcileFailed: string[] = [];
-          if (Object.keys(reconcilePatch).length > 0) {
+          const failed: string[] = [];
+          if (Object.keys(patch).length > 0) {
             try {
-              await client.update(input.entityType, id, reconcilePatch);
+              await client.update(input.entityType, id, patch);
             } catch {
-              reconcileFailed.push(...Object.keys(reconcilePatch));
+              failed.push(...Object.keys(patch));
             }
           }
-          if (tagsNeedReconcile && Array.isArray(input.tags)) {
-            // Tag PATCH-via-update is not supported; add each requested tag
-            // that isn't already present. We don't try to delete unexpected
-            // tags — that's an edge case not observed on POST.
-            const currentTags = new Set(
-              (typeof fresh.tags === 'string' ? fresh.tags : '')
-                .split('|')
-                .map((t) => t.trim())
-                .filter(Boolean)
-            );
-            const toAdd = input.tags
-              .map((t) => t.trim())
-              .filter((t) => t && !currentTags.has(t));
-            let tagFailed = false;
-            for (const tag of toAdd) {
+          if (input.tags?.length) {
+            const have = tagSet(fresh.tags);
+            for (const tag of input.tags.map((x) => x.trim())) {
+              if (!tag || have.has(tag)) continue;
               try {
                 await client.addEntityTag(input.entityType, id, tag);
               } catch {
-                tagFailed = true;
+                if (!failed.includes('tags')) failed.push('tags');
               }
             }
-            if (tagFailed) reconcileFailed.push('tags');
           }
-          return {
-            id,
-            landedTeam: fresh.team,
-            reconcileFailed: reconcileFailed.length ? reconcileFailed : null,
-            inheritedFieldCount,
-            inheritFailed,
-            sourceKindLabel,
-          };
+          // Last: an archived entity rejects every further update.
+          if (input.state === 'archived') {
+            try {
+              await client.action(input.entityType, id, 'archive');
+            } catch {
+              failed.push('state');
+            }
+          }
+          return { id, landedTeam: fresh.team, failed };
         },
-        ({
-          id,
-          landedTeam,
-          reconcileFailed,
-          inheritedFieldCount: inheritedCount,
-          inheritFailed: inheritErr,
-          sourceKindLabel: srcLabel,
-        }) => {
+        ({ id, landedTeam, failed }) => {
           if (id == null) {
             return errorText(
               'Create succeeded but elabftw returned no Location header.'
@@ -464,25 +370,16 @@ export function registerWriteTools(
                 'Switch your current team in the elabftw UI (for the key that owns this session) and try again, or soft-delete this entry manually.'
             );
           }
-          const label =
-            input.entityType === 'experiments_templates'
-              ? 'experiments_template'
-              : input.entityType === 'items_types'
-                ? 'items_type'
-                : input.entityType.slice(0, -1);
-          const note =
-            reconcileFailed && reconcileFailed.length
-              ? ` (follow-up PATCH for ${reconcileFailed.join(', ')} failed — call elab_update_entity to retry)`
+          const from =
+            templateId !== undefined
+              ? ` from ${input.entityType === 'items' ? 'items_type' : 'template'} #${templateId}`
               : '';
-          // Inherited-schema note: only surface when the source had a schema
-          // (inheritedCount > 0) or when the auto-load failed. Quiet otherwise.
-          let inheritNote = '';
-          if (inheritErr && srcLabel) {
-            inheritNote = ` (schema load failed: ${inheritErr} — call elab_clone_extra_fields_schema to retry).`;
-          } else if (inheritedCount > 0 && srcLabel && input.category_id !== undefined) {
-            inheritNote = ` Inherited ${inheritedCount}-field schema from ${srcLabel} #${input.category_id}.`;
-          }
-          return text(`Created ${label} #${id} in team ${t}.${note}${inheritNote}`);
+          const note = failed.length
+            ? ` Could not apply ${failed.join(', ')}; retry with elab_update_entity / elab_add_tag.`
+            : '';
+          return text(
+            `Created ${input.entityType.slice(0, -1)} #${id}${from} in team ${t}.${note}`
+          );
         }
       );
     }
@@ -490,18 +387,18 @@ export function registerWriteTools(
 
   server.tool(
     'elab_update_entity',
-    'Update fields on any entity (experiments, items, templates, items_types). Any field not provided is left unchanged. Passing `metadata` replaces the whole blob; for single-field edits use `elab_update_extra_field` instead. To soft-delete an entity use `elab_delete_entity`. ' +
-      'Round-trip path: pass `native` (the shape returned by `elab_get(view: "native")`) to apply a whole-entity patch in one shot. The toolkit re-stringifies `canread` / `canwrite` / `metadata` before PATCH. Only fields *present* in the supplied native object are written; omitted fields stay untouched. Explicit individual args (`title`, `body`, …) win over `native` when both are provided. Tags and entity links inside `native` are NOT applied here — manage them via `elab_add_tag` / `elab_remove_tag` and `elab_link_entities` / `elab_unlink_entities`.',
+    'Update fields on an entity; fields not provided stay unchanged. `metadata` replaces the whole blob (for one field use `elab_set_extra_field` / `elab_update_extra_field`). ' +
+      'Round-trip: pass `native` (the shape from `elab_get(view: "native")`) to write every field present in it, including `tags` (made to match exactly) and permission fields; explicit args win over `native`. Links inside `native` are ignored (use `elab_link_entities`).',
     {
       entityType: entityTypeSchema,
       id: z.number().int().positive(),
       team: teamParamSchema,
       title: z.string().optional(),
-      body: z.string().optional(),
-      content_type: z
-        .enum(['html', 'markdown'])
-        .optional()
-        .describe('1 = html (default), 2 = markdown.'),
+      body: bodySchema,
+      body_format: bodyFormatSchema,
+      content_type: contentTypeSchema.describe(
+        'Editor; omit to keep the current one. `html` without `body` converts the stored markdown body. `markdown` only if the user wants the markdown editor.'
+      ),
       date: z.string().optional().describe('YYYYMMDD format.'),
       rating: z.number().int().min(0).max(5).optional(),
       category: z.number().int().optional(),
@@ -517,13 +414,13 @@ export function registerWriteTools(
         .enum(['normal', 'archived'])
         .optional()
         .describe(
-          'Archive (`archived`) or un-archive (`normal`) the entity. To soft-delete use `elab_delete_entity` — this tool deliberately does not accept `deleted` to keep the audit-trail entry point unambiguous.'
+          '`archived` archives and locks; `normal` un-archives (stays locked). Archived entries reject other edits.'
         ),
       native: z
         .record(z.string(), z.any())
         .optional()
         .describe(
-          'Native entity shape (as returned by `elab_get(view: "native")`). Object form — canread / canwrite as `{teams,users,teamgroups}`, metadata as the parsed extra_fields tree. The toolkit re-stringifies on the way to elabftw. Only fields *present* in this object are written. Tag and link sub-arrays are ignored — use the dedicated tools for those.'
+          'Entity in the `elab_get(view: "native")` shape; only fields present are written.'
         ),
     },
     async (args) => {
@@ -531,62 +428,149 @@ export function registerWriteTools(
         entityType: ElabEntityType;
         id: number;
         team?: number;
-        content_type?: 'html' | 'markdown';
+        body?: string;
+        body_format?: BodyFormat;
+        content_type?: EditorMode;
         state?: StateName;
         native?: Partial<ElabEntityNative>;
       };
-      const ct =
-        input.content_type === 'markdown'
-          ? 2
-          : input.content_type === 'html'
-            ? 1
-            : undefined;
-      const stateNum = input.state ? stateMap[input.state] : undefined;
       const {
         entityType,
         id,
-        content_type: _ct,
-        state: _st,
+        body,
+        body_format,
+        content_type,
+        state,
         team,
         native,
         ...rest
       } = input;
+      const ct =
+        content_type === 'markdown'
+          ? 2
+          : content_type === 'html'
+            ? 1
+            : undefined;
       const t = effectiveTeam(registry, team);
       const client = clientFor(registry, team);
-      // Base patch from the native shape (if any); explicit individual
-      // args layered on top take precedence — gives the agent a "patch
-      // the whole record, but override field X" idiom.
-      const nativePatch = native
-        ? nativeToUpdate(native).patch
-        : ({} as ElabEntityUpdate);
+      const fromNative = native ? nativeToUpdate(native) : { patch: {} };
       const patch: ElabEntityUpdate = {
-        ...nativePatch,
+        ...fromNative.patch,
         ...rest,
-        ...(ct ? { content_type: ct as 1 | 2 } : {}),
-        ...(stateNum !== undefined ? { state: stateNum } : {}),
+        ...(body !== undefined ? { body } : {}),
+        ...(ct ? { content_type: ct } : {}),
       };
-      if (Object.keys(patch).length === 0) {
+      const nativeState =
+        fromNative.state === 1 || fromNative.state === 2 ? fromNative.state : undefined;
+      const wantState = state ? stateMap[state] : nativeState;
+      const wantTags = fromNative.tags;
+      if (
+        Object.keys(patch).length === 0 &&
+        wantState === undefined &&
+        wantTags === undefined
+      ) {
         return errorText(
           'No fields provided. Pass at least one updatable field or a `native` patch.'
         );
       }
       return guard(
         async () => {
-          await assertTeam(client, entityType, id, t);
-          return client.update(entityType, id, patch);
+          const entity = await assertTeam(client, entityType, id, t);
+          const notes: string[] = [];
+          if (body !== undefined) {
+            // Without an explicit `content_type`, keep the editor the entry
+            // already uses: users who keep an entry in markdown mode chose so.
+            const editor: EditorMode =
+              content_type ??
+              ((patch.content_type ?? entity.content_type) === 2
+                ? 'markdown'
+                : 'html');
+            const prepared = prepareBody(body, body_format, editor);
+            patch.body = prepared.body;
+            patch.content_type = prepared.content_type;
+          } else if (patch.content_type === 1 && patch.body === undefined) {
+            // Switching to the rich-text editor without a new body: render the
+            // stored markdown, otherwise TinyMCE shows it as one flat paragraph.
+            const html = storedBodyAsHtml(entity);
+            if (html !== null) {
+              patch.body = html;
+              notes.push('Converted the markdown body to rich text.');
+            }
+          }
+
+          const archived = entity.state === stateMap.archived;
+          const hasEdits =
+            Object.keys(patch).length > 0 || wantTags !== undefined;
+          if (archived && hasEdits && wantState !== stateMap.normal) {
+            throw new Error(
+              'The entity is archived and eLabFTW rejects edits on archived entries. Pass `state: "normal"` to un-archive it first.'
+            );
+          }
+          if (archived && wantState === stateMap.normal) {
+            await client.action(entityType, id, 'unarchive');
+            notes.push('Un-archived (still locked; use elab_unlock to edit).');
+          }
+          if (Object.keys(patch).length > 0)
+            await client.update(entityType, id, patch);
+          if (wantTags !== undefined) {
+            const want = new Set(wantTags.map((x) => x.trim()).filter(Boolean));
+            const have = await client.listEntityTags(entityType, id);
+            for (const tag of have)
+              if (!want.has(tag.tag))
+                await client.deleteEntityTag(entityType, id, tag.id);
+            const haveNames = new Set(have.map((x) => x.tag));
+            for (const tag of want)
+              if (!haveNames.has(tag)) await client.addEntityTag(entityType, id, tag);
+          }
+          if (!archived && wantState === stateMap.archived) {
+            await client.action(entityType, id, 'archive');
+            notes.push('Archived (and locked).');
+          }
+          return notes;
         },
-        () => text(`Updated ${entityType.slice(0, -1)} #${id}.`)
+        (notes) =>
+          text(
+            [`Updated ${entityType.slice(0, -1)} #${id}.`, ...notes].join(' ')
+          )
+      );
+    }
+  );
+
+  server.tool(
+    'elab_convert_body_to_html',
+    'Convert a markdown body to rich-text HTML so the entry opens formatted in the elabftw editor. Fixes entries stored as markdown and entries switched to the rich-text editor that show raw markdown. No-op on HTML bodies.',
+    {
+      entityType: entityTypeSchema,
+      id: z.number().int().positive(),
+      team: teamParamSchema,
+    },
+    async (args) => {
+      const { entityType, id, team } = args as {
+        entityType: ElabEntityType;
+        id: number;
+        team?: number;
+      };
+      return guard(
+        async () => {
+          const { client, entity } = await entityScope(registry, team, entityType, id);
+          const html = storedBodyAsHtml(entity);
+          if (html === null) return false;
+          await client.update(entityType, id, { body: html, content_type: 1 });
+          return true;
+        },
+        (converted) =>
+          text(
+            converted
+              ? `Converted ${entityType.slice(0, -1)} #${id} to rich text.`
+              : `${entityType.slice(0, -1)} #${id} already has an HTML body; nothing to convert.`
+          )
       );
     }
   );
 
   server.tool(
     'elab_update_extra_field',
-    'Update the *value* of an already-defined extra field on an entity. ' +
-      'Cannot create new fields, change `type` / `options` / `unit`, or touch field groups \u2014 use `elab_set_extra_field` for those. ' +
-      'Fast-path for batch value updates: the elabftw server-side handler is `JSON_SET` at `$.extra_fields.<name>.value`, so it bypasses the read-merge-PATCH cycle the full setter pays for. ' +
-      'Pre-flight check: this tool first GETs the entity and confirms the field exists in `metadata.extra_fields`; if not, it returns a friendly error pointing at `elab_set_extra_field` (the previous behavior was a silent SQL no-op). ' +
-      'Note: `value` is a primitive; complex structures must be JSON-encoded into a string.',
+    'Set the value of an extra field that already exists on an entity (fast path, safe to call in parallel). To create a field or change its type / options / unit, use `elab_set_extra_field`.',
     {
       entityType: entityTypeSchema,
       id: z.number().int().positive(),
@@ -594,7 +578,7 @@ export function registerWriteTools(
       fieldName: z.string().min(1),
       value: z
         .union([z.string(), z.number(), z.boolean(), z.null()])
-        .describe('Primitive value. Complex structures should be JSON-encoded strings.'),
+        .describe('New value. Checkbox: true/false. null clears the field.'),
     },
     async (args) => {
       const { entityType, id, team, fieldName, value } = args as {
@@ -604,19 +588,11 @@ export function registerWriteTools(
         fieldName: string;
         value: string | number | boolean | null;
       };
-      const t = effectiveTeam(registry, team);
-      const client = clientFor(registry, team);
       return guard(
         async () => {
-          const entity = await assertTeam(client, entityType, id, t);
-          const metadata = client.parseMetadata(entity);
-          const present =
-            metadata?.extra_fields &&
-            Object.prototype.hasOwnProperty.call(
-              metadata.extra_fields,
-              fieldName
-            );
-          if (!present) {
+          const { client, entity } = await entityScope(registry, team, entityType, id);
+          const field = client.parseMetadata(entity)?.extra_fields?.[fieldName];
+          if (!field) {
             return {
               ok: false as const,
               reason:
@@ -625,7 +601,17 @@ export function registerWriteTools(
                 'Use `elab_set_extra_field` to create the field first (it accepts `type`, `options`, `unit`, etc.).',
             };
           }
-          await client.updateExtraField(entityType, id, fieldName, value);
+          // elabftw only takes strings / ints here and expects checkboxes
+          // as 'on' / ''.
+          const wire =
+            field.type === 'checkbox'
+              ? coerceCheckboxValue(value)
+              : value === null
+                ? ''
+                : typeof value === 'string'
+                  ? value
+                  : String(value);
+          await client.updateExtraField(entityType, id, fieldName, wire);
           return { ok: true as const };
         },
         (result) =>
@@ -640,14 +626,7 @@ export function registerWriteTools(
 
   server.tool(
     'elab_set_extra_field',
-    'Create or fully replace an `extra_fields` entry on an entity in one call. ' +
-      'Performs a read-merge-PATCH on the entity\u2019s `metadata` blob, mirroring the elabftw UI\u2019s field-builder modal. ' +
-      'Supported types (15): `text`, `number`, `checkbox`, `date`, `datetime-local`, `email`, `time`, `url`, `select`, `radio`, `experiments`, `items`, `users`, `compounds`, `uploads`. ' +
-      'Note: the elabftw UI label "Dropdown menu" maps to the internal type `select`. ' +
-      'Per-type validation: `select` / `radio` require `options` (non-empty); `value` (if given) must be in `options`. `number` requires numeric `value`; pass `units` (string[]) to attach a unit picker \u2014 `unit` defaults to `units[0]` if not specified. `checkbox` coerces truthy \u2192 `"on"`, anything else \u2192 `""`. `experiments` / `items` / `users` / `compounds` require a positive integer id as `value`. ' +
-      'Auto-link side-effect: when `type` is `experiments` / `items` / `compounds` and `value` is set, also creates the corresponding entity-link (POST `/{entityType}/{id}/{type}_links/{value}`). Pass `autoLink: false` to opt out. `users`-typed fields do NOT auto-link (there is no parallel user-link sub-resource at the entity level). ' +
-      'Modes: `replace` (default) overwrites the field entirely; `merge` only updates the supplied properties and keeps existing values for the rest (use this when you just want to add a `description` or move the field to a new `group_id`). ' +
-      'For value-only updates after the field already exists, prefer `elab_update_extra_field` \u2014 it bypasses the read-merge-PATCH cycle.',
+    'Create or replace one extra field (definition and value) on an entity. Types: text, number, checkbox, date, datetime-local, time, email, url, select (UI: dropdown), radio, experiments, items, users, compounds, uploads. select / radio need `options` and a value among them; number takes a numeric value and optional `units`; experiments / items / users / compounds take an id, and experiments / items / compounds are also linked unless `autoLink: false`. `mode: \"merge\"` changes only the properties you pass. To change only the value of an existing field, use `elab_update_extra_field`.',
     {
       entityType: entityTypeSchema,
       id: z.number().int().positive(),
@@ -655,9 +634,7 @@ export function registerWriteTools(
       name: z.string().min(1).describe('Field key (used verbatim in the metadata blob).'),
       type: z
         .enum(EXTRA_FIELD_TYPES)
-        .describe(
-          'One of: ' + EXTRA_FIELD_TYPES.join(', ') + '. See the tool description for per-type semantics.'
-        ),
+        .describe('Field type.'),
       value: z
         .union([
           z.string(),
@@ -668,7 +645,7 @@ export function registerWriteTools(
         ])
         .optional()
         .describe(
-          'Default value. For `experiments` / `items` / `users` / `compounds` pass the target entity id. For `select` with `allow_multi_values=true` pass a string[]. For `checkbox` pass boolean / "on" / "checked".'
+          'Value: an id for experiments / items / users / compounds, string[] for multi-select, true / false for checkbox.'
         ),
       options: z
         .array(z.string())
@@ -691,7 +668,7 @@ export function registerWriteTools(
         .number()
         .int()
         .optional()
-        .describe('Group id (must exist in `metadata.elabftw.extra_fields_groups`; omit or pass -1 for the default group).'),
+        .describe('Group id (see `elab_set_extra_field_groups`); omit for the default group.'),
       position: z
         .number()
         .int()
@@ -701,13 +678,13 @@ export function registerWriteTools(
         .enum(['replace', 'merge'])
         .optional()
         .describe(
-          '`replace` (default) rewrites the field entirely; `merge` keeps existing properties not provided in this call.'
+          '`replace` (default) or `merge` (keep properties not passed).'
         ),
       autoLink: z
         .boolean()
         .optional()
         .describe(
-          'For `experiments` / `items` / `compounds` types only \u2014 when true (default), also create the corresponding entity-link. Pass `false` to skip.'
+          'Default true: also link the referenced experiment / item / compound.'
         ),
     },
     async (args) => {
@@ -736,7 +713,7 @@ export function registerWriteTools(
       const mode = input.mode ?? 'replace';
       const autoLink = input.autoLink !== false; // default true
       return guard(
-        async () => {
+        () => withEntityLock(`${t}/${input.entityType}/${input.id}`, async () => {
           const entity = await assertTeam(client, input.entityType, input.id, t);
           const metadata: ElabMetadata = client.parseMetadata(entity) ?? {};
           const extraFields = (metadata.extra_fields =
@@ -758,7 +735,7 @@ export function registerWriteTools(
               group_id: input.group_id,
               position: input.position,
             },
-            { partial: mode === 'merge' && existing !== undefined }
+            { partial: mode === 'merge' && existing !== undefined, existing }
           );
 
           extraFields[input.name] =
@@ -786,33 +763,15 @@ export function registerWriteTools(
                   ? Number(input.value)
                   : NaN;
             if (Number.isInteger(linkedId) && linkedId > 0) {
-              try {
-                await client.addLink(
-                  input.entityType,
-                  input.id,
-                  input.type,
-                  linkedId
-                );
-                linked = true;
-              } catch (e) {
-                // Tolerate "already linked" responses; rethrow on anything
-                // else so the caller sees real failures.
-                const msg = String((e as Error)?.message ?? '').toLowerCase();
-                if (!msg.includes('already') && !msg.includes('duplicate')) {
-                  throw e;
-                }
-              }
+              // elabftw ignores duplicate links, so re-linking is harmless.
+              await client.addLink(input.entityType, input.id, input.type, linkedId);
+              linked = true;
             }
           }
           return { name: input.name, type: input.type, value: input.value, linked };
-        },
+        }),
         ({ name, type, value, linked }) => {
-          const label =
-            input.entityType === 'experiments_templates'
-              ? 'experiments_template'
-              : input.entityType === 'items_types'
-                ? 'items_type'
-                : input.entityType.slice(0, -1);
+          const label = input.entityType.slice(0, -1);
           const linkNote =
             linked && value !== undefined && value !== null
               ? ` Auto-linked ${type} #${typeof value === 'string' ? Number(value) : value}.`
@@ -827,10 +786,7 @@ export function registerWriteTools(
 
   server.tool(
     'elab_remove_extra_field',
-    'Delete an `extra_fields` entry from an entity\u2019s metadata blob. ' +
-      'Cleans up empty `extra_fields` map + unreferenced `extra_fields_groups` (mirrors the UI\u2019s `cleanupMetadata` behavior). ' +
-      'If the metadata blob ends up empty, the entity\u2019s `metadata` is reset to `null`. ' +
-      'For `experiments` / `items` / `compounds` typed fields with a valid value, also removes the corresponding entity-link by default (pass `alsoUnlink: false` to keep the link).',
+    'Remove an extra field from an entity (empty groups are cleaned up). For experiments / items / compounds fields the matching link is removed too unless `alsoUnlink: false`.',
     {
       entityType: entityTypeSchema,
       id: z.number().int().positive(),
@@ -840,7 +796,7 @@ export function registerWriteTools(
         .boolean()
         .optional()
         .describe(
-          'Default `true`. For `experiments` / `items` / `compounds` typed fields, also DELETE the corresponding entity-link. 404 (already-unlinked) is tolerated silently.'
+          'Default `true`: for `experiments` / `items` / `compounds` fields, also remove the matching entity link.'
         ),
     },
     async (args) => {
@@ -855,7 +811,7 @@ export function registerWriteTools(
       const client = clientFor(registry, team);
       const doUnlink = alsoUnlink !== false; // default true
       return guard(
-        async () => {
+        () => withEntityLock(`${t}/${entityType}/${id}`, async () => {
           const entity = await assertTeam(client, entityType, id, t);
           const metadata: ElabMetadata = client.parseMetadata(entity) ?? {};
           const existing = metadata.extra_fields?.[name];
@@ -871,10 +827,7 @@ export function registerWriteTools(
             delete metadata.extra_fields[name];
           }
           cleanupMetadata(metadata);
-          const patchMetadata = isMetadataEmpty(metadata)
-            ? 'null'
-            : JSON.stringify(metadata);
-          await client.update(entityType, id, { metadata: patchMetadata });
+          await client.update(entityType, id, { metadata: JSON.stringify(metadata) });
 
           // Optional entity-link cleanup.
           let unlinked = false;
@@ -895,24 +848,16 @@ export function registerWriteTools(
                 await client.deleteLink(entityType, id, removedType, linkedId);
                 unlinked = true;
               } catch (e) {
-                const msg = String((e as Error)?.message ?? '').toLowerCase();
-                // Tolerate 404 / "not found" \u2014 link may already be gone.
-                if (!msg.includes('404') && !msg.includes('not found')) {
-                  throw e;
-                }
+                // The linked entity may be gone already.
+                if (!(e instanceof ElabftwApiError && e.statusCode === 404)) throw e;
               }
             }
           }
           return { removed: true as const, type: removedType, unlinked, linkedId: removedValue };
-        },
+        }),
         (result) => {
           if (!result.removed) return errorText(result.reason);
-          const label =
-            entityType === 'experiments_templates'
-              ? 'experiments_template'
-              : entityType === 'items_types'
-                ? 'items_type'
-                : entityType.slice(0, -1);
+          const label = entityType.slice(0, -1);
           const linkNote = result.unlinked
             ? ` Unlinked ${result.type} #${typeof result.linkedId === 'string' ? Number(result.linkedId) : result.linkedId}.`
             : '';
@@ -927,11 +872,8 @@ export function registerWriteTools(
   server.tool(
     'elab_clone_extra_fields_schema',
     'Copy an `extra_fields` schema (and field groups) from a source entity onto a target. ' +
-      'Agent equivalent of the elabftw UI\u2019s "Load fields" button (`metadata.ts:250-260`). ' +
-      'Deep-merges: source defines the schema, target\u2019s existing per-field `value`s are preserved; for fields the target doesn\u2019t have yet, the source\u2019s shape (type, options, unit, description, required, group_id, ...) is copied in. ' +
-      '`extra_fields_groups` are merged by `id` (target wins on conflicting names). ' +
-      'Typical uses: seed a fresh `experiments` entity from an `experiments_templates`; copy an `items_types` schema onto an existing `items` entity. ' +
-      'Pass `blankValues: true` for "schema only, no example values" \u2014 sets every field\u2019s `value` to `""` (matches elabftw\u2019s `blank_value_on_duplicate` server-side behavior). Both endpoints must be reachable under the same team.',
+      'Like the elabftw UI\u2019s "Load fields" button: the source defines each field\u2019s schema (type, options, units, group, \u2026); values the target already has are kept, fields it lacks are added with the source\u2019s values. Field groups are merged by `id`. ' +
+      '`blankValues: true` copies the schema without the source\u2019s example values (the target\u2019s own values are still kept).',
     {
       sourceEntityType: entityTypeSchema,
       sourceId: z.number().int().positive(),
@@ -959,17 +901,16 @@ export function registerWriteTools(
       const t = effectiveTeam(registry, team);
       const client = clientFor(registry, team);
       return guard(
-        async () => {
-          // Validate team scope on both ends.
+        () => withEntityLock(`${t}/${targetEntityType}/${targetId}`, async () => {
           const source = await assertTeam(client, sourceEntityType, sourceId, t);
           const target = await assertTeam(client, targetEntityType, targetId, t);
           const sourceMeta: ElabMetadata = client.parseMetadata(source) ?? {};
           const targetMeta: ElabMetadata = client.parseMetadata(target) ?? {};
 
-          const merged = mergeMetadataForClone(sourceMeta, targetMeta);
-          if (blankValues) {
-            blankExtraFieldValues(merged);
-          }
+          if (blankValues) blankExtraFieldValues(sourceMeta);
+          const merged = mergeMetadataForClone(sourceMeta, targetMeta, {
+            keep: 'value',
+          });
           const fieldCount = merged.extra_fields
             ? Object.keys(merged.extra_fields).length
             : 0;
@@ -977,14 +918,9 @@ export function registerWriteTools(
             metadata: JSON.stringify(merged),
           });
           return { fieldCount };
-        },
+        }),
         ({ fieldCount }) => {
-          const label =
-            targetEntityType === 'experiments_templates'
-              ? 'experiments_template'
-              : targetEntityType === 'items_types'
-                ? 'items_type'
-                : targetEntityType.slice(0, -1);
+          const label = targetEntityType.slice(0, -1);
           const blankNote = blankValues ? ' (values blanked)' : '';
           return text(
             `Cloned ${fieldCount}-field schema from ${sourceEntityType.slice(0, -1)} #${sourceId} onto ${label} #${targetId}${blankNote}.`
@@ -996,10 +932,7 @@ export function registerWriteTools(
 
   server.tool(
     'elab_set_extra_field_groups',
-    'Manage the named groups under `metadata.elabftw.extra_fields_groups`. ' +
-      'Groups cluster extra fields into collapsible UI sections (the field\u2019s `group_id` references one of these). ' +
-      '`mode: \'replace\'` (default) overwrites the groups list entirely; `mode: \'merge\'` upserts by `id` (existing name overwritten; new groups appended). ' +
-      'Group id `-1` is reserved for the default / uncategorized bucket; this tool rejects it.',
+    'Set the named extra-field groups (UI sections) of an entity; fields reference them by `group_id`. `mode`: `replace` (default) or `merge` (upsert by id). Id -1 is reserved.',
     {
       entityType: entityTypeSchema,
       id: z.number().int().positive(),
@@ -1031,7 +964,7 @@ export function registerWriteTools(
       const client = clientFor(registry, team);
       const effectiveMode = mode ?? 'replace';
       return guard(
-        async () => {
+        () => withEntityLock(`${t}/${entityType}/${id}`, async () => {
           const entity = await assertTeam(client, entityType, id, t);
           const metadata: ElabMetadata = client.parseMetadata(entity) ?? {};
           metadata.elabftw = metadata.elabftw ?? {};
@@ -1048,14 +981,9 @@ export function registerWriteTools(
             metadata: JSON.stringify(metadata),
           });
           return metadata.elabftw.extra_fields_groups.length;
-        },
+        }),
         (count) => {
-          const label =
-            entityType === 'experiments_templates'
-              ? 'experiments_template'
-              : entityType === 'items_types'
-                ? 'items_type'
-                : entityType.slice(0, -1);
+          const label = entityType.slice(0, -1);
           return text(
             `Set ${count} extra-field group(s) on ${label} #${id} (mode=${effectiveMode}).`
           );
@@ -1066,49 +994,44 @@ export function registerWriteTools(
 
   server.tool(
     'elab_duplicate_entity',
-    'Duplicate an experiment or item. Optionally copies files and creates a link back to the original. `team` selects which configured key to use for the duplicate call. `targetTeam` is where the duplicate should land — defaults to the same team as the source. Useful for cloning shared templates into another team’s workspace.',
+    'Duplicate an entity, optionally copying its files and linking the copy back to the original. The copy lands in the team the API key is currently in.',
     {
       entityType: entityTypeSchema,
       id: z.number().int().positive(),
       team: teamParamSchema,
       copyFiles: z.boolean().optional(),
       linkToOriginal: z.boolean().optional(),
-      targetTeam: z
-        .number()
-        .int()
-        .positive()
-        .optional()
-        .describe(
-          'Team id where the duplicate should land. Defaults to the source entity’s team. The configured key for `team` must have permission on `targetTeam`.'
-        ),
     },
     async (args) => {
-      const { entityType, id, team, copyFiles, linkToOriginal, targetTeam } =
-        args as {
-          entityType: ElabEntityType;
-          id: number;
-          team?: number;
-          copyFiles?: boolean;
-          linkToOriginal?: boolean;
-          targetTeam?: number;
-        };
-      const t = effectiveTeam(registry, team);
-      const client = clientFor(registry, team);
+      const { entityType, id, team, copyFiles, linkToOriginal } = args as {
+        entityType: ElabEntityType;
+        id: number;
+        team?: number;
+        copyFiles?: boolean;
+        linkToOriginal?: boolean;
+      };
       return guard(
         async () => {
-          await assertTeam(client, entityType, id, t);
-          return client.duplicate(entityType, id, {
+          const { t, client } = await entityScope(registry, team, entityType, id);
+          const newId = await client.duplicate(entityType, id, {
             copyFiles,
             linkToOriginal,
-            ...(targetTeam !== undefined ? { team: targetTeam } : {}),
           });
+          const landedTeam =
+            newId == null ? undefined : (await client.get(entityType, newId)).team;
+          return { newId, landedTeam, t };
         },
-        (newId) =>
-          newId == null
-            ? errorText('Duplicated but elabftw returned no new id.')
-            : text(
-                `Duplicated ${entityType.slice(0, -1)} #${id} → #${newId}${targetTeam !== undefined ? ` (team ${targetTeam})` : ''}.`
-              )
+        ({ newId, landedTeam, t }) => {
+          if (newId == null)
+            return errorText('Duplicated but elabftw returned no new id.');
+          const where =
+            landedTeam !== undefined && landedTeam !== t
+              ? ` Note: the copy landed in team ${landedTeam}, not ${t}.`
+              : '';
+          return text(
+            `Duplicated ${entityType.slice(0, -1)} #${id} → #${newId}.${where}`
+          );
+        }
       );
     }
   );
@@ -1129,11 +1052,9 @@ export function registerWriteTools(
         team?: number;
         comment: string;
       };
-      const t = effectiveTeam(registry, team);
-      const client = clientFor(registry, team);
       return guard(
         async () => {
-          await assertTeam(client, entityType, id, t);
+          const { client } = await entityScope(registry, team, entityType, id);
           return client.addComment(entityType, id, comment);
         },
         (cid) =>
@@ -1159,7 +1080,7 @@ export function registerWriteTools(
         .boolean()
         .optional()
         .describe(
-          'If `deadline` is set, `deadline_notif=true` makes elabftw email-notify the step owner before the deadline. Default off. Some elabftw versions ignore `deadline` / `deadline_notif` on step POST; check via `elab_list_steps` after creation. Per-step PATCH for these fields is not exposed (the v2 step PATCH dispatcher restricts to `action: finish`).'
+          'Email the step owner before the deadline. Default false.'
         ),
     },
     async (args) => {
@@ -1171,11 +1092,9 @@ export function registerWriteTools(
         deadline?: string;
         deadline_notif?: boolean;
       };
-      const t = effectiveTeam(registry, team);
-      const client = clientFor(registry, team);
       return guard(
         async () => {
-          await assertTeam(client, entityType, id, t);
+          const { client } = await entityScope(registry, team, entityType, id);
           return client.addStep(entityType, id, body, {
             deadline,
             deadline_notif,
@@ -1209,11 +1128,9 @@ export function registerWriteTools(
         team?: number;
         comment: string;
       };
-      const t = effectiveTeam(registry, team);
-      const client = clientFor(registry, team);
       return guard(
         async () => {
-          await assertTeam(client, entityType, id, t);
+          const { client } = await entityScope(registry, team, entityType, id);
           return client.updateComment(entityType, id, commentId, comment);
         },
         () =>
@@ -1240,11 +1157,9 @@ export function registerWriteTools(
         stepId: number;
         team?: number;
       };
-      const t = effectiveTeam(registry, team);
-      const client = clientFor(registry, team);
       return guard(
         async () => {
-          await assertTeam(client, entityType, id, t);
+          const { client } = await entityScope(registry, team, entityType, id);
           await client.deleteStep(entityType, id, stepId);
           return null;
         },
@@ -1258,7 +1173,7 @@ export function registerWriteTools(
 
   server.tool(
     'elab_update_step',
-    'Edit a checklist step in place — change the prose, set / clear the deadline, or flip the deadline-notification flag without churning the audit trail by delete + re-add. Pass any subset of `body` / `deadline` / `deadline_notif`; omitted fields are left untouched. `deadline` is a `YYYY-MM-DD HH:MM:SS` string (UTC); pass `null` to clear an existing deadline. `deadline_notif: true` requires the step to have a deadline (set one in the same call if needed). The toolkit translates these into elabftw’s three step-PATCH actions under the hood (`action: \"update\"` for body/deadline, `action: \"notif\"` / `\"notifdestroy\"` for deadline_notif). Use `elab_list_steps` to resolve `stepId`. For finished/unfinished, use `elab_toggle_step`.',
+    'Edit a checklist step: `body`, `deadline` (`YYYY-MM-DD HH:MM:SS`; null clears) and / or `deadline_notif` (needs a deadline). Omitted fields stay unchanged. Mark it done with `elab_toggle_step`.',
     {
       entityType: entityTypeSchema,
       id: z.number().int().positive(),
@@ -1322,7 +1237,7 @@ export function registerWriteTools(
 
   server.tool(
     'elab_toggle_step',
-    'Set a checklist step’s finished state. Idempotent — pass `finished: true` to mark finished, `finished: false` to mark unfinished; if the step is already in the requested state, the call is a no-op. (elabftw’s underlying API is a toggle that flips state AND clears the step’s `deadline` / `deadline_notif` on every fire; the toolkit wraps it with a read-modify-write so accidental double-toggles can’t blow away a deadline.)',
+    'Mark a checklist step finished (`finished: true`) or unfinished. Idempotent, and keeps the step\'s deadline.',
     {
       entityType: entityTypeSchema,
       id: z.number().int().positive(),
@@ -1338,11 +1253,9 @@ export function registerWriteTools(
         finished: boolean;
         team?: number;
       };
-      const t = effectiveTeam(registry, team);
-      const client = clientFor(registry, team);
       return guard(
         async () => {
-          await assertTeam(client, entityType, id, t);
+          const { client } = await entityScope(registry, team, entityType, id);
           return client.toggleStep(entityType, id, stepId, finished);
         },
         () =>
@@ -1353,13 +1266,17 @@ export function registerWriteTools(
     }
   );
 
+  const linkTargetSchema = z
+    .enum(['experiments', 'items', 'compounds'])
+    .describe('Kind of the target; `targetId` is an experiment, item or compound id.');
+
   server.tool(
     'elab_link_entities',
-    'Create a link between two entities. `entityType`+`id` are the source; `targetKind`+`targetId` are the destination. Both must live in the same team.',
+    'Link an entity (`entityType` + `id`) to an experiment, item or compound (`targetKind` + `targetId`) in the same team. Linking twice is harmless.',
     {
       entityType: entityTypeSchema,
       id: z.number().int().positive(),
-      targetKind: z.enum(['experiments', 'items']),
+      targetKind: linkTargetSchema,
       targetId: z.number().int().positive(),
       team: teamParamSchema,
     },
@@ -1367,18 +1284,20 @@ export function registerWriteTools(
       const { entityType, id, targetKind, targetId, team } = args as {
         entityType: ElabEntityType;
         id: number;
-        targetKind: 'experiments' | 'items';
+        targetKind: 'experiments' | 'items' | 'compounds';
         targetId: number;
         team?: number;
       };
-      const t = effectiveTeam(registry, team);
-      const client = clientFor(registry, team);
       return guard(
         async () => {
-          await assertTeam(client, entityType, id, t);
-          await assertTeam(client, targetKind, targetId, t);
-          await client.addLink(entityType, id, targetKind, targetId);
-          return null;
+          const { t, client } = await entityScope(registry, team, entityType, id);
+          if (targetKind === 'compounds') {
+            await assertCompoundTeam(client, targetId, t);
+            await client.addCompoundLink(entityType, id, targetId);
+          } else {
+            await assertTeam(client, targetKind, targetId, t);
+            await client.addLink(entityType, id, targetKind, targetId);
+          }
         },
         () =>
           text(
@@ -1390,11 +1309,11 @@ export function registerWriteTools(
 
   server.tool(
     'elab_unlink_entities',
-    'Remove an existing link between two entities.',
+    'Remove a link from an entity to an experiment, item or compound.',
     {
       entityType: entityTypeSchema,
       id: z.number().int().positive(),
-      targetKind: z.enum(['experiments', 'items']),
+      targetKind: linkTargetSchema,
       targetId: z.number().int().positive(),
       team: teamParamSchema,
     },
@@ -1402,17 +1321,16 @@ export function registerWriteTools(
       const { entityType, id, targetKind, targetId, team } = args as {
         entityType: ElabEntityType;
         id: number;
-        targetKind: 'experiments' | 'items';
+        targetKind: 'experiments' | 'items' | 'compounds';
         targetId: number;
         team?: number;
       };
-      const t = effectiveTeam(registry, team);
-      const client = clientFor(registry, team);
       return guard(
         async () => {
-          await assertTeam(client, entityType, id, t);
-          await client.deleteLink(entityType, id, targetKind, targetId);
-          return null;
+          const { client } = await entityScope(registry, team, entityType, id);
+          if (targetKind === 'compounds')
+            await client.deleteCompoundLink(entityType, id, targetId);
+          else await client.deleteLink(entityType, id, targetKind, targetId);
         },
         () =>
           text(
@@ -1438,11 +1356,9 @@ export function registerWriteTools(
         tag: string;
         team?: number;
       };
-      const t = effectiveTeam(registry, team);
-      const client = clientFor(registry, team);
       return guard(
         async () => {
-          await assertTeam(client, entityType, id, t);
+          const { client } = await entityScope(registry, team, entityType, id);
           await client.addEntityTag(entityType, id, tag);
           return null;
         },
@@ -1467,11 +1383,9 @@ export function registerWriteTools(
         tagId: number;
         team?: number;
       };
-      const t = effectiveTeam(registry, team);
-      const client = clientFor(registry, team);
       return guard(
         async () => {
-          await assertTeam(client, entityType, id, t);
+          const { client } = await entityScope(registry, team, entityType, id);
           await client.deleteEntityTag(entityType, id, tagId);
           return null;
         },
@@ -1483,7 +1397,7 @@ export function registerWriteTools(
 
   server.tool(
     'elab_create_tag',
-    'Create a team-scoped tag without attaching it to any entity. Useful for seeding a tag namespace at team setup or before bulk-tagging a cohort via `elab_add_tag`. If the tag already exists (elabftw uses `INSERT ... ON DUPLICATE KEY UPDATE`), the call is idempotent and returns the existing tag id. Requires team-admin privileges on the API key. Pass `team` to pick which configured team key/team to target; omit for the default team.',
+    'Create a team-scoped tag without attaching it to any entity. Useful for seeding a tag namespace at team setup or before bulk-tagging a cohort via `elab_add_tag`. If the tag already exists (elabftw uses `INSERT ... ON DUPLICATE KEY UPDATE`), the call is idempotent and returns the existing tag id. Requires team-admin privileges on the API key.',
     {
       tag: z
         .string()
@@ -1496,7 +1410,10 @@ export function registerWriteTools(
       const t = effectiveTeam(registry, team);
       const client = clientFor(registry, team);
       return guard(
-        () => client.createTag(tag),
+        async () => {
+          await assertCurrentTeam(client, t);
+          return client.createTag(tag);
+        },
         (tagId) =>
           text(
             tagId !== null
@@ -1511,100 +1428,90 @@ export function registerWriteTools(
   // tools share the same field set, and additions only need to land here.
   // Hazard flags are booleans on the agent side; the client coerces them
   // to 0/1 before sending.
+  // Compound fields shared by create / update. Hazards travel as one list
+  // of short names instead of 24 booleans to keep the tool schema small.
   const compoundIdentifierFields = {
-    molecular_formula: z.string().nullable().optional(),
-    molecular_weight: z
-      .union([z.number(), z.string()])
-      .nullable()
-      .optional()
-      .describe(
-        'Numeric weight. Accepts a number or a string (elabftw returns the field as a string on the wire).'
-      ),
-    inchi: z.string().nullable().optional(),
-    inchi_key: z.string().nullable().optional(),
-    smiles: z.string().nullable().optional(),
-    iupac_name: z.string().nullable().optional(),
-    cas_number: z.string().nullable().optional(),
-    ec_number: z.string().nullable().optional(),
-    chebi_id: z.string().nullable().optional(),
-    chembl_id: z.string().nullable().optional(),
-    dea_number: z.string().nullable().optional(),
-    drugbank_id: z.string().nullable().optional(),
-    dsstox_id: z.string().nullable().optional(),
-    hmdb_id: z.string().nullable().optional(),
-    kegg_id: z.string().nullable().optional(),
-    metabolomics_wb_id: z.string().nullable().optional(),
-    nci_code: z.string().nullable().optional(),
-    nikkaji_number: z.string().nullable().optional(),
-    pharmgkb_id: z.string().nullable().optional(),
-    pharos_ligand_id: z.string().nullable().optional(),
-    pubchem_cid: z
-      .union([z.number(), z.string()])
-      .nullable()
-      .optional(),
-    rxcui: z.string().nullable().optional(),
-    unii: z.string().nullable().optional(),
-    wikidata: z.string().nullable().optional(),
-    wikipedia: z.string().nullable().optional(),
-  } as const;
-  const compoundHazardFields = {
-    is_corrosive: z.boolean().optional(),
-    is_explosive: z.boolean().optional(),
-    is_flammable: z.boolean().optional(),
-    is_gas_under_pressure: z.boolean().optional(),
-    is_hazardous2env: z.boolean().optional(),
-    is_hazardous2health: z.boolean().optional(),
-    is_oxidising: z.boolean().optional(),
-    is_toxic: z.boolean().optional(),
-    is_radioactive: z.boolean().optional(),
-    is_serious_health_hazard: z.boolean().optional(),
-    is_antibiotic: z.boolean().optional(),
-    is_antibiotic_precursor: z.boolean().optional(),
-    is_drug: z.boolean().optional(),
-    is_drug_precursor: z.boolean().optional(),
-    is_explosive_precursor: z.boolean().optional(),
-    is_cmr: z.boolean().optional(),
-    is_nano: z.boolean().optional(),
-    is_controlled: z.boolean().optional(),
-    is_ed2health: z.boolean().optional(),
-    is_ed2env: z.boolean().optional(),
-    is_pbt: z.boolean().optional(),
-    is_pmt: z.boolean().optional(),
-    is_vpvb: z.boolean().optional(),
-    is_vpvm: z.boolean().optional(),
-  } as const;
+    molecular_weight: z.number().optional(),
+    pubchem_cid: z.number().int().optional(),
+    molecular_formula: z.string().optional(),
+    inchi: z.string().optional(),
+    inchi_key: z.string().optional(),
+    smiles: z.string().optional(),
+    iupac_name: z.string().optional(),
+    cas_number: z.string().optional(),
+    ec_number: z.string().optional(),
+    chebi_id: z.string().optional(),
+    chembl_id: z.string().optional(),
+    dea_number: z.string().optional(),
+    drugbank_id: z.string().optional(),
+    dsstox_id: z.string().optional(),
+    hmdb_id: z.string().optional(),
+    kegg_id: z.string().optional(),
+    metabolomics_wb_id: z.string().optional(),
+    nci_code: z.string().optional(),
+    nikkaji_number: z.string().optional(),
+    pharmgkb_id: z.string().optional(),
+    pharos_ligand_id: z.string().optional(),
+    rxcui: z.string().optional(),
+    unii: z.string().optional(),
+    wikidata: z.string().optional(),
+    wikipedia: z.string().optional(),
+  };
+  const hazardNames = COMPOUND_HAZARD_FLAGS.map((f) => f.slice(3)) as [
+    string,
+    ...string[],
+  ];
+  const hazardsSchema = z
+    .array(z.enum(hazardNames))
+    .optional()
+    .describe(
+      'Hazard flags that apply, e.g. ["toxic","flammable"]. On update it replaces the set; omit to keep it.'
+    );
+  /** Expand `hazards` into the 24 `is_*` flags elabftw stores. */
+  const hazardFlags = (hazards: string[] | undefined): ElabCompoundPatch =>
+    hazards === undefined
+      ? {}
+      : (Object.fromEntries(
+          COMPOUND_HAZARD_FLAGS.map((f) => [f, hazards.includes(f.slice(3))])
+        ) as ElabCompoundPatch);
 
   server.tool(
     'elab_create_compound',
-    'Create a new compound (chemical substance) in the team’s compound catalog. Only `name` is required; everything else is optional and corresponds to PubChem / CAS / ChEMBL / EC identifiers, structural descriptors (InChI / SMILES / formula / MW / IUPAC name), and GHS / regulatory hazard flags (`is_corrosive`, `is_toxic`, `is_cmr`, etc.). Hazard flags accept booleans; the client coerces to 0/1. After create, attach the compound to an entity with `elab_link_entities(..., targetKind: "compounds", targetId: <newId>)` or via `elab_set_extra_field` with `type: "compounds"`. Pass `team` to pick a configured team key; omit for the default. Gated by `ELABFTW_ALLOW_WRITES`.',
+    'Create a compound in the team catalog. Only `name` is required; the rest are identifiers, structure descriptors and `hazards`. Prefer `elab_create_compound_from_pubchem` when the compound is in PubChem. Attach it with `elab_link_entities(targetKind: "compounds")`.',
     {
       name: z.string().min(1),
       ...compoundIdentifierFields,
-      ...compoundHazardFields,
+      hazards: hazardsSchema,
       team: teamParamSchema,
     },
     async (args) => {
-      const { team, ...rest } = args as {
+      const { team, hazards, ...rest } = args as {
         name: string;
         team?: number;
+        hazards?: string[];
       } & ElabCompoundPatch;
       const t = effectiveTeam(registry, team);
       const client = clientFor(registry, team);
       return guard(
-        () => client.createCompound(rest as { name: string } & ElabCompoundPatch),
-        (id) =>
-          text(
-            id != null
-              ? `Created compound #${id} \`${rest.name}\` in team ${t}.`
-              : `Created compound \`${rest.name}\` in team ${t}. (elabftw did not return an id; call \`elab_search_compounds\` to resolve.)`
-          )
+        () =>
+          client.createCompoundDetailed({ ...rest, ...hazardFlags(hazards) }),
+        ({ id, unreconciledFields }) => {
+          if (id == null)
+            return text(
+              `Created compound \`${rest.name}\` in team ${t}, but elabftw returned no id; find it with \`elab_search_compounds\`.`
+            );
+          const note = unreconciledFields?.length
+            ? ` Could not set ${unreconciledFields.join(', ')}; retry with elab_update_compound (do not create it again).`
+            : '';
+          return text(`Created compound #${id} \`${rest.name}\` in team ${t}.${note}`);
+        }
       );
     }
   );
 
   server.tool(
     'elab_create_compound_from_pubchem',
-    'Create a compound by fetching its full record from PubChem. elabftw resolves the identifier (CID preferred, CAS fallback) against PubChem, pulls name / InChI / SMILES / formula / IUPAC / hazard flags, and stores the result in the team catalog. Provide exactly one of `cid` / `cas`. After create, attach to an entity with `elab_link_entities(targetKind: "compounds", targetId: <newId>)` or `elab_set_extra_field(type: "compounds")`. Preview before committing with `elab_search_pubchem`. Pass `team` to pick a configured team key. Gated by `ELABFTW_ALLOW_WRITES`.',
+    'Import a compound from PubChem into the team catalog by `cid` or `cas` (exactly one): name, structure, identifiers, hazards. Check first with `elab_search_pubchem`; attach it with `elab_link_entities(targetKind: \"compounds\")`.',
     {
       cid: z
         .number()
@@ -1654,28 +1561,33 @@ export function registerWriteTools(
 
   server.tool(
     'elab_update_compound',
-    'Patch fields on an existing compound. Plain PATCH semantics — pass any subset of the create-time fields and only those values are written; omitted fields stay untouched. Hazard flags accept booleans (coerced to 0/1). Cannot change team membership through this tool. Pass `team` to pick which configured team key/team the compound lives in. Gated by `ELABFTW_ALLOW_WRITES`.',
+    'Update fields on a compound; omitted fields stay unchanged.',
     {
       id: z.number().int().positive(),
       name: z.string().min(1).optional(),
       ...compoundIdentifierFields,
-      ...compoundHazardFields,
+      hazards: hazardsSchema,
       team: teamParamSchema,
     },
     async (args) => {
-      const { id, team, ...rest } = args as {
+      const { id, team, hazards, ...rest } = args as {
         id: number;
         team?: number;
+        hazards?: string[];
       } & ElabCompoundPatch;
+      const t = effectiveTeam(registry, team);
       const client = clientFor(registry, team);
-      const patch = rest as ElabCompoundPatch;
+      const patch: ElabCompoundPatch = { ...rest, ...hazardFlags(hazards) };
       if (Object.keys(patch).length === 0) {
         return errorText(
           'No fields provided. Pass at least one of `name` / identifier / hazard fields.'
         );
       }
       return guard(
-        () => client.updateCompound(id, patch),
+        async () => {
+          await assertCompoundTeam(client, id, t);
+          return client.updateCompound(id, patch);
+        },
         (compound) => text(`Updated compound #${id}.\n${formatCompound(compound)}`)
       );
     }
@@ -1689,7 +1601,7 @@ export function registerWriteTools(
 
   server.tool(
     'elab_delete_entity',
-    'Soft-delete an experiment or item (sets state=3). The record is still retrievable with state=deleted. Permanent deletion is sysadmin-only and not exposed here. Gated behind `ELABFTW_ALLOW_DESTRUCTIVE` — even a soft-delete hides the row from default listings and can disrupt downstream readers.',
+    'Soft-delete an entity (state=deleted). It stays retrievable with `state: "deleted"` searches and can be restored in the elabftw UI.',
     {
       entityType: entityTypeSchema,
       id: z.number().int().positive(),
@@ -1701,11 +1613,9 @@ export function registerWriteTools(
         id: number;
         team?: number;
       };
-      const t = effectiveTeam(registry, team);
-      const client = clientFor(registry, team);
       return guard(
         async () => {
-          await assertTeam(client, entityType, id, t);
+          const { client } = await entityScope(registry, team, entityType, id);
           await client.remove(entityType, id);
           return id;
         },
@@ -1716,7 +1626,7 @@ export function registerWriteTools(
 
   server.tool(
     'elab_delete_comment',
-    'Permanently delete a comment from an entity. Unlike entity deletion, this is not a soft-delete — the row is removed and the audit-trail entry shows the deletion. Use `elab_list_comments` to find the `commentId`. Gated behind `ELABFTW_ALLOW_DESTRUCTIVE`.',
+    'Permanently delete a comment from an entity. Unlike entity deletion, this is not a soft-delete — the row is removed and the audit-trail entry shows the deletion. Use `elab_list_comments` to find the `commentId`.',
     {
       entityType: entityTypeSchema,
       id: z.number().int().positive(),
@@ -1730,11 +1640,9 @@ export function registerWriteTools(
         commentId: number;
         team?: number;
       };
-      const t = effectiveTeam(registry, team);
-      const client = clientFor(registry, team);
       return guard(
         async () => {
-          await assertTeam(client, entityType, id, t);
+          const { client } = await entityScope(registry, team, entityType, id);
           await client.deleteComment(entityType, id, commentId);
           return null;
         },
@@ -1748,16 +1656,18 @@ export function registerWriteTools(
 
   server.tool(
     'elab_delete_compound',
-    'Soft-delete a compound (sets state=3, consistent with `elab_delete_entity`). The compound is still retrievable with `state=deleted`; permanent deletion is sysadmin-only and not exposed. Gated behind `ELABFTW_ALLOW_DESTRUCTIVE` because compound deletion can cascade through `compounds_links` references on experiments / items, removing the link end-points downstream readers depend on. Pass `team` to pick which configured team key/team the compound lives in.',
+    'Soft-delete a compound (sets state=3, consistent with `elab_delete_entity`). The compound is still retrievable with `state=deleted`; permanent deletion is sysadmin-only and not exposed.',
     {
       id: z.number().int().positive(),
       team: teamParamSchema,
     },
     async (args) => {
       const { id, team } = args as { id: number; team?: number };
+      const t = effectiveTeam(registry, team);
       const client = clientFor(registry, team);
       return guard(
         async () => {
+          await assertCompoundTeam(client, id, t);
           await client.deleteCompound(id);
           return null;
         },
@@ -1768,38 +1678,7 @@ export function registerWriteTools(
 
   server.tool(
     'elab_lock',
-    'Lock an entity to prevent further edits. Reversible by the owner or an admin via `elab_unlock`. Required before `elab_sign` / `elab_timestamp`.',
-    {
-      entityType: entityTypeSchema,
-      id: z.number().int().positive(),
-      team: teamParamSchema,
-      force: z
-        .boolean()
-        .optional()
-        .describe('Admin override; uses action=forcelock.'),
-    },
-    async (args) => {
-      const { entityType, id, team, force } = args as {
-        entityType: ElabEntityType;
-        id: number;
-        team?: number;
-        force?: boolean;
-      };
-      const t = effectiveTeam(registry, team);
-      const client = clientFor(registry, team);
-      return guard(
-        async () => {
-          await assertTeam(client, entityType, id, t);
-          return client.action(entityType, id, force ? 'forcelock' : 'lock');
-        },
-        () => text(`Locked ${entityType.slice(0, -1)} #${id}.`)
-      );
-    }
-  );
-
-  server.tool(
-    'elab_unlock',
-    'Force-unlock a previously locked entity. Admin action.',
+    'Lock an entity against further edits. Idempotent: an already locked entity stays locked. Undo with `elab_unlock`.',
     {
       entityType: entityTypeSchema,
       id: z.number().int().positive(),
@@ -1811,11 +1690,34 @@ export function registerWriteTools(
         id: number;
         team?: number;
       };
-      const t = effectiveTeam(registry, team);
-      const client = clientFor(registry, team);
       return guard(
         async () => {
-          await assertTeam(client, entityType, id, t);
+          const { client } = await entityScope(registry, team, entityType, id);
+          // `lock` toggles; `forcelock` sets locked=1.
+          return client.action(entityType, id, 'forcelock');
+        },
+        () => text(`Locked ${entityType.slice(0, -1)} #${id}.`)
+      );
+    }
+  );
+
+  server.tool(
+    'elab_unlock',
+    'Unlock a locked entity. Allowed for whoever locked it and for admins.',
+    {
+      entityType: entityTypeSchema,
+      id: z.number().int().positive(),
+      team: teamParamSchema,
+    },
+    async (args) => {
+      const { entityType, id, team } = args as {
+        entityType: ElabEntityType;
+        id: number;
+        team?: number;
+      };
+      return guard(
+        async () => {
+          const { client } = await entityScope(registry, team, entityType, id);
           return client.action(entityType, id, 'forceunlock');
         },
         () => text(`Unlocked ${entityType.slice(0, -1)} #${id}.`)
@@ -1837,11 +1739,9 @@ export function registerWriteTools(
         id: number;
         team?: number;
       };
-      const t = effectiveTeam(registry, team);
-      const client = clientFor(registry, team);
       return guard(
         async () => {
-          await assertTeam(client, entityType, id, t);
+          const { client } = await entityScope(registry, team, entityType, id);
           return client.action(entityType, id, 'timestamp');
         },
         () => text(`Timestamped ${entityType.slice(0, -1)} #${id}.`)
@@ -1863,11 +1763,9 @@ export function registerWriteTools(
         id: number;
         team?: number;
       };
-      const t = effectiveTeam(registry, team);
-      const client = clientFor(registry, team);
       return guard(
         async () => {
-          await assertTeam(client, entityType, id, t);
+          const { client } = await entityScope(registry, team, entityType, id);
           return client.action(entityType, id, 'bloxberg');
         },
         () => text(`Bloxberg-anchored ${entityType.slice(0, -1)} #${id}.`)
@@ -1876,34 +1774,8 @@ export function registerWriteTools(
   );
 
   server.tool(
-    'elab_sign',
-    'Cryptographically sign an entity with a configured signature key. Irreversible.',
-    {
-      entityType: entityTypeSchema,
-      id: z.number().int().positive(),
-      team: teamParamSchema,
-    },
-    async (args) => {
-      const { entityType, id, team } = args as {
-        entityType: ElabEntityType;
-        id: number;
-        team?: number;
-      };
-      const t = effectiveTeam(registry, team);
-      const client = clientFor(registry, team);
-      return guard(
-        async () => {
-          await assertTeam(client, entityType, id, t);
-          return client.action(entityType, id, 'sign');
-        },
-        () => text(`Signed ${entityType.slice(0, -1)} #${id}.`)
-      );
-    }
-  );
-
-  server.tool(
     'elab_delete_tag',
-    'Permanently delete a team-scoped tag. elabftw first detaches the tag from every entity that referenced it, then removes the row. Gated behind `ELABFTW_ALLOW_DESTRUCTIVE` because some teams use tags as permission gates — a stray delete can break access control. Pair with `elab_list_tags` to resolve the tag id first. Requires team-admin privileges on the API key. Pass `team` to pick which configured team key/team to target; omit for the default team.',
+    'Permanently delete a team-scoped tag. elabftw first detaches the tag from every entity that referenced it, then removes the row. Pair with `elab_list_tags` to resolve the tag id first. Requires team-admin privileges on the API key.',
     {
       tagId: z
         .number()
@@ -1918,6 +1790,7 @@ export function registerWriteTools(
       const client = clientFor(registry, team);
       return guard(
         async () => {
+          await assertCurrentTeam(client, t);
           await client.deleteTag(tagId);
           return null;
         },

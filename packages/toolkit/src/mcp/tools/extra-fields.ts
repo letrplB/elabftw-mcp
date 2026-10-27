@@ -1,9 +1,8 @@
 /**
- * Helpers for the Phase-2 extra-fields tools.
+ * Helpers for the extra-fields tools.
  *
- * Mirrors the shape-construction + cleanup logic of the elabftw UI's
- * field-builder (`elabftw/src/ts/metadata.ts:281-344`) and `Metadata.class.ts`'s
- * `cleanupMetadata` (`elabftw/src/ts/Metadata.class.ts:138-168`).
+ * Mirrors the shape-construction and cleanup logic of the elabftw UI's
+ * field builder (`metadata.ts`) and `Metadata.class.ts` `cleanupMetadata`.
  *
  * The functions here intentionally fail loud on per-type validation rather
  * than silently coercing — agents calling `elab_set_extra_field` benefit
@@ -41,6 +40,11 @@ export interface BuildExtraFieldOptions {
    * Validations still run.
    */
   partial?: boolean;
+  /**
+   * The field as it currently exists. In partial mode its `options` are
+   * used to validate a new `select` / `radio` value.
+   */
+  existing?: ElabExtraFieldValue;
 }
 
 /**
@@ -48,8 +52,7 @@ export interface BuildExtraFieldOptions {
  * throws on invalid combinations (caller catches and reports). Undefined
  * properties are dropped from the output so the metadata blob stays clean.
  *
- * Mirrors `metadata.ts:281-344` (the "save-new-field" handler in the UI's
- * field-builder modal).
+ * Mirrors the "save new field" handler of the UI's field-builder modal.
  *
  * Pass `{partial: true}` for merge-mode callers: skips default-value
  * injection so unprovided keys stay absent in the result and `{...existing,
@@ -67,41 +70,32 @@ export function buildExtraFieldEntry(
   switch (args.type) {
     case 'select':
     case 'radio': {
-      // Options is required for replace mode; for partial mode it's required
-      // only when the caller passed a value (to validate against).
-      if (!args.options || args.options.length === 0) {
-        if (!partial || valueProvided) {
-          throw new Error(
-            `extra field type \`${args.type}\` requires \`options\` (non-empty string array).`
-          );
-        }
-      } else {
-        entry.options = args.options;
+      // Replace mode needs options; partial mode needs them (given or
+      // already on the field) only to validate a new value.
+      const choices = args.options?.length
+        ? args.options
+        : partial
+          ? options.existing?.options
+          : undefined;
+      if (args.options?.length) entry.options = args.options;
+      if (!choices?.length && (!partial || valueProvided)) {
+        throw new Error(
+          `extra field type \`${args.type}\` requires \`options\` (non-empty string array).`
+        );
       }
       if (valueProvided && value !== null && value !== '') {
-        if (Array.isArray(value)) {
-          if (args.options) {
-            for (const v of value) {
-              if (!args.options.includes(v)) {
-                throw new Error(
-                  `value \`${v}\` is not in \`options\` (${args.options.join(', ')}).`
-                );
-              }
-            }
-          }
-          entry.value = value;
-        } else {
-          const s = String(value);
-          if (args.options && !args.options.includes(s)) {
+        const values = Array.isArray(value) ? value : [String(value)];
+        for (const v of values) {
+          if (choices && !choices.includes(v)) {
             throw new Error(
-              `value \`${s}\` is not in \`options\` (${args.options.join(', ')}).`
+              `value \`${v}\` is not in \`options\` (${choices.join(', ')}).`
             );
           }
-          entry.value = s;
         }
-      } else if (!partial && args.options) {
-        // Replace-mode default: pre-select first option (UI behavior).
-        entry.value = args.options[0];
+        entry.value = Array.isArray(value) ? value : String(value);
+      } else if (!partial && choices) {
+        // Replace-mode default: pre-select the first option, like the UI.
+        entry.value = choices[0];
       }
       break;
     }
@@ -210,8 +204,7 @@ export function buildExtraFieldEntry(
 
 /**
  * Coerce a checkbox value to elabftw's wire format: `'on'` when truthy,
- * `''` (empty string) otherwise. Mirrors the UI at `metadata.ts:319-321`
- * which writes `'on'` or `''` to the metadata blob.
+ * `''` otherwise, as the UI writes it.
  */
 export function coerceCheckboxValue(
   value: string | number | boolean | string[] | null | undefined
@@ -245,7 +238,7 @@ export function mergeExtraFieldEntry(
 }
 
 /**
- * Cleanup mirror of `elabftw/src/ts/Metadata.class.ts:138-168`. Drops empty
+ * Mirror of the UI's `Metadata.cleanupMetadata`: drops empty
  * `extra_fields`, prunes unreferenced `extra_fields_groups`, and removes an
  * empty `elabftw` namespace. Mutates the input and returns it.
  */
@@ -282,31 +275,26 @@ export function cleanupMetadata(metadata: ElabMetadata): ElabMetadata {
 }
 
 /**
- * Deep merge two `ElabMetadata` objects. Used by `elab_clone_extra_fields_schema`:
- *   - For `extra_fields[name]`: source is the base, target's value wins per-field;
- *     other properties (type, options, unit, description, required, group_id, ...)
- *     in source fill any missing slots in the target.
- *   - For `extra_fields_groups`: union by `id` (target's name wins on conflict;
- *     groups only in source are appended).
- *   - Other top-level `elabftw.*` props: shallow-merge (target wins).
- *
- * Mirrors the UI's `lodash.merge` semantics used by "Load fields" at
- * `metadata.ts:250-260`, with one deliberate difference: when the *same*
- * extra-field exists in both, we keep the target's `value` (don't overwrite
- * user data with the source schema's default).
+ * Deep merge two `ElabMetadata` objects; `source` is the base.
+ *   - `extra_fields`: with `keep: 'all'` (default) the target's field
+ *     properties win wholesale — used when a caller's metadata is layered
+ *     onto a template. With `keep: 'value'` the source defines the schema
+ *     (type, options, units, group, …) and only the target's `value`
+ *     survives — used to re-apply a template schema onto an entity.
+ *   - `extra_fields_groups`: union by `id`, target's name wins.
+ *   - Other `elabftw.*` props: shallow merge, target wins.
  */
 export function mergeMetadataForClone(
   source: ElabMetadata,
-  target: ElabMetadata
+  target: ElabMetadata,
+  { keep = 'all' }: { keep?: 'all' | 'value' } = {}
 ): ElabMetadata {
   const out: ElabMetadata = { ...source, ...target };
 
-  // Deep-merge `elabftw` namespace.
   if (source.elabftw || target.elabftw) {
     const srcElab = source.elabftw ?? {};
     const tgtElab = target.elabftw ?? {};
     const mergedElab: NonNullable<ElabMetadata['elabftw']> = { ...srcElab, ...tgtElab };
-    // Merge groups by id: union, target wins on name conflict.
     if (srcElab.extra_fields_groups || tgtElab.extra_fields_groups) {
       const byId = new Map<number, { id: number; name: string }>();
       for (const g of srcElab.extra_fields_groups ?? []) byId.set(g.id, g);
@@ -316,18 +304,17 @@ export function mergeMetadataForClone(
     out.elabftw = mergedElab;
   }
 
-  // Deep-merge extra_fields.
   if (source.extra_fields || target.extra_fields) {
     const merged: Record<string, ElabExtraFieldValue> = {};
-    // Start with all source fields (they define the schema).
     for (const [k, v] of Object.entries(source.extra_fields ?? {})) {
       merged[k] = { ...v };
     }
-    // Layer target on top: target's properties win per-key, with target's
-    // `value` always preserved when present.
     for (const [k, v] of Object.entries(target.extra_fields ?? {})) {
-      const base = merged[k] ?? {};
-      merged[k] = { ...base, ...v };
+      const base = merged[k];
+      merged[k] =
+        base && keep === 'value'
+          ? { ...base, ...(v.value !== undefined ? { value: v.value } : {}) }
+          : { ...base, ...v };
     }
     out.extra_fields = merged;
   }
@@ -336,9 +323,8 @@ export function mergeMetadataForClone(
 }
 
 /**
- * Strip default values from every extra_fields entry. Used when cloning a
- * schema with `blankValues=true` — matches the server-side behavior in
- * `elabftw/src/Elabftw/Metadata.php:130-153` which sets `value = ''`.
+ * Strip default values from every extra_fields entry (mutates). Used when
+ * cloning a schema with `blankValues=true`.
  */
 export function blankExtraFieldValues(metadata: ElabMetadata): ElabMetadata {
   if (!metadata.extra_fields) return metadata;
@@ -347,14 +333,4 @@ export function blankExtraFieldValues(metadata: ElabMetadata): ElabMetadata {
     if (field) field.value = '';
   }
   return metadata;
-}
-
-/**
- * "this metadata blob is effectively empty" check — used by
- * `elab_remove_extra_field` to decide whether to PATCH `metadata: "null"`
- * (mirroring elabftw's no-metadata normalization) or to send a real JSON
- * payload.
- */
-export function isMetadataEmpty(metadata: ElabMetadata): boolean {
-  return Object.keys(metadata).length === 0;
 }
