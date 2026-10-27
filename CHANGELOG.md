@@ -6,6 +6,17 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.6.1] — 2026-10-27
+
+### Fixed
+
+- **README on the npm package pages.** 0.6.0 put README / LICENSE /
+  CHANGELOG into the tarballs, but npm still showed "No README data
+  found": npm reads the README for the registry page from the package
+  folder after packing, and a `postpack` script had already removed the
+  copy. The copies now stay in the package folders (gitignored). No code
+  changes.
+
 ## [0.6.0] — 2026-10-27
 
 Target is now eLabFTW **6.0** (tested against 6.0.9, the latest

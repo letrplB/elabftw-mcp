@@ -2,7 +2,7 @@
 #
 # Builds both workspace packages (toolkit + hosted), then ships only
 # the hosted runtime + its production deps. The hosted package depends
-# on "@sura_ai/elabftw": "^0.6.0"; because packages/toolkit is at a
+# on "@sura_ai/elabftw": "^0.6.1"; because packages/toolkit is at a
 # version inside that range, npm satisfies the dependency with the local
 # workspace (a symlink under node_modules/@sura_ai/elabftw) instead of
 # the registry copy. Keep the two versions in step — if the range stops
