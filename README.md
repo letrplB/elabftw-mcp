@@ -23,6 +23,81 @@ If you're a single user adding eLabFTW to your own AI client, you want
 running a lab server that several people will share, you want
 **`@sura_ai/elabftw-hosted`** — see [Hosted mode](#hosted-mode).
 
+> **Upgrading to 0.6?** It fixes several bugs that affected 0.5.x and
+> changes some tool parameters. Hosted operators must set up a store key
+> **before** upgrading. See [Upgrading to 0.6](#upgrading-to-06).
+
+## Upgrading to 0.6
+
+Full details are in the [CHANGELOG](CHANGELOG.md).
+
+### Bugs fixed
+
+If you used 0.5.x or earlier, these may have affected your data or
+results:
+
+- **AI-written entries were hard to edit.** Bodies were stored as
+  markdown, so entries opened in eLabFTW's markdown editor, and
+  switching to the rich-text editor showed the markdown as one
+  unformatted paragraph. Bodies are now stored as rich text (HTML).
+  Convert existing entries with `elab_convert_body_to_html`.
+- **Single-key setups without `ELABFTW_TEAM_ID` saw no data.** The
+  team was looked up on a client the server never used, so searches
+  returned "No results." and `elab_get` reported a cross-team error.
+  (Workaround on 0.5.x: set `ELABFTW_TEAM_ID`.)
+- **Creating from a template did not instantiate it.** eLabFTW ignores
+  the `category_id` the tool sent: items got no category, and
+  experiments did not get the template's body, steps, links or tags
+  (only the extra-field schema was copied).
+- **Long bodies were cut at 4,000 characters** by `elab_get`. Editing
+  such a body and writing it back deleted everything after the cut and
+  saved the truncation marker into the entry. Check long entries an
+  agent edited.
+- **Parallel extra-field edits lost data.** Several
+  `elab_set_extra_field` calls on one entry at the same time kept only
+  one of the fields.
+- **`elab_lock` unlocked already locked entries** (eLabFTW's `lock`
+  toggles).
+- `elab_clone_extra_fields_schema` with `blankValues: true` also
+  blanked values the target already had.
+- Tables with a merged title row collapsed to a single column when
+  read; attachments always came back as base64, even text files.
+- `elab_update_extra_field` failed on `true`, `null` and decimals;
+  un-archiving with `state: "normal"` always failed; `elab_sign` always
+  failed; `elab_duplicate_entity` ignored `targetTeam`.
+- Compound update / delete and tag create / delete did not check the
+  team.
+- The request timeout did not cover reading the response, so calls
+  could hang; redirects silently turned writes into reads.
+
+### Breaking changes
+
+For the stdio package these only matter if your prompts, skills or
+scripts use the parameters below:
+
+- `elab_sign` is removed; sign entries in the eLabFTW UI.
+- Compound hazards are one list, `hazards: ["toxic", "flammable"]`,
+  instead of 24 `is_*` booleans.
+- `elab_create_entity`: use `template` and `category`. `category_id` is
+  a deprecated alias of `template`; `loadFieldsFromCategory` is removed.
+- `elab_duplicate_entity` loses `targetTeam`; `elab_lock` loses `force`.
+- With one API key configured, tools no longer have a `team` parameter.
+- `elab_download_attachment` / `elab_export` no longer return base64:
+  text up to 100 KB comes back inline, anything else is saved under
+  `ELABFTW_DOWNLOAD_DIR` and the tool returns the path.
+- Redirects are not followed: `ELABFTW_BASE_URL` must be the final
+  (https) URL.
+- Programmatic API: see the CHANGELOG.
+
+### Hosted operators
+
+The registration store is migrated on first start (tokens hashed, API
+keys encrypted) and eLabFTW base URLs must now be allow-listed. Before
+upgrading, set `MCP_STORE_KEY` and keep a copy of it, set
+`MCP_PUBLIC_URL`, and make sure every instance your users registered
+against is allow-listed. Step by step:
+[Upgrading to 0.6 (hosted)](#upgrading-to-06-hosted).
+
 ## Quick start
 
 ### Single team
@@ -829,9 +904,9 @@ everything else.
 - The process runs with umask 077. The data directory is 0700; the
   store, key file and SQLite `-wal` / `-shm` files are 0600.
 
-### Upgrading from 0.4.x
+### Upgrading to 0.6 (hosted)
 
-Hosted 0.5.0 migrates existing stores in place on first start (JSON
+Hosted 0.6.0 migrates existing stores in place on first start (JSON
 schema v3, SQLite schema v2; SQLite is VACUUMed so no plaintext stays
 in free pages). Existing bearer tokens keep working. Before upgrading:
 

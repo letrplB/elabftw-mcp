@@ -204,7 +204,7 @@ categories need 6.x.
 
 ### Security
 
-Hosted mode (`@sura_ai/elabftw-hosted`, now 0.5.0) hardening. Existing
+Hosted mode (`@sura_ai/elabftw-hosted`, 0.6.0) hardening. Existing
 stores migrate on first start and existing bearer tokens keep working;
 see the operator notes at the end.
 
