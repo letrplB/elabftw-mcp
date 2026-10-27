@@ -14,3 +14,8 @@ dev-docs/
 CLAUDE.md
 
 .dev-registrations.*
+
+# Copied in by prepack for the npm tarball
+packages/*/README.md
+packages/*/LICENSE
+packages/*/CHANGELOG.md

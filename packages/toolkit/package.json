@@ -6,7 +6,7 @@
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "bin": {
-    "sura-elabftw-mcp": "./dist/cli.js"
+    "sura-elabftw-mcp": "dist/cli.js"
   },
   "exports": {
     ".": {
@@ -23,7 +23,9 @@
   "scripts": {
     "build": "tsup",
     "typecheck": "tsc --noEmit",
-    "prepublishOnly": "npm run typecheck && npm run build"
+    "prepublishOnly": "npm run typecheck && npm run build",
+    "prepack": "cp ../../README.md ../../LICENSE ../../CHANGELOG.md .",
+    "postpack": "rm -f README.md LICENSE CHANGELOG.md"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.25.1",

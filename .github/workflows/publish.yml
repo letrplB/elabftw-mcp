@@ -22,6 +22,21 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm run build
-      - run: npm publish --access public --provenance
+      - name: Tag matches both package versions
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          for pkg in packages/toolkit packages/hosted; do
+            version=$(node -p "require('./$pkg/package.json').version")
+            if [ "$version" != "$tag" ]; then
+              echo "$pkg is at $version but the tag is v$tag"; exit 1
+            fi
+          done
+      # The repo root is a private workspace root; publish each package.
+      # Toolkit first: hosted depends on it.
+      - run: npm publish -w @sura_ai/elabftw --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - run: npm publish -w @sura_ai/elabftw-hosted --access public --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

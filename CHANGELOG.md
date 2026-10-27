@@ -6,6 +6,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-10-27
+
 Target is now eLabFTW **6.0** (tested against 6.0.9, the latest
 stable). 5.6 keeps working where that costs little; resource
 categories need 6.x.
