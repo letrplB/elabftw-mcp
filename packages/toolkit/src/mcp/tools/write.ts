@@ -83,6 +83,86 @@ function tagSet(tags: unknown): Set<string> {
   );
 }
 
+const PERMISSION_JSON_KEYS = [
+  'canread',
+  'canwrite',
+  'canread_target',
+  'canwrite_target',
+] as const;
+
+/** Fields that only exist on templates (`experiments_templates`, `items_types`). */
+const TEMPLATE_ONLY_KEYS = [
+  'canread_target',
+  'canwrite_target',
+  'canread_target_base',
+  'canwrite_target_base',
+] as const;
+
+const BASE_LEVELS = [10, 20, 30, 40, 50] as const;
+const BASE_LEVELS_TEXT =
+  '50 = everyone incl. anonymous, 40 = everyone with an account, 30 = team, 20 = owner + admins, 10 = owner only';
+
+const baseLevelSchema = z
+  .number()
+  .int()
+  .refine((n) => (BASE_LEVELS as readonly number[]).includes(n), {
+    message: `Base level must be one of ${BASE_LEVELS.join(', ')}.`,
+  });
+
+/**
+ * elabftw's PATCH stores `canread` / `canwrite` (and the template
+ * `*_target` variants) as `{teams, users, teamgroups}`; the base level is
+ * a separate `<key>_base` column, and a `base` key inside the JSON is
+ * only honoured on create. Move it out so `{"base":20,...}` works on
+ * every path. An explicit `<key>_base` wins. Throws on malformed JSON.
+ */
+function normalizePermissionFields(patch: Record<string, unknown>): void {
+  for (const key of PERMISSION_JSON_KEYS) {
+    const raw = patch[key];
+    if (typeof raw !== 'string') continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new Error(`\`${key}\` must be a JSON object string.`);
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed))
+      throw new Error(`\`${key}\` must be a JSON object string.`);
+    const { base, ...rest } = parsed as Record<string, unknown>;
+    if (base === undefined) continue;
+    const level = Number(base);
+    if (!(BASE_LEVELS as readonly number[]).includes(level))
+      throw new Error(
+        `\`${key}\`.base must be one of ${BASE_LEVELS.join(', ')} (${BASE_LEVELS_TEXT}).`
+      );
+    const baseKey = `${key}_base`;
+    if (patch[baseKey] === undefined) patch[baseKey] = level;
+    patch[key] = JSON.stringify({ teams: [], users: [], teamgroups: [], ...rest });
+  }
+}
+
+/** Convert optional boolean immutability flags to elabftw's 0 | 1. */
+function immutabilityFields(input: {
+  canread_is_immutable?: boolean;
+  canwrite_is_immutable?: boolean;
+}): Partial<ElabEntityUpdate> {
+  return {
+    ...(input.canread_is_immutable !== undefined
+      ? { canread_is_immutable: input.canread_is_immutable ? 1 : 0 }
+      : {}),
+    ...(input.canwrite_is_immutable !== undefined
+      ? { canwrite_is_immutable: input.canwrite_is_immutable ? 1 : 0 }
+      : {}),
+  };
+}
+
+const targetPermsDescription =
+  'Templates only (experiments_templates / items_types): permissions that entries created from this template get. JSON string like `canread`, e.g. `{"base":20,"teams":[],"users":[],"teamgroups":[]}`. Base levels: ' +
+  BASE_LEVELS_TEXT +
+  '.';
+const immutableDescription =
+  'On a template: lock this permission on entries created from it (owners cannot change it; admins can). On an experiment / item elabftw refuses to change it.';
+
 function fieldMismatch(
   key: string,
   requested: unknown,
@@ -221,6 +301,19 @@ export function registerWriteTools(
           'JSON permissions string, e.g. `{"base":40,"teams":[],"users":[],"teamgroups":[]}`.'
         ),
       canwrite: z.string().optional().describe('Same shape as `canread`.'),
+      canread_target: z.string().optional().describe(targetPermsDescription),
+      canwrite_target: z
+        .string()
+        .optional()
+        .describe('Same as `canread_target`, for write access.'),
+      canread_is_immutable: z
+        .boolean()
+        .optional()
+        .describe('Templates only. ' + immutableDescription),
+      canwrite_is_immutable: z
+        .boolean()
+        .optional()
+        .describe('Templates only. ' + immutableDescription),
       state: z
         .enum(['normal', 'archived'])
         .optional()
@@ -245,6 +338,10 @@ export function registerWriteTools(
         custom_id?: number;
         canread?: string;
         canwrite?: string;
+        canread_target?: string;
+        canwrite_target?: string;
+        canread_is_immutable?: boolean;
+        canwrite_is_immutable?: boolean;
         state?: StateName;
       };
       const t = effectiveTeam(registry, input.team);
@@ -252,6 +349,28 @@ export function registerWriteTools(
       const isSchemaKind =
         input.entityType === 'experiments_templates' ||
         input.entityType === 'items_types';
+
+      // Template-only permission fields: applied by the post-create PATCH.
+      const templatePerms: Record<string, unknown> = {
+        ...(input.canread_target !== undefined
+          ? { canread_target: input.canread_target }
+          : {}),
+        ...(input.canwrite_target !== undefined
+          ? { canwrite_target: input.canwrite_target }
+          : {}),
+        ...immutabilityFields(input),
+      };
+      if (Object.keys(templatePerms).length > 0) {
+        if (!isSchemaKind)
+          return errorText(
+            '`canread_target` / `canwrite_target` / `*_is_immutable` apply to templates only (experiments_templates, items_types). Entries created from a template inherit them.'
+          );
+        try {
+          normalizePermissionFields(templatePerms);
+        } catch (err) {
+          return errorText((err as Error).message);
+        }
+      }
       const templateId = isSchemaKind
         ? undefined
         : (input.template ?? input.category_id);
@@ -317,6 +436,7 @@ export function registerWriteTools(
             if (templateId !== undefined || isSchemaKind || fieldMismatch(key, val, current))
               (patch as Record<string, unknown>)[key] = val;
           }
+          Object.assign(patch, templatePerms);
           if (callerMeta) {
             // Server-side merge is 6.x only, and 5.x double-encodes string
             // metadata on create: merge onto what landed and re-send if needed.
@@ -404,8 +524,34 @@ export function registerWriteTools(
       category: z.number().int().optional(),
       status: z.number().int().optional(),
       custom_id: z.number().int().optional(),
-      canread: z.string().optional(),
-      canwrite: z.string().optional(),
+      canread: z
+        .string()
+        .optional()
+        .describe(
+          'JSON permissions string, e.g. `{"base":20,"teams":[],"users":[],"teamgroups":[]}`. Base levels: ' +
+            BASE_LEVELS_TEXT +
+            '.'
+        ),
+      canwrite: z.string().optional().describe('Same shape as `canread`.'),
+      canread_base: baseLevelSchema
+        .optional()
+        .describe('Read base level alone (' + BASE_LEVELS_TEXT + ').'),
+      canwrite_base: baseLevelSchema
+        .optional()
+        .describe('Write base level alone.'),
+      canread_target: z.string().optional().describe(targetPermsDescription),
+      canwrite_target: z
+        .string()
+        .optional()
+        .describe('Same as `canread_target`, for write access.'),
+      canread_target_base: baseLevelSchema
+        .optional()
+        .describe('Templates only: read base level for entries created from it.'),
+      canwrite_target_base: baseLevelSchema
+        .optional()
+        .describe('Templates only: write base level for entries created from it.'),
+      canread_is_immutable: z.boolean().optional().describe(immutableDescription),
+      canwrite_is_immutable: z.boolean().optional().describe(immutableDescription),
       metadata: z
         .string()
         .optional()
@@ -443,8 +589,13 @@ export function registerWriteTools(
         state,
         team,
         native,
+        canread_is_immutable,
+        canwrite_is_immutable,
         ...rest
-      } = input;
+      } = input as typeof input & {
+        canread_is_immutable?: boolean;
+        canwrite_is_immutable?: boolean;
+      };
       const ct =
         content_type === 'markdown'
           ? 2
@@ -457,9 +608,23 @@ export function registerWriteTools(
       const patch: ElabEntityUpdate = {
         ...fromNative.patch,
         ...rest,
+        ...immutabilityFields({ canread_is_immutable, canwrite_is_immutable }),
         ...(body !== undefined ? { body } : {}),
         ...(ct ? { content_type: ct } : {}),
       };
+      try {
+        normalizePermissionFields(patch);
+      } catch (err) {
+        return errorText((err as Error).message);
+      }
+      const isSchemaKind =
+        entityType === 'experiments_templates' || entityType === 'items_types';
+      const misplaced = TEMPLATE_ONLY_KEYS.filter((k) => patch[k] !== undefined);
+      if (!isSchemaKind && misplaced.length > 0) {
+        return errorText(
+          `Template-only field(s) on ${entityType}: ${misplaced.join(', ')}. They apply to experiments_templates / items_types; entries created from a template inherit them.`
+        );
+      }
       const nativeState =
         fromNative.state === 1 || fromNative.state === 2 ? fromNative.state : undefined;
       const wantState = state ? stateMap[state] : nativeState;

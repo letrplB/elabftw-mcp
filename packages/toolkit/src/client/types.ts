@@ -200,6 +200,17 @@ export interface ElabEntityUpdate {
   canwrite_base?: number;
   canread_is_immutable?: 0 | 1;
   canwrite_is_immutable?: 0 | 1;
+  /**
+   * Templates only (`experiments_templates`, `items_types`): permissions
+   * that entries created FROM the template inherit. JSON string of
+   * `{teams, users, teamgroups}`; the base level goes in `*_target_base`.
+   * The template's `canread_is_immutable` / `canwrite_is_immutable` flags
+   * are likewise copied onto the created entries.
+   */
+  canread_target?: string;
+  canwrite_target?: string;
+  canread_target_base?: number;
+  canwrite_target_base?: number;
   /** Send as a JSON string to be safe across instance versions. */
   metadata?: string;
   /** Plain-state transitions go through `state` (1=normal, 2=archived). */
@@ -324,6 +335,13 @@ export interface ElabEntityNative {
   canwrite: ElabPermissions;
   canwrite_base?: number;
   canwrite_is_immutable?: 0 | 1;
+
+  // Template-only: permissions inherited by entries created from this
+  // template (absent on experiments / items).
+  canread_target?: ElabPermissions;
+  canread_target_base?: number;
+  canwrite_target?: ElabPermissions;
+  canwrite_target_base?: number;
 
   // Structured payload (parsed)
   metadata: ElabMetadata | null;

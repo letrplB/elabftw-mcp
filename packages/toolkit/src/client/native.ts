@@ -87,6 +87,8 @@ export function toNativeEntity(entity: ElabEntity): ElabEntityNative {
     canread_is_immutable?: 0 | 1;
     canwrite_base?: number;
     canwrite_is_immutable?: 0 | 1;
+    canread_target_base?: number;
+    canwrite_target_base?: number;
     elabid?: string | null;
     category_color?: string | null;
     experiments_links?: ElabLink[];
@@ -132,6 +134,16 @@ export function toNativeEntity(entity: ElabEntity): ElabEntityNative {
     state: e.state,
     locked: e.locked,
   };
+  // Templates (experiments_templates / items_types) carry the permissions
+  // their created entries inherit. Only surface them where the wire has them.
+  if (e.canread_target !== undefined || e.canread_target_base !== undefined) {
+    native.canread_target = parsePermissions(e.canread_target);
+    native.canread_target_base = e.canread_target_base;
+  }
+  if (e.canwrite_target !== undefined || e.canwrite_target_base !== undefined) {
+    native.canwrite_target = parsePermissions(e.canwrite_target);
+    native.canwrite_target_base = e.canwrite_target_base;
+  }
   return native;
 }
 
@@ -180,6 +192,14 @@ export function nativeToUpdate(
     patch.canread_is_immutable = native.canread_is_immutable;
   if (native.canwrite_is_immutable !== undefined)
     patch.canwrite_is_immutable = native.canwrite_is_immutable;
+  if (native.canread_target !== undefined)
+    patch.canread_target = JSON.stringify(native.canread_target);
+  if (native.canwrite_target !== undefined)
+    patch.canwrite_target = JSON.stringify(native.canwrite_target);
+  if (native.canread_target_base !== undefined)
+    patch.canread_target_base = native.canread_target_base;
+  if (native.canwrite_target_base !== undefined)
+    patch.canwrite_target_base = native.canwrite_target_base;
 
   if (native.metadata !== undefined) {
     // The metadata column is JSON; an empty object clears it.

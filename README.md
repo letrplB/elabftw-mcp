@@ -261,8 +261,8 @@ the MCP server instructions rather than in every tool description.
 
 | Tool | Purpose |
 |---|---|
-| `elab_create_entity` | Create any of the four kinds (experiments, items, experiments_templates, items_types). `template` (an `experiments_templates` id for experiments, an `items_types` id for items) instantiates it server-side the way the UI does: body, extra-fields schema, steps, links, tags, permissions and category come from the template, and everything else you pass is applied on top (`metadata` is merged into the template's, yours winning per field). `category` sets the experiment category / resource category. Also accepts `title` / `body` (markdown or HTML, stored as rich text; see [Rich body rendering](#rich-body-rendering)) / `body_format` / `content_type` / `tags` / `metadata` / `date` / `rating` / `status` / `custom_id` / `canread` / `canwrite` / `state` (`archived` archives and locks the entry after creation). Fields elabftw drops on POST are re-PATCHed; the response names any field that could not be applied. `category_id` is a deprecated alias of `template`. |
-| `elab_update_entity` | Patch any of the four kinds; omitted fields stay unchanged. Title / body / `body_format` / content_type / category / status / rating / date / custom_id / metadata (replaces the whole blob) / permissions / `state`. `state: "archived"` archives and locks through elabftw's archive action; `state: "normal"` un-archives (the entry stays locked). Archived entries reject other edits until un-archived. Without `content_type` the entry keeps its current editor. Accepts `native` (the shape from `elab_get(view: "native")`) for a whole-record round-trip, including tags (made to match exactly) and permission base / immutability fields; explicit args win over `native`. Links inside `native` are ignored. Soft-delete goes through `elab_delete_entity`. |
+| `elab_create_entity` | Create any of the four kinds (experiments, items, experiments_templates, items_types). `template` (an `experiments_templates` id for experiments, an `items_types` id for items) instantiates it server-side the way the UI does: body, extra-fields schema, steps, links, tags, permissions and category come from the template, and everything else you pass is applied on top (`metadata` is merged into the template's, yours winning per field). `category` sets the experiment category / resource category. Also accepts `title` / `body` (markdown or HTML, stored as rich text; see [Rich body rendering](#rich-body-rendering)) / `body_format` / `content_type` / `tags` / `metadata` / `date` / `rating` / `status` / `custom_id` / `canread` / `canwrite` / `state` (`archived` archives and locks the entry after creation). On templates (`experiments_templates`, `items_types`) also `canread_target` / `canwrite_target` (permissions for entries created from the template; a `base` key sets the base level) and `canread_is_immutable` / `canwrite_is_immutable`. Fields elabftw drops on POST are re-PATCHed; the response names any field that could not be applied. `category_id` is a deprecated alias of `template`. |
+| `elab_update_entity` | Patch any of the four kinds; omitted fields stay unchanged. Title / body / `body_format` / content_type / category / status / rating / date / custom_id / metadata (replaces the whole blob) / permissions (`canread` / `canwrite`, a `base` key inside them is moved to `canread_base` / `canwrite_base`; also `canread_base` / `canwrite_base` alone and `canread_is_immutable` / `canwrite_is_immutable`) / template target permissions (`canread_target` / `canwrite_target` / `canread_target_base` / `canwrite_target_base`, templates only) / `state`. `state: "archived"` archives and locks through elabftw's archive action; `state: "normal"` un-archives (the entry stays locked). Archived entries reject other edits until un-archived. Without `content_type` the entry keeps its current editor. Accepts `native` (the shape from `elab_get(view: "native")`) for a whole-record round-trip, including tags (made to match exactly) and permission base / immutability fields; explicit args win over `native`. Links inside `native` are ignored. Soft-delete goes through `elab_delete_entity`. |
 | `elab_set_extra_field` | Create-or-replace one `extra_fields` entry via read-merge-PATCH. Typed: `text`, `number`, `checkbox`, `date`, `datetime-local`, `email`, `time`, `url`, `select`, `radio`, `experiments`, `items`, `users`, `compounds`, `uploads`. Validates per type (e.g. `select`/`radio` require `options` and a value among them; in `mode: 'merge'` a new value is checked against the field's existing options). For `experiments` / `items` / `compounds` types, also creates the entity-link unless `autoLink: false`. `mode: 'replace'` (default) writes the whole entry; `mode: 'merge'` updates only-provided properties. |
 | `elab_update_extra_field` | Value-only fast path on an existing field (elabftw's server-side JSON_SET). Checkbox fields take `true` / `false`; numbers are sent as strings; `null` clears the value. Cannot create fields or change type / options / unit; pre-flights with a GET and returns an error pointing at `elab_set_extra_field` when the field is missing. |
 | `elab_remove_extra_field` | Delete one `extra_fields` entry and prune empty groups; an emptied blob is written as `{}`. `alsoUnlink: true` (default) also removes the entity-link for typed pointer fields (`experiments` / `items` / `compounds`). |
@@ -495,6 +495,11 @@ already parsed:
 - `canread` / `canwrite` are objects (`{teams, users, teamgroups}`); the
   companion `canread_base` / `canread_is_immutable` (and `canwrite`
   versions) are preserved on the parent.
+- On templates (`experiments_templates`, `items_types`),
+  `canread_target` / `canwrite_target` (objects) and
+  `canread_target_base` / `canwrite_target_base` hold the permissions
+  that entries created from the template get. They are absent on
+  experiments and items.
 - `metadata` is the parsed extra-fields tree (extra_fields map +
   `elabftw.extra_fields_groups`), not a stringified blob.
 - `tags` is `string[]`, with `tags_id` as `number[]` alongside.
@@ -510,7 +515,9 @@ win over `native` when both are passed. Specifically:
 - `tags` is applied: the entity's tags are made to match the array
   exactly (missing ones added, extra ones removed).
 - `canread_base` / `canwrite_base` / `canread_is_immutable` /
-  `canwrite_is_immutable` are written.
+  `canwrite_is_immutable` are written, and on templates
+  `canread_target` / `canwrite_target` / `canread_target_base` /
+  `canwrite_target_base`.
 - `state` goes through elabftw's archive / unarchive actions rather
   than a field PATCH. Archiving also locks the entry; archived entries
   reject edits until un-archived.

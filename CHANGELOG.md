@@ -6,6 +6,35 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-11-02
+
+### Added
+
+- **Template target permissions.** `elab_create_entity` and
+  `elab_update_entity` take `canread_target` / `canwrite_target` on
+  `experiments_templates` and `items_types`: the permissions that
+  entries created from the template get (the UI's "Permissions for
+  entries created from this template"). Same JSON shape as `canread`;
+  a `base` key goes to `canread_target_base` / `canwrite_target_base`,
+  which `elab_update_entity` also takes directly.
+- **Permission immutability flags** as booleans
+  (`canread_is_immutable` / `canwrite_is_immutable`) on both tools. On a
+  template they lock the permission on entries created from it.
+- `elab_update_entity` takes `canread_base` / `canwrite_base` directly.
+- `elab_get(view: "native")` returns `canread_target` /
+  `canread_target_base` / `canwrite_target` / `canwrite_target_base` on
+  templates, and `elab_update_entity({native})` writes them back.
+
+### Fixed
+
+- `elab_update_entity` ignored a `base` inside `canread` / `canwrite`
+  (`{"base":20,...}`): eLabFTW honours that key only on create, and the
+  PATCH dropped it without an error. The toolkit now moves it to
+  `canread_base` / `canwrite_base`. Base levels are validated
+  (10, 20, 30, 40, 50).
+- Template-only permission fields on an experiment or item are refused
+  with an explanation instead of failing at the API.
+
 ## [0.6.1] — 2026-10-27
 
 ### Fixed
